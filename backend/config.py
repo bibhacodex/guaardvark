@@ -10,6 +10,12 @@ try:
 except ImportError:
     pass
 
+# The active profile fills in env defaults for anything .env left unset. It
+# runs here, before the first flag below is read, because several services
+# re-parse os.environ themselves at import. workstation sets nothing.
+from backend.profiles import active_profile as _active_profile, apply_env as _apply_profile_env
+_apply_profile_env(_active_profile())
+
 _default_root = Path(__file__).resolve().parents[1]
 _env_root = os.environ.get("GUAARDVARK_ROOT")
 if _env_root:
@@ -56,7 +62,8 @@ def _comfyui_default_url() -> str:
 
     plugin.local.json (untracked per-install override) beats plugin.json,
     so a custom port — e.g. an external ComfyUI Desktop on 8000 — set once
-    survives updates and drives every backend consumer.
+    survives updates and drives every backend consumer. The host is localhost,
+    matching the plugin manager's Running probe (see backend/utils/comfyui_url.py).
     """
     import json as _json
     for name in ("plugin.local.json", "plugin.json"):
@@ -66,8 +73,8 @@ def _comfyui_default_url() -> str:
                 port = int(_json.load(f).get("port"))
         except (OSError, ValueError, TypeError):
             continue
-        return f"http://127.0.0.1:{port}"
-    return "http://127.0.0.1:8188"
+        return f"http://localhost:{port}"
+    return "http://localhost:8188"
 
 COMFYUI_URL = os.environ.get("GUAARDVARK_COMFYUI_URL") or _comfyui_default_url()
 COMFYUI_DIR = os.environ.get("GUAARDVARK_COMFYUI_DIR", os.path.join(GUAARDVARK_ROOT, "plugins", "comfyui", "ComfyUI"))
@@ -92,7 +99,6 @@ _config_logger.info(f"Config initialized - STORAGE_DIR: {STORAGE_DIR}")
 
 ENHANCED_CONTEXT_ENABLED = os.environ.get("GUAARDVARK_ENHANCED_CONTEXT", "true").lower() == "true"
 ADVANCED_RAG_ENABLED = os.environ.get("GUAARDVARK_ADVANCED_RAG", "true").lower() == "true"
-RAG_DEBUG_ENABLED = os.environ.get("GUAARDVARK_RAG_DEBUG", "true").lower() == "true"
 CONTEXT_PERSISTENCE_DIR = _resolve_path("GUAARDVARK_CONTEXT_DIR", "data/context")
 
 AGENT_BRAIN_ENABLED = os.environ.get("GUAARDVARK_AGENT_BRAIN", "true").lower() == "true"
@@ -130,9 +136,19 @@ ALLOWED_APPS = [
 if os.environ.get("GUAARDVARK_ALLOWED_APPS"):
     ALLOWED_APPS.extend(os.environ.get("GUAARDVARK_ALLOWED_APPS").split(":"))
 
+# MCP (Model Context Protocol) client. Server definitions live in
+# data/config/mcp_servers.json (see mcp_servers.json.example) and/or the
+# GUAARDVARK_MCP_SERVERS env var (same JSON shape).
 MCP_ENABLED = os.environ.get("GUAARDVARK_MCP_ENABLED", "true").lower() == "true"
 MCP_TIMEOUT = int(os.environ.get("GUAARDVARK_MCP_TIMEOUT", "30"))
-MCP_SERVERS_CONFIG = os.environ.get("GUAARDVARK_MCP_SERVERS", "{}")
+MCP_CONNECT_TIMEOUT = int(os.environ.get("GUAARDVARK_MCP_CONNECT_TIMEOUT", "30"))
+MCP_SERVERS_CONFIG = os.environ.get("GUAARDVARK_MCP_SERVERS", "")
+MCP_CONFIG_FILE = os.environ.get(
+    "GUAARDVARK_MCP_CONFIG_FILE",
+    str(GUAARDVARK_ROOT / "data" / "config" / "mcp_servers.json"),
+)
+MCP_MAX_OUTPUT_CHARS = int(os.environ.get("GUAARDVARK_MCP_MAX_OUTPUT_CHARS", "16000"))
+MCP_AUTOCONNECT = os.environ.get("GUAARDVARK_MCP_AUTOCONNECT", "true").lower() == "true"
 
 # Uncle Claude configuration
 CLAUDE_API_ENABLED = os.environ.get("GUAARDVARK_CLAUDE_API_ENABLED", "true").lower() == "true"
@@ -177,9 +193,29 @@ def get_dedup_threshold(model_name: str) -> float:
 # RAG Autoresearch configuration
 AUTORESEARCH_ENABLED = os.environ.get("GUAARDVARK_AUTORESEARCH_ENABLED", "true").lower() == "true"
 AUTORESEARCH_IDLE_MINUTES = int(os.environ.get("GUAARDVARK_AUTORESEARCH_IDLE_MINUTES", "10"))
-AUTORESEARCH_MAX_EXPERIMENT_DURATION = 300  # 5 minutes, matching Karpathy's time budget
+AUTORESEARCH_MAX_EXPERIMENT_DURATION = 300  # floor for the per-experiment deadline (seconds)
+# The real deadline is max(floor, HEADROOM x pairs x measured seconds per pair).
+# Measured 2026-08-30 on gemma4 12B via Ollama: the 18-pair baseline took ~600s,
+# so a fixed 300s crashed every experiment at exactly 300.7s. F1 judges a subset
+# and F2 may re-run the full set, hence 2x the full-set estimate.
+AUTORESEARCH_EXPERIMENT_DEADLINE_HEADROOM = 2.0
+# Before any pair cost has been measured (fresh box, or a baseline cached by an
+# older build) the floor is a trap: on 2026-08-30 the F0 retrieval screen alone
+# took ~400s because Ollama swapped the 12B answer model and the 4B embedding
+# model on every pair, and three experiments in a row died at "calls=0". The
+# first experiment gets this instead; every later one uses measurements.
+AUTORESEARCH_EXPERIMENT_DEADLINE_UNMEASURED = 1800
 AUTORESEARCH_MAX_LLM_CALLS_PER_EXPERIMENT = 200
 AUTORESEARCH_PHASE_PLATEAU_THRESHOLD = 10  # consecutive discards before phase advance
+# Keep bar matches run-end confirmation (research_run_service). Any smaller
+# positive delta is LLM-judge jitter, not a real improvement — measured
+# against the 2026-08 overnight ledgers where 0.001 keeps promoted noise.
+AUTORESEARCH_KEEP_MIN_DELTA = 0.05
+# TPE-lite needs a handful of scored trials before it beats LLM/random.
+AUTORESEARCH_TPE_MIN_HISTORY = 8
+# Drop parse-failed judge pairs from the mean; crash the experiment if more
+# than this fraction of the judged set failed to parse.
+AUTORESEARCH_PARSE_FAIL_CRASH_RATIO = 0.5
 # Bounds that keep the loop finite and paced. A single loop invocation may never
 # run unbounded (the 2026-08-07..10 runaway spun ~3,500 no-op experiments/second
 # for 3.4 days = 134M rows, because 0 eval pairs made each "experiment" a 1ms
@@ -189,7 +225,13 @@ AUTORESEARCH_MAX_EXPERIMENTS_PER_RUN = 25   # cap when caller passes 0/unbounded
 AUTORESEARCH_MIN_EXPERIMENT_INTERVAL = 5.0  # seconds between experiments, minimum
 AUTORESEARCH_MIN_CORPUS_SIZE = 10  # minimum indexed documents to enable
 AUTORESEARCH_SHADOW_CORPUS_SIZE = 100  # documents in shadow eval corpus
-AUTORESEARCH_EVAL_PAIR_TARGET = 100  # target eval pairs per generation
+# Overnight default. 100 pairs × (answer + judge) on local Ollama ate a 6h
+# window for ~10 noisy trials (2026-08). 30 pairs + a 20-pair F1 judge
+# subset leaves room for >20 trials in 6h. Explicit regenerate may still
+# request up to AUTORESEARCH_EVAL_PAIR_REGENERATE_MAX.
+AUTORESEARCH_EVAL_PAIR_TARGET = 30
+AUTORESEARCH_EVAL_PAIR_REGENERATE_MAX = 100
+AUTORESEARCH_JUDGE_SUBSET = 20  # F1 LLM-judge sample; F2 is the full active set
 AUTORESEARCH_STALENESS_SAMPLE_RATE = 0.1  # fraction of pairs to spot-check
 AUTORESEARCH_STALENESS_THRESHOLD = 0.2  # fraction of stale pairs triggering regen
 
@@ -257,12 +299,19 @@ DEFAULT_INDEX_PROJECT_ID = None
 # or can be overridden manually for advanced setups.
 _DEFAULT_DATABASE_URL = "postgresql://guaardvark:guaardvark@localhost:5432/guaardvark"
 
+def mask_dsn(url: str) -> str:
+    """The URL with its password replaced, for logs. A truncated DSN still
+    leaked the first characters of the password."""
+    import re as _re
+    return _re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", url or "")
+
+
 _env_db_url = os.environ.get("DATABASE_URL")
 if _env_db_url:
     allowed_schemes = ["postgresql", "postgres"]
     if any(_env_db_url.startswith(f"{scheme}://") for scheme in allowed_schemes):
         DATABASE_URL = _env_db_url
-        _config_logger.info(f"Using DATABASE_URL from environment: {_env_db_url[:50]}...")
+        _config_logger.info(f"Using DATABASE_URL from environment: {mask_dsn(_env_db_url)}")
     else:
         _config_logger.warning(
             f"DATABASE_URL has unsupported scheme: {_env_db_url[:20]}... "
@@ -282,16 +331,6 @@ DEFAULT_EMBEDDING_MODEL = None
 # OLLAMA_BASE_URL env var (full URL) to point Guaardvark at an Ollama elsewhere.
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 ACTIVE_MODEL_FILE = os.path.join(STORAGE_DIR, "active_model.json")
-
-# --- Cloud LLM providers (optional, opt-in; OFF by default) -------------------
-# Local Ollama is always the default. Cloud providers are gated behind a master
-# "cloud_models_enabled" DB setting (see services/llm_provider.py) AND the
-# provider's API key being present below. Keys live in .env (never the DB).
-# Embeddings/RAG always stay on local Ollama regardless of the chat provider.
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
-MISTRAL_BASE_URL = os.environ.get("GUAARDVARK_MISTRAL_BASE_URL", "https://api.mistral.ai/v1").rstrip("/")
-MISTRAL_DEFAULT_MODEL = os.environ.get("GUAARDVARK_MISTRAL_MODEL", "mistral-large-latest").strip()
-MISTRAL_REQUEST_TIMEOUT = int(os.environ.get("GUAARDVARK_MISTRAL_TIMEOUT", "120"))
 
 # GPU Memory Orchestrator settings
 GPU_QUALITY_TIER = os.environ.get("GUAARDVARK_GPU_QUALITY_TIER", "balanced")
@@ -504,18 +543,68 @@ def _get_gpu_vram_info() -> dict:
     return result
 
 
-def get_active_embedding_model() -> str:
-    # Check if user has explicitly set an embedding model (via Settings UI)
-    # Try DB first, then fall back to env var, then auto-selection
+_SAVED_EMBED_TTL_S = 10.0
+_saved_embed_cache: dict = {"at": 0.0, "value": None}
+_saved_embed_engine = None
+
+
+def _saved_embedding_model_outside_app() -> str | None:
+    """The Settings choice, read straight from the settings table.
+
+    Import-time configuration, Celery workers and scripts have no Flask app
+    context, so the ORM lookup fails there and the env var or auto-selection
+    used to win. The workers then embedded with a different model than the one
+    chosen in Settings, writing into another width's table while chat searched
+    the chosen one. Cached briefly because retrieval asks on every query.
+    """
+    import time as _time
+    global _saved_embed_engine
+    now = _time.monotonic()
+    if now - _saved_embed_cache["at"] < _SAVED_EMBED_TTL_S:
+        return _saved_embed_cache["value"]
+    value = None
     try:
-        from backend.models import Setting, db
-        if db and Setting:
-            setting = db.session.get(Setting, "active_embedding_model")
-            if setting and setting.value:
-                _config_logger.info(f"Using user-selected embedding model: {setting.value}")
-                return setting.value
+        from sqlalchemy import create_engine, text
+        from sqlalchemy.pool import NullPool
+        if _saved_embed_engine is None:
+            _saved_embed_engine = create_engine(
+                DATABASE_URL, poolclass=NullPool, connect_args={"connect_timeout": 3},
+            )
+        with _saved_embed_engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT value FROM settings WHERE key = :k"),
+                {"k": "active_embedding_model"},
+            ).first()
+        value = (row[0] or None) if row else None
     except Exception as e:
-        _config_logger.debug(f"DB not available for embedding model lookup: {e}")
+        _config_logger.debug(f"Saved embedding model not readable outside the app: {e}")
+    _saved_embed_cache.update(at=now, value=value)
+    return value
+
+
+def get_active_embedding_model() -> str:
+    # The model chosen in Settings wins, in every process. Then the env var
+    # (first boot, before anything is saved), then auto-selection.
+    try:
+        from flask import has_app_context
+        in_app = has_app_context()
+    except Exception:
+        in_app = False
+    if in_app:
+        try:
+            from backend.models import Setting, db
+            if db and Setting:
+                setting = db.session.get(Setting, "active_embedding_model")
+                if setting and setting.value:
+                    _config_logger.info(f"Using user-selected embedding model: {setting.value}")
+                    return setting.value
+        except Exception as e:
+            _config_logger.debug(f"DB not available for embedding model lookup: {e}")
+    else:
+        saved = _saved_embedding_model_outside_app()
+        if saved:
+            _config_logger.debug(f"Using saved embedding model (no app context): {saved}")
+            return saved
 
     # Env var override (useful when DB is not ready at startup)
     env_model = os.environ.get("GUAARDVARK_EMBEDDING_MODEL")
@@ -646,6 +735,12 @@ if not SECRET_KEY:
 METRICS_LOG_LEVEL = os.environ.get("GUAARDVARK_METRICS_LOG_LEVEL", "WARNING").upper()
 
 AGENTIC_MAX_TOKENS_FINAL = int(os.environ.get("GUAARDVARK_AGENTIC_MAX_TOKENS", "4096"))
+# Ollama counts a thinking model's reasoning tokens against num_predict, so with
+# thinking on the visible answer would be cut short unless the budget grows by
+# roughly the reasoning length. 4096 equals the answer budget: a 300-word request
+# on gemma4-12b produced ~6.4k chars (~2k tokens) of reasoning, so this leaves
+# headroom for longer chains without an open-ended ceiling.
+AGENTIC_THINKING_TOKEN_BUDGET = int(os.environ.get("GUAARDVARK_AGENTIC_THINKING_TOKENS", "4096"))
 AGENTIC_HISTORY_LIMIT = int(os.environ.get("GUAARDVARK_AGENTIC_HISTORY_LIMIT", "30"))
 
 CHAT_HISTORY_LIMIT_FOR_ENGINE = (

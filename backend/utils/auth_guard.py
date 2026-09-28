@@ -25,6 +25,14 @@ PROTECTED_PREFIXES = (
     '/api/social-outreach/',
 )
 
+# Browser/desktop/MCP automation and direct tool execution can read files, run
+# commands and reach internal networks. Off by default because the Tools page
+# and automation panels are used from other devices on the LAN, which have no
+# API-key field; GUAARDVARK_PROTECT_TOOL_ENDPOINTS=true closes them to remote
+# hosts without the key.
+if os.environ.get("GUAARDVARK_PROTECT_TOOL_ENDPOINTS", "").strip().lower() in ("1", "true", "yes", "on"):
+    PROTECTED_PREFIXES = PROTECTED_PREFIXES + ('/api/automation/', '/api/tools/execute')
+
 # File APIs include both the document library and the live repository editor.
 # Keep read-only document browser GETs public for the local UI, but protect
 # server filesystem reads and every mutation-capable file route.
@@ -42,6 +50,10 @@ PROTECTED_FILE_PREFIXES = (
 # Endpoints protected only on DELETE
 PROTECTED_DELETE_PREFIXES = (
     '/api/backups/',
+    # Cast subjects, reference images and samples; generate/train stay LAN-usable.
+    '/api/cast-library/',
+    # Clearing the audio job history; generation and cancel stay LAN-usable.
+    '/api/audio-foundry/jobs',
 )
 
 # Explicitly safe operations that are exempt from the host check even though they
@@ -58,12 +70,37 @@ SAFE_EXEMPT_PREFIXES = (
 # non-GET (create/cancel/delete/run) requires auth/localhost — same model as the
 # /api/memory hardening. Stops a random LAN host from wiping jobs/tasks/schedules.
 MUTATION_PROTECTED_PREFIXES = (
+    # Writing an MCP server entry names a program the backend will start, so
+    # config changes are never open to other hosts.
+    '/api/automation/mcp/servers/',
+    '/api/automation/mcp/reload-config',
+    # Turning the project-folder limit off widens what tools may read.
+    '/api/settings/confine_tool_paths',
+    # Persists the product profile into .env.
+    '/api/settings/profile',
     '/api/memory',
     '/api/tasks',
     '/api/scheduler',
     '/api/jobs',
     '/api/meta',
     '/api/progress-test',
+    # Destructive batch-image file operations (delete/rename/move). Generation
+    # and reads stay reachable from LAN browsers, which have no API-key field.
+    '/api/batch-image/image/',
+    '/api/batch-image/delete/',
+    '/api/batch-image/rename/',
+    '/api/batch-image/move/',
+    '/api/batch-image/folder',
+    # GPU control (stop Ollama, force-release leases, evict) and upscaling jobs.
+    '/api/gpu',
+    '/api/upscaling',
+)
+
+# Mutation-only protection for routes whose id sits mid-path: (prefix, suffix).
+# Importing a Cast LoRA writes a file of up to a few GB and replaces the member's
+# LoRA, so it is closed to other hosts; train/generate/upload-refs stay LAN-usable.
+MUTATION_PROTECTED_SUFFIXES = (
+    ('/api/cast-library/subjects/', '/import-lora'),
 )
 
 
@@ -170,6 +207,9 @@ def _is_protected():
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
         for prefix in MUTATION_PROTECTED_PREFIXES:
             if path.startswith(prefix):
+                return True
+        for prefix, suffix in MUTATION_PROTECTED_SUFFIXES:
+            if path.startswith(prefix) and path.rstrip('/').endswith(suffix):
                 return True
     if request.method == 'DELETE':
         for prefix in PROTECTED_DELETE_PREFIXES:

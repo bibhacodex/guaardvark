@@ -9,10 +9,28 @@ import threading
 import uuid
 
 from flask import Blueprint, current_app, request, jsonify
+from backend.services.tool_activity import broadcast_tool_activity
+from backend.socketio_instance import CHAT_ATTACHMENT_MAX_BYTES, chat_attachment_too_large
+from backend.utils.response_utils import success_response
 
 logger = logging.getLogger(__name__)
 
 unified_chat_bp = Blueprint("unified_chat", __name__, url_prefix="/api/chat/unified")
+
+# Limits the chat UI needs before it sends. Its own blueprint because the
+# unified one is mounted under /api/chat/unified and this is not a chat call.
+chat_config_bp = Blueprint("chat_config", __name__, url_prefix="/api/chat")
+
+
+@chat_config_bp.route("/config", methods=["GET"])
+def chat_config():
+    """
+    GET /api/chat/config
+    Returns { success, data: { attachment_max_bytes } }. The attachment limit
+    is declared once, in backend/socketio_instance.py, and enforced on both
+    POST /api/chat/unified and the chat:send socket event.
+    """
+    return success_response(data={"attachment_max_bytes": CHAT_ATTACHMENT_MAX_BYTES})
 
 # Per-session in-flight chat threads. Without this, a stuck Ollama vision call
 # would let retries pile up forever — every retry spawned a fresh thread that
@@ -69,6 +87,15 @@ def unified_chat():
     if not message and not image_data and not has_direct_tool:
         return jsonify({"success": False, "error": "Message or image is required"}), 400
 
+    too_large = chat_attachment_too_large(image_data)
+    if too_large:
+        return jsonify({
+            "success": False,
+            "error": too_large,
+            "code": "attachment_too_large",
+            "attachment_max_bytes": CHAT_ATTACHMENT_MAX_BYTES,
+        }), 413
+
     # If image provided but no message, set a default
     if not message and image_data:
         message = "Describe this image."
@@ -87,6 +114,9 @@ def unified_chat():
     if project_root:
         options["project_root"] = str(project_root)
     options = _merge_session_mode_options(session_id, options)
+    # The same id must reach the brain and the engine, so the ack, the socket
+    # events and the saved row all name one turn.
+    options["request_id"] = request_id
 
     # Also forward to direct-tool for slash commands etc.
     if project_root and "project_root" not in options:
@@ -176,6 +206,7 @@ def unified_chat():
             }
             logger.info(f"[UNIFIED-EMIT] {event} room={session_id} agent_think={is_agent_think} keys={list(data_payload.keys()) if isinstance(data_payload,dict) else type(data_payload)} payload={log_payload}")
             socketio.emit(event, data_payload, room=session_id)
+            broadcast_tool_activity(event, data_payload)
         except Exception as emit_err:
             logger.warning(f"Failed to emit {event}: {emit_err}")
 
@@ -254,7 +285,7 @@ def unified_chat():
                         llm = get_llm_for_startup()
                     except Exception:
                         pass
-                    eng = UnifiedChatEngine(registry=reg, llm_instance=llm or object())
+                    eng = UnifiedChatEngine(tool_registry=reg, llm_instance=llm or object())
                     eng.app = app
                     rid = str(uuid.uuid4())
                     disp = message or f"/{options.get('slash_command', d_tool)}"
@@ -326,7 +357,7 @@ def unified_chat():
 
     # Now claim the slot. If the old thread is *still* alive after the grace
     # period, it's genuinely wedged (stuck Ollama call, frozen tool, etc.) —
-    # reject and tell the user to hit /abort for a hard kill.
+    # reject and tell the user to hard-abort or start a new session.
     with _inflight_lock:
         existing = _inflight.get(session_id)
         if existing is not None and existing.is_alive():
@@ -339,7 +370,8 @@ def unified_chat():
                 "success": False,
                 "error": "A previous request for this session is still running "
                          "and didn't respond to the abort signal. "
-                         "POST to /abort for a hard kill.",
+                         "Use /abort (CLI), POST /api/chat/unified/<session_id>/abort, "
+                         "or /new for a fresh session.",
                 "request_id": request_id,
             }), 409
         thread = threading.Thread(target=run_engine, daemon=True, name=f"unified-chat-{request_id[:8]}")
@@ -399,7 +431,7 @@ def direct_tool_sync():
         from backend.utils.llm_service import get_llm_for_startup
 
         registry = initialize_all_tools()
-        engine = UnifiedChatEngine(registry=registry, llm_instance=get_llm_for_startup())
+        engine = UnifiedChatEngine(tool_registry=registry, llm_instance=get_llm_for_startup())
         engine.app = current_app._get_current_object()
 
         def _noop_emit(_event, _payload):
@@ -454,7 +486,10 @@ def get_history(session_id):
 def abort_chat(session_id):
     """
     POST /api/chat/unified/<session_id>/abort
-    Abort the current generation for a session.
+
+    Hard-kill the current generation for a session: set the cooperative abort
+    flag, kill any active agent task, and clear the in-flight slot so a new
+    request can claim it even if the old thread is wedged.
     """
     from backend.services.unified_chat_engine import set_abort_flag
     set_abort_flag(session_id)
@@ -466,7 +501,26 @@ def abort_chat(session_id):
             service.kill()
     except Exception:
         pass
-    return jsonify({"success": True, "message": f"Abort requested for {session_id}"})
+
+    # Force-release the session slot. The old thread's finally block uses an
+    # identity check, so a late exit will not clobber a newer claim.
+    cleared = False
+    with _inflight_lock:
+        if session_id in _inflight:
+            _inflight.pop(session_id, None)
+            cleared = True
+
+    try:
+        from backend.socketio_instance import socketio
+        socketio.emit("chat:aborted", {"session_id": session_id}, room=session_id)
+    except Exception:
+        pass
+
+    return jsonify({
+        "success": True,
+        "message": f"Abort requested for {session_id}",
+        "inflight_cleared": cleared,
+    })
 
 def resume_chat_background(session_id: str, state_id: int):
     """Resume a suspended chat session in a background thread."""
@@ -481,6 +535,7 @@ def resume_chat_background(session_id: str, state_id: int):
         if socketio.server is None:
             return
         socketio.emit(event, data_payload, room=session_id)
+        broadcast_tool_activity(event, data_payload)
         
     def run_resume():
         with app.app_context():

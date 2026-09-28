@@ -6,6 +6,7 @@ expensive per-clip generation.
 """
 import logging
 import os
+import time
 from pathlib import Path
 
 from flask import Blueprint, request, jsonify, send_file
@@ -21,6 +22,9 @@ from backend.services.music_video_director import _is_embedding_model
 
 bp = Blueprint("music_video_api", __name__, url_prefix="/api/music-video")
 log = logging.getLogger(__name__)
+
+# A storyboard_generating flag older than this is treated as left behind by a dead worker.
+STORYBOARD_FLAG_TTL_S = 1800
 
 # Rough per-clip wall-clock for the approval-gate estimate: FLUX still (~20s) +
 # WAN i2v (~45s) + gate cooldown (~8s) + ffmpeg fill (~2s). Display-only.
@@ -102,7 +106,15 @@ def _mv_dict(mv: MusicVideo) -> dict:
     out["director_model"] = dm
     out["use_lora_consistency"] = s.get("use_lora_consistency", False)
     out["keyframe_model"] = s.get("keyframe_model", "flux-schnell")
-    out["i2v_model"] = s.get("i2v_model") or ("wan22-14b-i2v" if s.get("i2v_engine", "wan") == "wan" else "cogvideox-5b-i2v")
+    from backend.services.video_model_registry import DEFAULT_I2V_MODEL
+    out["i2v_model"] = s.get("i2v_model") or (
+        "cogvideox-5b-i2v" if s.get("i2v_engine") == "cogvideox" else DEFAULT_I2V_MODEL
+    )
+    try:
+        from backend.services.video_model_registry import model_capabilities
+        out["i2v_native_audio"] = bool((model_capabilities(out["i2v_model"]) or {}).get("audio_out"))
+    except Exception:  # noqa: BLE001 — informational only
+        out["i2v_native_audio"] = False
     # The rich visual treatment / short story the Director (acting as screenwriter) invented.
     # This is the creative foundation — per-cut prompts should advance this treatment.
     # This is the main defense against "every scene uses the identical repeated global prompt".
@@ -135,6 +147,13 @@ def create():
 
     if not name or not style_prompt or not song_document_id:
         return jsonify({"error": "name, song_document_id and style_prompt are required"}), 400
+
+    from backend.services.video_model_registry import resolve_active_video_model
+    explicit_i2v = (settings.get("i2v_model") or "").strip() or None
+    picked, resolve_err = resolve_active_video_model("i2v", explicit_i2v, surface="music-video")
+    if resolve_err:
+        return jsonify({"error": resolve_err}), 400
+    settings["i2v_model"] = picked
 
     if project_id is not None and db.session.get(Project, project_id) is None:
         return jsonify({"error": f"project_id {project_id} not found"}), 400
@@ -511,9 +530,15 @@ def generate_storyboards(mv_id):
 
     settings = dict(mv.settings_json or {})
     if settings.get("storyboard_generating"):
-        return jsonify({"error": "storyboard generation already in progress"}), 409
+        # A worker that died mid-storyboard never clears the flag; treat a
+        # flag older than the TTL as stale rather than locking the video forever.
+        started = float(settings.get("storyboard_started_at") or 0)
+        if started and (time.time() - started) < STORYBOARD_FLAG_TTL_S:
+            return jsonify({"error": "storyboard generation already in progress"}), 409
+        log.warning("music_video %s: stale storyboard_generating flag ignored", mv_id)
 
     settings["storyboard_generating"] = True
+    settings["storyboard_started_at"] = time.time()
     settings.pop("storyboard_error", None)
     mv.settings_json = settings
     db.session.commit()
@@ -545,7 +570,7 @@ def regen_mv_storyboard(mv_id, idx):
         from backend.services.plugin_bridge import prepare_plugins_for_route
         prepare_plugins_for_route("/music-video/storyboard")
     except Exception:
-        logger.warning("Failed to prepare plugins for music-video storyboard regen (non-fatal)", exc_info=True)  # noqa: BLE001
+        log.warning("Failed to prepare plugins for music-video storyboard regen (non-fatal)", exc_info=True)  # noqa: BLE001
 
     body = request.get_json(silent=True) or {}
     prompt_override = body.get("prompt")

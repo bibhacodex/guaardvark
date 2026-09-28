@@ -19,9 +19,16 @@ from sqlalchemy import func as sa_func
 
 from backend.config import GUAARDVARK_PROJECT_NAME
 from backend.models import Folder, Document as DBDocument, Client, Project, Website, db
-from backend.services.guarded_code_service import GuardedCodeError, browse_repo_path, default_repo_root
+from backend.services.guarded_code_service import (
+    GuardedCodeError,
+    browse_repo_path,
+    default_repo_root,
+    live_repo_analysis_summary,
+)
+from backend.utils.clock import utcnow
 from backend.utils.db_utils import ensure_db_session_cleanup
 from backend.utils.response_utils import success_response, error_response
+from backend.utils.path_guard import PathEscapesRoot, contained, contained_path
 
 files_bp = Blueprint("files", __name__, url_prefix="/api/files")
 logger = logging.getLogger(__name__)
@@ -101,16 +108,11 @@ def ensure_path_is_safe(path: str) -> bool:
 
     # Validate the final resolved path stays within base
     try:
-        base = get_upload_base_path()
-        final_path = os.path.normpath(os.path.join(str(base), path_for_validation))
-        base_str = str(base.resolve())
-        final_str = str(Path(final_path).resolve())
-
-        if not final_str.startswith(base_str):
-            logger.warning(f"Rejected path outside base: {path} -> {final_str} not in {base_str}")
-            return False
-
+        contained_path(get_upload_base_path(), path_for_validation)
         return True
+    except PathEscapesRoot:
+        logger.warning(f"Rejected path outside base: {path}")
+        return False
     except Exception as e:
         logger.error(f"Path validation error for {path}: {e}")
         return False
@@ -121,7 +123,7 @@ def get_physical_path(relative_path: str) -> Path:
     base = get_upload_base_path()
     if not relative_path or relative_path == "/":
         return base
-    return base / relative_path.lstrip("/")
+    return contained(base, relative_path.lstrip("/"))
 
 
 # ============================================================================
@@ -175,7 +177,7 @@ _DOC_SORT_COLS = {
 LIVE_REPO_PREFIX = "/__repo__"
 
 # File-browser label for the live repo mount; follows the product name so
-# white-label distributions read naturally (e.g. "Roof Brain Code").
+# white-label distributions read naturally (e.g. "Acme Studio Code").
 _REPO_MOUNT_NAME = f"{GUAARDVARK_PROJECT_NAME} Code"
 
 
@@ -194,6 +196,7 @@ def _live_repo_mount_folder() -> dict:
             "source_type": "live_repo",
             "repo_root": str(root),
             "mount_mode": "read_first_review_apply",
+            **live_repo_analysis_summary(root),
         },
         "subfolder_count": 0,
         "document_count": 0,
@@ -398,7 +401,7 @@ def create_folder():
         db.session.add(new_folder)
         db.session.commit()
         logger.info(f"Created folder: {new_folder.name} at {new_folder.path}")
-        return success_response(new_folder.to_dict(), 201)
+        return success_response(new_folder.to_dict(), "Folder created successfully", status_code=201)
     except SQLAlchemyError as e:
         db.session.rollback()
         logger.error(f"Database error creating folder: {e}", exc_info=True)
@@ -544,6 +547,109 @@ def move_folder(folder_id):
     except Exception as e:
         logger.error(f"Error moving folder: {e}", exc_info=True)
         return error_response("Failed to move folder", 500, "MOVE_ERROR")
+
+
+# Folder attributes a duplicate inherits — everything that describes the folder
+# rather than identifying it. name/path/parent_id are set by the copy itself.
+_COPIED_FOLDER_FIELDS = (
+    "is_repository", "description", "repo_metadata",
+    "client_id", "project_id", "website_id", "tags", "notes",
+)
+
+
+def _available_folder_name(dest_path: str, name: str) -> str:
+    """A folder name free at ``dest_path``, suffixed the way a copy is named."""
+    def taken(candidate: str) -> bool:
+        path = f"{dest_path}/{candidate}" if dest_path else candidate
+        return (
+            Folder.query.filter_by(path=path).first() is not None
+            or get_physical_path(path).exists()
+        )
+
+    if not taken(name):
+        return name
+    candidate = f"{name} (Copy)"
+    n = 2
+    while taken(candidate):
+        candidate = f"{name} (Copy {n})"
+        n += 1
+    return candidate
+
+
+def _copy_folder_tree(folder: Folder, dest_path: str, dest_folder_id, new_name: str) -> Folder:
+    """Recreate ``folder`` and everything under it at ``dest_path``.
+
+    Rows are added but not committed: one tree is one transaction, so a failure
+    halfway down does not leave half a folder in the database.
+    """
+    new_path = f"{dest_path}/{new_name}" if dest_path else new_name
+    os.makedirs(get_physical_path(new_path), exist_ok=True)
+
+    new_folder = Folder(name=new_name, path=new_path, parent_id=dest_folder_id)
+    for field in _COPIED_FOLDER_FIELDS:
+        if hasattr(folder, field):
+            setattr(new_folder, field, getattr(folder, field))
+    db.session.add(new_folder)
+    db.session.flush()  # the children need the new id
+
+    for document in folder.documents.all():
+        _copy_document_into(document, new_path, new_folder.id)
+    for subfolder in folder.subfolders.all():
+        _copy_folder_tree(subfolder, new_path, new_folder.id, subfolder.name)
+    return new_folder
+
+
+@files_bp.route("/folder/<int:folder_id>/copy", methods=["POST"])
+@ensure_db_session_cleanup
+def copy_folder(folder_id):
+    """POST /api/files/folder/:id/copy - Deep-copy a folder into another folder
+
+    Body: {"target_folder_id": <int|null>} — null copies into the root.
+    """
+    logger.info(f"API: Copy folder {folder_id}")
+    try:
+        folder = db.session.get(Folder, folder_id)
+        if not folder:
+            return error_response("Folder not found", 404, "FOLDER_NOT_FOUND")
+
+        data = request.get_json(silent=True) or {}
+        target_folder_id = data.get("target_folder_id")
+
+        dest_path = ""
+        if target_folder_id is not None:
+            try:
+                target_folder_id = int(target_folder_id)
+            except (TypeError, ValueError):
+                return error_response("Invalid target folder id", 400, "INVALID_TARGET")
+            if target_folder_id == folder.id:
+                return error_response("Cannot copy folder into itself", 400, "INVALID_COPY")
+            target = db.session.get(Folder, target_folder_id)
+            if not target:
+                return error_response("Destination folder not found", 404, "DEST_NOT_FOUND")
+            dest_path = target.path
+            # A copy into a descendant would walk into the tree it is writing.
+            if dest_path == folder.path or dest_path.startswith(folder.path + "/"):
+                return error_response(
+                    "Cannot copy folder into its own subfolder", 400, "INVALID_COPY"
+                )
+
+        new_folder = _copy_folder_tree(
+            folder, dest_path, target_folder_id,
+            _available_folder_name(dest_path, folder.name),
+        )
+        db.session.commit()
+        logger.info(f"Copied folder {folder_id} to {new_folder.path} (new id={new_folder.id})")
+        # The folder dict the folder POST returns, under a real 201: the
+        # sibling routes pass 201 as the *message* argument and answer 200.
+        return success_response(new_folder.to_dict(), "Folder copied", 201)
+    except SQLAlchemyError as e:
+        db.session.rollback()
+        logger.error(f"Database error copying folder: {e}", exc_info=True)
+        return error_response("Database error", 500, "DB_ERROR")
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Error copying folder: {e}", exc_info=True)
+        return error_response("Failed to copy folder", 500, "COPY_ERROR")
 
 
 def _cascade_properties_to_folder(folder: Folder, properties: dict, stats: dict):
@@ -696,10 +802,15 @@ def _delete_folder_recursive(folder: Folder, deleted_folders: list, deleted_docu
     index_instance = current_app.config.get("LLAMA_INDEX_INDEX")
     storage_dir = current_app.config.get("STORAGE_DIR")
     if doc_ids_to_deindex and index_instance and storage_dir and hasattr(index_instance, "delete_ref_doc"):
+        from backend.services.indexing_service import purge_document_vectors
+        # Node ids are `doc_<id>_<hash>` per source fragment, so `delete_ref_doc`
+        # matched on a bare document id never found anything -- it removed nothing
+        # and logged success, leaving deleted documents answering questions.
+        # purge_document_vectors does the prefix match the ids actually need.
         for ref_doc_id in doc_ids_to_deindex:
             try:
-                index_instance.delete_ref_doc(ref_doc_id, delete_from_docstore=True)
-                logger.info(f"Removed document {ref_doc_id} from vector index")
+                _removed = purge_document_vectors(ref_doc_id)
+                logger.info(f"Removed document {ref_doc_id} from vector index ({_removed} chunk(s))")
             except Exception:
                 logger.warning(f"Failed to remove doc {ref_doc_id} from index (continuing)")
         try:
@@ -806,6 +917,61 @@ def toggle_repo_status(folder_id):
         logger.error(f"Error toggling repo status: {e}", exc_info=True)
         return error_response(f"Failed to toggle repository status: {e}", 500, "TOGGLE_ERROR")
 
+
+@files_bp.route("/repositories", methods=["GET"])
+@ensure_db_session_cleanup
+def list_repositories():
+    """GET /api/files/repositories - Folders marked as Code Repositories"""
+    try:
+        repos = Folder.query.filter_by(is_repository=True).all()
+        return success_response({
+            "repositories": [
+                {
+                    "id": f.id,
+                    "name": f.name,
+                    "path": f.path,
+                    "has_metadata": bool(f.repo_metadata),
+                    "description": (f.description or "")[:200],
+                }
+                for f in repos
+            ]
+        })
+    except SQLAlchemyError as e:
+        logger.error(f"Database error listing repositories: {e}", exc_info=True)
+        return error_response("Database error", 500, "DB_ERROR")
+
+
+@files_bp.route("/folder/<int:folder_id>/repository", methods=["GET"])
+@ensure_db_session_cleanup
+def get_repository(folder_id):
+    """GET /api/files/folder/:id/repository - Repository metadata and on-disk root"""
+    try:
+        folder = db.session.get(Folder, folder_id)
+        if not folder:
+            return error_response("Folder not found", 404, "FOLDER_NOT_FOUND")
+        metadata = folder.repo_metadata
+        if isinstance(metadata, str) and metadata:
+            try:
+                metadata = json.loads(metadata)
+            except ValueError:
+                return error_response("Repository metadata is not valid JSON", 500, "BAD_REPO_METADATA")
+        try:
+            physical_path = str(get_physical_path(folder.path).resolve())
+        except (ValueError, PathEscapesRoot) as e:
+            logger.warning(f"Folder {folder_id} has no resolvable location: {e}")
+            physical_path = None
+        return success_response({
+            "id": folder.id,
+            "name": folder.name,
+            "path": folder.path,
+            "is_repository": bool(folder.is_repository),
+            "metadata": metadata or None,
+            "physical_path": physical_path,
+        })
+    except SQLAlchemyError as e:
+        logger.error(f"Database error reading repository {folder_id}: {e}", exc_info=True)
+        return error_response("Database error", 500, "DB_ERROR")
+
 # ============================================================================
 # FILE OPERATIONS
 # ============================================================================
@@ -861,7 +1027,7 @@ def upload_file():
             response_data['job_id'] = job_id
         
         logger.info(f"Successfully uploaded file {document.filename} (ID: {document.id})")
-        return success_response(response_data, 201)
+        return success_response(response_data, "File uploaded successfully", status_code=201)
         
     except ValueError as e:
         logger.warning(f"Validation error during upload: {e}")
@@ -973,6 +1139,51 @@ def move_document(doc_id):
         return error_response("Failed to move document", 500, "MOVE_ERROR")
 
 
+def _copy_document_into(document, dest_path: str, dest_folder_id):
+    """Copy one document's file, thumbnail and row into ``dest_path``.
+
+    Returns the new (added, uncommitted) row so a caller copying a whole tree
+    commits once.
+    """
+    old_physical = get_physical_path(document.path)
+    physical_filename = Path(document.path).name
+    prefix = dest_path.lstrip("/") if dest_path and dest_path != "/" else ""
+    new_rel_path = f"{prefix}/{physical_filename}" if prefix else physical_filename
+
+    # Handle name collision
+    new_physical = get_physical_path(new_rel_path)
+    if new_physical.exists():
+        new_filename = f"{old_physical.stem} (Copy){old_physical.suffix}"
+        new_rel_path = f"{prefix}/{new_filename}" if prefix else new_filename
+        new_physical = get_physical_path(new_rel_path)
+
+    new_physical.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(old_physical), str(new_physical))
+
+    # Also copy thumbnail if it exists
+    thumb_name = old_physical.stem + ".jpg"
+    thumb_src = old_physical.parent / "thumbnails" / thumb_name
+    if thumb_src.exists():
+        dest_thumb_dir = new_physical.parent / "thumbnails"
+        dest_thumb_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(thumb_src), str(dest_thumb_dir / thumb_name))
+
+    new_doc = DBDocument(
+        filename=Path(new_rel_path).name,
+        path=new_rel_path,
+        type=document.type,
+        folder_id=dest_folder_id,
+        size=document.size,
+        index_status="NOT_INDEXED",
+        is_code_file=document.is_code_file,
+        file_metadata=document.file_metadata,
+        uploaded_at=datetime.datetime.now(),
+        updated_at=datetime.datetime.now(),
+    )
+    db.session.add(new_doc)
+    return new_doc
+
+
 @files_bp.route("/document/<int:doc_id>/copy", methods=["POST"])
 @ensure_db_session_cleanup
 def copy_document(doc_id):
@@ -997,55 +1208,11 @@ def copy_document(doc_id):
                 return error_response("Destination folder not found", 404, "DEST_NOT_FOUND")
             dest_folder_id = dest_folder.id
 
-        # Physical copy
-        old_physical = get_physical_path(document.path)
-        physical_filename = Path(document.path).name
-        if dest_path and dest_path != "/":
-            new_rel_path = f"{dest_path.lstrip('/')}/{physical_filename}"
-        else:
-            new_rel_path = physical_filename
-
-        # Handle name collision
-        new_physical = get_physical_path(new_rel_path)
-        if new_physical.exists():
-            stem = old_physical.stem
-            ext = old_physical.suffix
-            new_filename = f"{stem} (Copy){ext}"
-            if dest_path and dest_path != "/":
-                new_rel_path = f"{dest_path.lstrip('/')}/{new_filename}"
-            else:
-                new_rel_path = new_filename
-            new_physical = get_physical_path(new_rel_path)
-
-        new_physical.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(old_physical), str(new_physical))
-
-        # Also copy thumbnail if it exists
-        thumb_dir = old_physical.parent / "thumbnails"
-        thumb_name = old_physical.stem + ".jpg"
-        thumb_src = thumb_dir / thumb_name
-        if thumb_src.exists():
-            dest_thumb_dir = new_physical.parent / "thumbnails"
-            dest_thumb_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(thumb_src), str(dest_thumb_dir / thumb_name))
-
-        # Create new document record
-        new_doc = DBDocument(
-            filename=Path(new_rel_path).name,
-            path=new_rel_path,
-            type=document.type,
-            folder_id=dest_folder_id,
-            size=document.size,
-            index_status="NOT_INDEXED",
-            is_code_file=document.is_code_file,
-            file_metadata=document.file_metadata,
-            uploaded_at=datetime.datetime.now(),
-            updated_at=datetime.datetime.now(),
-        )
-        db.session.add(new_doc)
+        new_doc = _copy_document_into(document, dest_path, dest_folder_id)
+        new_rel_path = new_doc.path
         db.session.commit()
         logger.info(f"Copied document {doc_id} to {new_rel_path} (new id={new_doc.id})")
-        return success_response(new_doc.to_dict(), 201)
+        return success_response(new_doc.to_dict(), "Document copied successfully", status_code=201)
     except SQLAlchemyError as e:
         db.session.rollback()
         logger.error(f"Database error copying document: {e}", exc_info=True)
@@ -1076,9 +1243,14 @@ def delete_document(doc_id):
         if (index_instance and storage_dir and
                 hasattr(index_instance, "delete_ref_doc")):
             try:
-                ref_doc_id = str(document.id)
-                index_instance.delete_ref_doc(ref_doc_id, delete_from_docstore=True)
-                logger.info(f"Removed document {doc_id} from vector index")
+                from backend.services.indexing_service import purge_document_vectors
+                # Node ids are `doc_<id>_<hash>` per source fragment, so `delete_ref_doc`
+                # matched on a bare document id never found anything -- it removed nothing
+                # and logged success, leaving deleted documents answering questions.
+                # purge_document_vectors does the prefix match the ids actually need.
+                _removed = purge_document_vectors(
+                    document.id, getattr(document, "project_id", None))
+                logger.info(f"Removed document {doc_id} from vector index ({_removed} chunk(s))")
                 try:
                     index_instance.storage_context.persist(persist_dir=storage_dir)
                 except Exception as persist_err:
@@ -1170,10 +1342,13 @@ def bulk_delete():
         index_instance = current_app.config.get("LLAMA_INDEX_INDEX")
         storage_dir = current_app.config.get("STORAGE_DIR")
         if doc_ids_to_deindex and index_instance and storage_dir and hasattr(index_instance, "delete_ref_doc"):
+            from backend.services.indexing_service import purge_document_vectors
+            # Same id mismatch as the other delete paths: node ids are
+            # `doc_<id>_<hash>`, so a bare document id matched nothing.
             for ref_doc_id in doc_ids_to_deindex:
                 try:
-                    index_instance.delete_ref_doc(ref_doc_id, delete_from_docstore=True)
-                    logger.info(f"Bulk: removed document {ref_doc_id} from vector index")
+                    _removed = purge_document_vectors(ref_doc_id)
+                    logger.info(f"Bulk: removed document {ref_doc_id} from vector index ({_removed} chunk(s))")
                 except Exception:
                     logger.warning(f"Bulk: failed to remove doc {ref_doc_id} from index (continuing)")
             try:
@@ -1345,7 +1520,7 @@ def get_thumbnail():
         if not ensure_path_is_safe(doc_path):
             return error_response("Invalid path", 400, "INVALID_PATH")
         base = get_upload_base_path()
-        doc_physical = base / doc_path.lstrip("/")
+        doc_physical = contained(base, doc_path.lstrip("/"))
         if not doc_physical.exists():
             return error_response("File not found", 404, "FILE_NOT_FOUND")
     else:
@@ -1518,7 +1693,7 @@ def edit_image():
                 folder_id=document.folder_id,
                 file_size=0,
                 file_type=f"image/{target_format}",
-                uploaded_at=datetime.datetime.utcnow(),
+                uploaded_at=utcnow(),
             )
             db.session.add(out_doc)
 

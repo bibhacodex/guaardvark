@@ -330,6 +330,20 @@ class AgentExecutor:
             logger.error(f"Failed to initialize default LLM for AgentExecutor: {e}", exc_info=True)
             return None
 
+    def _name_available_tools_on_miss(self, result) -> None:
+        """When the model invents a tool name, tell it what exists. A bare
+        "not found" left a local model retrying variations until the run
+        ran out (directed run 24, 2026-09-05: tool_code_read_file)."""
+        try:
+            if result.success or "not found in registry" not in (result.error or ""):
+                return
+            names = sorted(self.tool_registry.list_tools())
+            if names:
+                result.error = (f"{result.error}. Use one of the tools that exist: "
+                                f"{', '.join(names)}")
+        except Exception:
+            pass
+
     def set_tool_context(self, **kwargs):
         """Set extra kwargs that get forwarded to every tool execute() call."""
         self._tool_context.update(kwargs)
@@ -660,7 +674,7 @@ What tool do you need to call next?"""
             logger.info(f"Executing tool: {tool_call.tool_name}")
 
             # Normalize parameters - handle nested parameter/value format
-            normalized_params = self._normalize_tool_parameters(tool_call.parameters)
+            normalized_params = self._normalize_tool_parameters(tool_call.parameters, tool_call.tool_name)
             logger.debug(f"Tool {tool_call.tool_name} parameters: {normalized_params}")
 
             log_tool_call("agent_executor", tool_call.tool_name, normalized_params,
@@ -708,7 +722,8 @@ What tool do you need to call next?"""
                 except Exception:
                     pass
             result = self.tool_registry.execute_tool(tool_call.tool_name, agent_context=self._tool_context, **normalized_params)
-            
+            self._name_available_tools_on_miss(result)
+
             # Register result as resource if coordinator available
             if self.coordinator and process_id and result.success and result.output:
                 from backend.utils.system_coordinator import ResourceType
@@ -1067,6 +1082,7 @@ EXAMPLE - Final answer (no tools needed):
 
             # Execute
             result = self.tool_registry.execute_tool(sel.tool_name, agent_context=self._tool_context, **normalized_params)
+            self._name_available_tools_on_miss(result)
 
             if self.coordinator and process_id and result.success and result.output:
                 from backend.utils.system_coordinator import ResourceType
@@ -1305,7 +1321,7 @@ If the answer needs correction, respond with: CORRECTED: [corrected answer using
             logger.error(f"LLM verification failed: {e}", exc_info=True)
             return (False, answer)
     
-    def _normalize_tool_parameters(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_tool_parameters(self, params: Dict[str, Any], tool_name: Optional[str] = None) -> Dict[str, Any]:
         """
         Normalize tool parameters to handle different LLM output formats.
         
@@ -1352,29 +1368,11 @@ If the answer needs correction, respond with: CORRECTED: [corrected answer using
         # Already in direct format or unknown format
         result = params if isinstance(params, dict) else {}
 
-        # Coerce string values to proper types (LLM outputs XML text as strings)
-        coerced = {}
-        for k, v in result.items():
-            if isinstance(v, str):
-                low = v.lower().strip()
-                if low == 'true':
-                    coerced[k] = True
-                elif low == 'false':
-                    coerced[k] = False
-                elif low == 'none' or low == 'null':
-                    coerced[k] = None
-                else:
-                    # Try int/float coercion
-                    try:
-                        coerced[k] = int(v)
-                    except ValueError:
-                        try:
-                            coerced[k] = float(v)
-                        except ValueError:
-                            coerced[k] = v
-            else:
-                coerced[k] = v
-        return coerced
+        # Coerce string values (text tool-call formats) using the tool's schema
+        from backend.services.agent_tools import coerce_params_to_schema
+
+        tool = self.tool_registry.get_tool(tool_name) if tool_name else None
+        return coerce_params_to_schema(result, tool)
     
     def _summarize_steps(self, steps: List[AgentStep]) -> str:
         """Summarize agent steps into a coherent response"""

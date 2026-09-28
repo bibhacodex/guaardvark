@@ -33,7 +33,8 @@ WHAT_IS = (
     "Guaardvark is a self-hosted AI system that writes, voices, shoots, and "
     "edits video — chat, image gen, video gen, voice cloning, an autonomous "
     "screen agent, and a full AI film crew — running on a single desktop GPU, "
-    "no cloud API calls. This is one of 12 walkthrough episodes."
+    "no cloud API calls. This episode is part of the Guaardvark walkthrough "
+    "series."
 )
 
 TAGS_COMMON = ["Guaardvark", "local AI", "self-hosted AI", "open source AI",
@@ -43,6 +44,27 @@ TAGS_COMMON = ["Guaardvark", "local AI", "self-hosted AI", "open source AI",
 # not the finer-grained SERIES.md beat plan, which the production consolidated
 # during editing. Overrides the placeholder chapters below for these episodes.
 REAL_CHAPTERS = {
+    # EP19_FINAL.mp4 (2026-09-27): cold open 12.8, teach 23.4, photo 37.0,
+    # consent 25.4, mcp 16.0, end card 7.3.
+    19: [
+        (0, "Cold open"),
+        (13, "A thumb that teaches"),
+        (36, "Photo editing in chat"),
+        (73, "Consent before likeness"),
+        (99, "MCP, the other direction"),
+        (115, "One machine. No cloud."),
+    ],
+    # Beat lengths of ep16_mcp_20260913_021604 (doctor 24.0, install 27.0,
+    # policy 37.0, profiles 38.5, client 44.5, approvals 34.0, fixed 42.5).
+    16: [
+        (0, "Doctor"),
+        (24, "Install"),
+        (51, "The policy"),
+        (88, "An index profile for clients"),
+        (126, "A client on camera"),
+        (171, "Approvals"),
+        (205, "A caveat, recorded and fixed"),
+    ],
     5: [
         (0, "Hook — the Media Director"),
         (27, "The wall — browsing the pre-rendered batch"),
@@ -52,7 +74,7 @@ REAL_CHAPTERS = {
         (99, "Closer — auto-filing into Files"),
     ],
     6: [
-        (0, "Hook — seven video models, one GPU"),
+        (0, "Hook — eleven video models, one GPU, one of them talks"),
         (22, "Preset tour — Quality, Duration, Motion, Aspect"),
         (43, "Live render — Queued → Storyboard → Director → Generating"),
         (72, "Draft-tier render"),
@@ -237,11 +259,13 @@ EPISODES = {
         title="Hollywood on One GPU — Video Gen",
         keyword="video gen",
         hook=(
-            "Seven video models. Wan. CogVideoX. LTX. Text to video, image to "
-            "video — on the same card that ran your chat in episode two."
+            "Eleven video models across five families. Wan. CogVideoX. LTX. "
+            "HunyuanVideo. MiniMax H3, which renders picture and its own "
+            "soundtrack in one pass — on the same card that ran your chat in "
+            "episode two."
         ),
         body=(
-            "Episode 6 tours video generation: seven backend models behind "
+            "Episode 6 tours video generation: eleven backend models behind "
             "one interface, the quality/duration/motion/aspect preset system, "
             "instant prompt styles, a live Fast-tier render with staged "
             "progress, the gpu_wait queue (renders wait for the card instead "
@@ -249,8 +273,8 @@ EPISODES = {
             "to the underlying ComfyUI graph."
         ),
         chapters=[
-            "Seven video models, one GPU",
-            "Model menu — Wan, CogVideoX, LTX...",
+            "Eleven video models, one GPU",
+            "Model menu — Wan, CogVideoX, LTX, Hunyuan, MiniMax H3",
             "Preset tour — Quality, Duration, Motion, Aspect",
             "Prompt styles — Cinematic, Anime, Claymation, Ghibli",
             "Live render — Queued → Storyboard → Director → Keyframe → Generating → Post",
@@ -455,6 +479,181 @@ EPISODES = {
         links=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
         tags=["AI safety", "kill switch", "GPU resource management"],
     ),
+    13: dict(
+        title="The New Front Door — Workspaces, and Everything New Since Episode 12",
+        keyword="what's new",
+        hook=(
+            "Thirty-four pages, four groups, one sidebar — that was the front "
+            "door for twelve episodes. Now it is a setting. Eight workspaces, "
+            "one row of tools, and a tour of what landed since the series "
+            "ended."
+        ),
+        body=(
+            "The Workspaces top bar driven by the same navigation catalog as "
+            "the sidebar, the keyboard shortcuts overlay, a fresh batch of "
+            "renders in the Media Library, MiniMax H3 with native audio and a "
+            "compiled prompt you can read before you render, chat reasoning "
+            "streamed as its own channel with inline file artifacts, product "
+            "profiles, Export Chats, Delete History, the rebuilt guaardvark "
+            "command line, and the live GPU numbers everything ran on."
+        ),
+        chapters=[
+            "The sidebar becomes a setting",
+            "Eight workspaces, three pins",
+            "Keyboard shortcuts overlay",
+            "Media Library — this morning's batch",
+            "MiniMax H3 — a compiled prompt",
+            "Two honest notes",
+            "Reasoning as its own channel",
+            "A file lands in the chat",
+            "Profiles, Export Chats, Delete History",
+            "The guaardvark REPL",
+            "One machine. No cloud.",
+        ],
+        links=[2, 5, 6, 7, 12, 14, 15, 16, 17],
+        tags=["local AI", "workspaces UI", "MiniMax H3"],
+    ),
+    14: dict(
+        title="A Map of Everything — the System Map, Episode 14",
+        keyword="system map",
+        hook=(
+            "Every module in this product, drawn from its real imports. "
+            "Click one and it tells you who depends on it, whether it still "
+            "runs, and what is wrong."
+        ),
+        body=(
+            "The System Map on its own: a force-directed constellation of "
+            "1,300+ modules computed from the code on disk, section "
+            "spotlights, search, the tool-graph and ghost-endpoint overlays, "
+            "ranked findings with the file and line, the finding that caught "
+            "an unreachable chat tool (the fix cites it by id, and the map "
+            "needed its own fix to clear it), a dispatch that stages the exact "
+            "one-line proposal for review, and a chat tool call pulsing its "
+            "module in real time."
+        ),
+        chapters=[
+            "The constellation",
+            "Spotlight a section",
+            "Search, and the detail panel",
+            "Tool graph and ghost endpoints",
+            "Ranked findings",
+            "The bug the map caught",
+            "Send it to the self-improvement agent",
+            "Live — a tool call pulses its module",
+            "Would rather miss than lie",
+        ],
+        links=[3, 11, 13, 15, 16],
+        tags=["codebase visualization", "dependency graph", "self-improving AI"],
+    ),
+    15: dict(
+        title="Guaardvark Codes — Editor, Guardrails, and the Fix Queue",
+        keyword="self-coding AI",
+        hook=(
+            "This product edits its own code. That sentence should worry "
+            "you — so here is every gate between an idea and a changed file."
+        ),
+        body=(
+            "The code editor, chat that runs workstation tools instead of "
+            "describing them, the codebase lock that returns 423 to every "
+            "writer including the AI, self-check runs and the fix queue with "
+            "bulk approve and apply, the guardian's six directives, the "
+            "unified overnight director with its morning report, and the "
+            "scheduler gate that used to be advisory."
+        ),
+        chapters=[
+            "The editor",
+            "Chat that runs tools",
+            "The lock",
+            "Self-check and the fix queue",
+            "The guardian",
+            "The overnight director",
+            "The gate that lied",
+        ],
+        links=[11, 13, 14, 16, 17],
+        tags=["AI coding agent", "self-improving software", "human in the loop"],
+    ),
+    16: dict(
+        title="Plug In Anything — MCP, Episode 16",
+        keyword="MCP server",
+        hook=(
+            "Any client that speaks the protocol. And a policy that says no "
+            "by default."
+        ),
+        body=(
+            "The MCP server's doctor and install commands, the default-deny "
+            "policy and the approval rule that decide which registered tools "
+            "a client can see, an index profile tuned for MCP clients, Claude "
+            "Code searching a synthetic company's documents through Guaardvark "
+            "with nothing of the operator's own setup loaded and then asking "
+            "to publish a post, the approvals page where that request waits "
+            "for a person, and a caveat recorded in one commit and fixed in a "
+            "later one."
+        ),
+        chapters=[
+            "Doctor",
+            "Install",
+            "The policy",
+            "An index profile for clients",
+            "A client on camera",
+            "Approvals",
+            "A caveat, recorded and fixed",
+        ],
+        links=[2, 3, 12, 13, 14],
+        tags=["Model Context Protocol", "MCP", "local AI tools"],
+    ),
+    17: dict(
+        title="Five Agents, One Repo — Swarm, Episode 17",
+        keyword="agent swarm",
+        hook=(
+            "Five agents. One repository. Every one of them in its own copy."
+        ),
+        body=(
+            "The swarm orchestrator: six templates, the launch dialog with "
+            "flight mode and auto-merge, a live dependency graph, one "
+            "worktree per task on its own branch, the live diff, merge and "
+            "clean up, and the resource monitor that stops spawning agents "
+            "when the machine is busy."
+        ),
+        chapters=[
+            "The sidecar",
+            "Templates",
+            "Launch",
+            "The graph",
+            "Worktrees",
+            "Merge and clean up",
+            "What this launch proved",
+        ],
+        links=[11, 13, 14, 15],
+        tags=["multi-agent", "git worktree", "parallel coding agents"],
+    ),
+    19: dict(
+        title="Everything New in 2.9 — Guaardvark, Episode 19",
+        keyword="local AI photo editing",
+        hook=(
+            "A thumb that says what it taught. Photo edits in chat. And a "
+            "face that needs your say-so first."
+        ),
+        body=(
+            "What landed since Episode 13, on the real product: a thumbs up "
+            "that names the memories it credited and a second click that takes "
+            "it back, a photo edited three ways inside chat (night, wider, "
+            "background gone), a consent card that stops any likeness before "
+            "it renders, and the MCP client connecting an outside tool server "
+            "whose tools join Guaardvark's own under the same policy. Render "
+            "waits are sped up on screen, with the speed shown. The photo and "
+            "the face were generated on the same machine for the demo."
+        ),
+        chapters=[
+            "A thumb that teaches",
+            "Photo editing in chat",
+            "Consent before likeness",
+            "MCP, the other direction",
+            "One machine. No cloud.",
+        ],
+        links=[13, 16],
+        tags=["AI photo editing", "local image editing", "MCP client",
+              "human in the loop"],
+    ),
 }
 
 
@@ -465,7 +664,8 @@ def render(num):
     lines.append("")
     lines.append(ep["body"])
     lines.append("")
-    lines.append(f"{MANTRA} This is Episode {num} of 12.")
+    lines.append(f"{MANTRA} This is Episode {num} of 12." if num <= 12
+                 else f"{MANTRA} This is Episode {num}.")
     lines.append("")
     if num in REAL_CHAPTERS:
         lines.append("CHAPTERS")

@@ -28,6 +28,8 @@ from backend.services.video_generation_router import (
     get_video_generator,
 )
 from backend.services.gpu_resource_coordinator import get_gpu_coordinator
+from backend.utils.path_guard import PathEscapesRoot, contained
+from backend.services.job_types import RenderErrorKind
 
 try:
     from backend.config import UPLOAD_DIR
@@ -43,14 +45,19 @@ _I2V_CAPTION_PROMPT = (
     "setting, and lighting. Describe exactly what is shown — do not invent "
     "details that are not visible."
 )
+# Motion-only fallback when the VLM returns nothing. Does not invent a subject.
+_I2V_MOTION_ONLY = (
+    "Animate this image with subtle natural motion. Keep the subject, "
+    "outfit, and scene exactly as shown."
+)
 
 
 def _caption_image_for_i2v(image_path: str) -> str:
     """VLM caption of an I2V source image, or "" when the VLM is unavailable.
 
     Uses the shared offline VisionAnalyzer (same model as character_captioner /
-    film_curator). Never raises — I2V must proceed with a generic prompt rather
-    than fail the item over captioning."""
+    film_curator). Never raises — I2V proceeds without a caption rather than
+    failing the item."""
     try:
         from PIL import Image
         from backend.utils.vision_analyzer import VisionAnalyzer
@@ -58,10 +65,21 @@ def _caption_image_for_i2v(image_path: str) -> str:
         res = VisionAnalyzer().analyze(img, _I2V_CAPTION_PROMPT, think=False)
         if getattr(res, "success", False) and (getattr(res, "description", "") or "").strip():
             return res.description.strip()
-        logger.warning("I2V auto-caption: VLM gave no description for %s", image_path)
+        logger.info("I2V auto-caption: VLM gave no description for %s", image_path)
     except Exception as e:
-        logger.warning("I2V auto-caption failed for %s: %s", image_path, e)
+        logger.info("I2V auto-caption failed for %s: %s", image_path, e)
     return ""
+
+
+def _i2v_prompt_from_caption(caption: str) -> tuple[str, bool]:
+    """(prompt, caption_empty). An empty VLM result is not filled with invented detail."""
+    text = (caption or "").strip()
+    if text:
+        return (
+            f"{text} Subtle natural motion; keep the subject, outfit, and scene exactly as shown.",
+            False,
+        )
+    return _I2V_MOTION_ONLY, True
 
 
 def _derive_display_name(text: str, max_len: int = 40) -> str:
@@ -119,6 +137,10 @@ class BatchVideoItem:
     id: str
     prompt: Optional[str] = None
     image_path: Optional[str] = None
+    # End frame for models that declare l2v / flf2v (MiniMax H3).
+    last_frame_path: Optional[str] = None
+    # Anchors for models that declare audio_in: [{"kind", "path", "frame_idx", ...}].
+    guides: List[Dict] = field(default_factory=list)
     metadata: Dict = field(default_factory=dict)
 
 
@@ -135,6 +157,8 @@ class BatchVideoRequest:
     motion_strength: float = 1.0
     num_inference_steps: int = 25
     guidance_scale: float = 7.5
+    # False when the request named no guidance (see VideoGenerationRequest).
+    cfg_explicit: bool = False
     seed: Optional[int] = None
     generate_frames_only: bool = False
     frames_per_batch: int = 1
@@ -143,11 +167,18 @@ class BatchVideoRequest:
     prompt_style: str = "cinematic"
     enhance_prompt: bool = True
     fidelity_mode: bool = False  # "Exact text / preserve fidelity" — light enhancement only
+    wan_sampler_profile: Optional[str] = None  # Wan 5B: "adaptive" | "official"
     negative_prompt: str = ""
     freeu: bool = False
     face_restore: bool = False
     lora_name: Optional[str] = None
     lora_strength: float = 1.0
+    adapters: List[Dict] = field(default_factory=list)
+    text_encoder: Optional[str] = None
+    # Capability-contract knobs (video_model_registry): a declared speed profile
+    # (turbo LoRA + step count) and a declared style embedding id.
+    speed_profile: Optional[str] = None
+    style_embedding: Optional[str] = None
     # Cast members (trained character LoRAs) to lock into each clip. Resolved once
     # per batch via cast_lock.subjects_to_lock; the LoRA is baked into the cinematic
     # keyframe (the video model can't apply it). Selecting cast implies cinematic.
@@ -170,6 +201,7 @@ class BatchVideoResult:
     thumbnail_path: Optional[str] = None
     error: Optional[str] = None
     metadata: Dict = field(default_factory=dict)
+    error_kind: Optional[str] = None  # job_types.RenderErrorKind value
 
 
 @dataclass
@@ -191,6 +223,17 @@ class BatchVideoStatus:
     stage: str = "queued"
     current_item: Optional[str] = None
     progress_pct: Optional[int] = None
+    # Why the batch as a whole stopped (job_types.RenderErrorKind value); a
+    # failed clip carries its own on its result.
+    error_kind: Optional[str] = None
+
+
+AUTO_RETRY_ENV = "GUAARDVARK_VIDEO_AUTO_RETRY"
+
+
+def auto_retry_enabled() -> bool:
+    """Retry a clip whose failure kind is retryable (off by default)."""
+    return (os.environ.get(AUTO_RETRY_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class BatchVideoGenerator:
@@ -211,7 +254,7 @@ class BatchVideoGenerator:
         self._running_batch_id: Optional[str] = None
 
         self.video_generator = get_video_generator()
-        self.service_available = getattr(self.video_generator, 'service_available', True) and video_generator_available if 'video_generator_available' in dir() else self.video_generator.service_available
+        self.service_available = getattr(self.video_generator, 'service_available', True)
         # Edge graceful: on no-GPU, batch video (which uses offline or Comfy) will inherit unavailable with reason from underlying generator.
         _get_video_logger()  # Initialize dedicated log file
 
@@ -222,9 +265,25 @@ class BatchVideoGenerator:
         )
         self._worker_thread.start()
 
-        self._restore_pending_batches()
+        # Only the API process resumes on-disk batches. Celery, the MCP stdio
+        # server and ad-hoc scripts construct this class too; if they restored,
+        # every restart would render the same batch from two PIDs into one dir.
+        if self._restore_allowed():
+            self._restore_pending_batches()
+        else:
+            logger.info("BatchVideoGenerator: restore-on-start skipped in this process")
 
         logger.info(f"BatchVideoGenerator initialized - Service available: {self.service_available}")
+
+    @staticmethod
+    def _restore_allowed() -> bool:
+        if os.environ.get("GUAARDVARK_VIDEO_RESTORE_ON_START", "1") != "1":
+            return False
+        if os.environ.get("CELERY_WORKER_MODE", "").lower() == "true":
+            return False
+        if os.environ.get("GUAARDVARK_MCP_PROCESS") == "1":
+            return False
+        return True
 
     def _restore_pending_batches(self) -> None:
         """Re-enqueue batches left queued/running on disk after a process restart."""
@@ -307,6 +366,7 @@ class BatchVideoGenerator:
                 cancel_event = self.cancel_events.get(batch_request.batch_id)
                 if cancel_event and cancel_event.is_set():
                     status.status = "cancelled"
+                    status.error_kind = RenderErrorKind.CANCELLED.value
                     status.end_time = datetime.now()
                     if not status.error:
                         status.error = "Cancelled before start"
@@ -318,8 +378,10 @@ class BatchVideoGenerator:
                 self._run_batch(batch_request, status)
             except Exception as e:
                 logger.error(f"Queue worker crashed on batch {batch_request.batch_id}: {e}")
+                from backend.services.job_operation_gate import classify_render_exception
                 status.status = "error"
                 status.error = str(e)
+                status.error_kind = classify_render_exception(e).value
                 status.end_time = datetime.now()
                 self._save_metadata(status)
             finally:
@@ -356,21 +418,28 @@ class BatchVideoGenerator:
             return False
 
     def _get_batch_dir(self, batch_id: str) -> Path:
-        return self.base_output_dir / batch_id
+        return contained(self.base_output_dir, batch_id)
 
     def _attach_quality_metrics(
         self,
         batch_result: BatchVideoResult,
         *,
         video_path: str,
+        expected: Optional[Dict] = None,
         keyframe_path: Optional[str] = None,
         cinematic: bool = False,
         high_consistency: bool = False,
     ) -> None:
-        """Best-effort quality sidecar for completed clips (never raises / never fails the item)."""
+        """Quality record for a completed clip (never raises / never fails the item).
+
+        ``video_path`` is the clip's absolute path. The frame checker's flags
+        (``quality.flags``: code and a plain message) mark a clip that finished
+        but is not usable; ``expected`` holds the width, height and frame count
+        the request resolved to."""
         try:
             from backend.services.video_consistency_metrics import (
                 compute_basic_video_stats,
+                inspect_video_frames,
                 score_identity_preservation,
                 review_video_quality,
                 annotate_asset,
@@ -379,11 +448,23 @@ class BatchVideoGenerator:
             logger.debug("quality metrics import failed: %s", e)
             return
 
-        quality: Dict = {"flagged": False, "flag_reasons": []}
+        quality: Dict = {"flagged": False, "flag_reasons": [], "flags": []}
         try:
             quality["stats"] = compute_basic_video_stats(video_path)
         except Exception as e:
             logger.debug("basic video stats failed: %s", e)
+
+        try:
+            check = inspect_video_frames(video_path, **(expected or {}))
+            quality["frames"] = {k: check.get(k) for k in (
+                "readable", "width", "height", "frames", "fps", "duration_s", "sampled", "metrics",
+                "observations")}
+            quality["flags"] = check.get("flags") or []
+            if quality["flags"]:
+                quality["flagged"] = True
+                quality["flag_reasons"].extend(f["code"] for f in quality["flags"])
+        except Exception as e:  # noqa: BLE001 — the checker must never fail a render
+            logger.warning("frame quality check skipped for %s: %s", video_path, e)
 
         if cinematic and keyframe_path and Path(keyframe_path).exists():
             try:
@@ -413,6 +494,10 @@ class BatchVideoGenerator:
                             quality["flag_reasons"].append(
                                 f"low_identity_score:{score:.2f}"
                             )
+                            quality["flags"].append({
+                                "code": "low_identity_score",
+                                "message": f"the clip drifts from its keyframe: identity score {score:.2f}",
+                            })
             except Exception as e:
                 logger.debug("identity scoring skipped: %s", e)
 
@@ -426,6 +511,10 @@ class BatchVideoGenerator:
                     if isinstance(qscore, (int, float)) and qscore < 5:
                         quality["flagged"] = True
                         quality["flag_reasons"].append(f"low_vlm_score:{qscore}")
+                        quality["flags"].append({
+                            "code": "low_vlm_score",
+                            "message": f"the vision review scored it {qscore}/10",
+                        })
             except Exception as e:
                 logger.debug("VLM video review skipped: %s", e)
 
@@ -435,6 +524,24 @@ class BatchVideoGenerator:
             annotate_asset(video_path, {"quality": quality})
         except Exception:
             pass
+
+    @staticmethod
+    def _expected_output(gen_request: VideoGenerationRequest) -> Dict:
+        """Size and length the MP4 should have, from the request as generate_video
+        resolved it: upscale doubles the frame, RIFE multiplies the length, and a
+        model may move the length by one step of its frame grid."""
+        from backend.services.video_consistency_metrics import expected_output_frames, frame_grid_step
+        from backend.services.video_model_registry import model_capabilities
+
+        scale = 2 if (gen_request.metadata or {}).get("upscale") else 1
+        interp = max(1, int(gen_request.interpolation_multiplier or 1))
+        step = frame_grid_step((model_capabilities(gen_request.model) or {}).get("frame_rule"))
+        return {
+            "expected_width": int(gen_request.width) * scale,
+            "expected_height": int(gen_request.height) * scale,
+            "expected_frames": expected_output_frames(gen_request.duration_frames, interp),
+            "frame_tolerance": step * interp,
+        }
 
     @staticmethod
     def _compute_progress_pct(batch_status: BatchVideoStatus) -> int:
@@ -527,11 +634,21 @@ class BatchVideoGenerator:
                     it.prompt = new_prompt.strip()
                     changed += 1
             # Director output is already a complete cinematic prompt; don't double-enhance.
-            batch_request.enhance_prompt = False
-            logger.info(
-                f"Video Director enhanced {changed}/{len(text_items)} prompt(s) for batch "
-                f"{batch_request.batch_id}"
-            )
+            # Only when it actually produced one: media_director hands the ORIGINALS back on
+            # failure (and plan() hands back nothing), and switching the light enhancer off
+            # on top of that shipped raw prompts with no enhancement at all.
+            if changed:
+                batch_request.enhance_prompt = False
+                logger.info(
+                    f"Video Director enhanced {changed}/{len(text_items)} prompt(s) for batch "
+                    f"{batch_request.batch_id}"
+                )
+            else:
+                logger.warning(
+                    f"Director returned no rewrites for batch {batch_request.batch_id} "
+                    f"({(result.diagnostics or {}).get('reason', 'originals returned')}); "
+                    f"prompts and the light enhancer stand as they were."
+                )
         except Exception as e:  # noqa: BLE001 — director must never fail a render
             logger.warning(f"Director pass skipped for batch {batch_request.batch_id} (non-fatal): {e}")
 
@@ -554,27 +671,74 @@ class BatchVideoGenerator:
                 extra_guidance=getattr(batch_request, "director_guidance", None),
             ))
             shots = [s.prompt for s in result.shots]
+            changed = 0
             for it, shot in zip(batch_request.items, shots):
                 if shot and shot.strip():
+                    if shot.strip() != (it.prompt or "").strip():
+                        changed += 1
                     it.prompt = shot.strip()
-            batch_request.enhance_prompt = False
-            logger.info(
-                f"Storyboard expanded one concept into {len(shots)} shot(s) for batch "
-                f"{batch_request.batch_id}"
-            )
+            # Same rule as the director pass: the fallback is "the concept, n times",
+            # which is not a storyboard and must not switch the enhancer off.
+            if changed:
+                batch_request.enhance_prompt = False
+                logger.info(
+                    f"Storyboard expanded one concept into {len(shots)} shot(s) for batch "
+                    f"{batch_request.batch_id}"
+                )
+            else:
+                logger.warning(
+                    f"Storyboard returned no shots beyond the concept for batch "
+                    f"{batch_request.batch_id}; placeholder prompts and the light enhancer stand."
+                )
         except Exception as e:  # noqa: BLE001 — storyboard must never fail a render
             logger.warning(f"Storyboard expansion skipped for batch {batch_request.batch_id} (non-fatal): {e}")
 
+    def _render_with_retries(self, gen_request, cancel_event, item_id: str):
+        """Render one clip. With GUAARDVARK_VIDEO_AUTO_RETRY on, a failure whose
+        kind job_types.RENDER_ERROR_POLICY marks retryable is rendered again
+        after the policy's waits; off (the default), it renders once.
+
+        Each attempt gets a fresh copy of the request: generate_video rewrites
+        the prompt, negative and size in place, and a second pass over the
+        rewritten request would enhance the prompt twice."""
+        import copy
+
+        from backend.services.job_types import retry_waits
+
+        original = copy.deepcopy(gen_request)
+        result = self.video_generator.generate_video(gen_request)
+        if not auto_retry_enabled():
+            return result
+        attempts = 1
+        for wait_s in retry_waits(result.error_kind):
+            if result.success:
+                break
+            logger.info("Clip %s failed (%s); retrying in %.0fs (attempt %d)",
+                        item_id, result.error_kind, wait_s, attempts + 1)
+            if cancel_event is not None and cancel_event.wait(wait_s):
+                break
+            if cancel_event is None:
+                time.sleep(wait_s)
+            gen_request.__dict__.update(copy.deepcopy(original).__dict__)
+            result = self.video_generator.generate_video(gen_request)
+            attempts += 1
+            if not retry_waits(result.error_kind):
+                break  # succeeded, or failed in a way a retry cannot fix
+        result.metadata = dict(result.metadata or {})
+        result.metadata["render_attempts"] = attempts
+        return result
+
     @staticmethod
     def _to_i2v_model(model: Optional[str]) -> str:
-        """Map a text-to-video model to its image-to-video sibling for cinematic mode.
-        Defaults to the music-video quality animator (Wan 2.2 I2V)."""
-        m = (model or "").lower()
-        if "i2v" in m:
-            return model  # already an I2V model
-        if m.startswith("cogvideox"):
-            return "cogvideox-5b-i2v"
-        return "wan22-14b-i2v"
+        """The model that animates the cinematic keyframe.
+
+        A model that takes a first frame itself (LTX, MiniMax H3, Wan 5B TI2V,
+        any *-i2v) keeps the job; a pure T2V model hands it to its same-family
+        I2V sibling. Only an unknown model falls back to DEFAULT_I2V_MODEL. The
+        old rule swapped anything without "i2v" in its id for Wan 14B, so a
+        person who picked LTX or MiniMax got a Wan render."""
+        from backend.services.video_model_registry import i2v_model_for
+        return i2v_model_for(model or "")
 
     def _generate_keyframe_still(self, *, prompt: str, width: int, height: int,
                                  out_path: str, seed: int,
@@ -680,17 +844,11 @@ class BatchVideoGenerator:
             return None
 
     def _run_batch(self, batch_request: BatchVideoRequest, status: BatchVideoStatus) -> None:
-        # gpu_session composes gate + cross-process lease + Ollama eviction + VRAM
-        # orchestrator debit (P0.3c). Serial background queue waits out the gate
-        # busy/cooldown, then retries require_fit while residual Comfy weights
-        # still occupy the card — never cascade-fail the rest of the queue.
-        from backend.services.gpu_resource_policy import (
-            gpu_session,
-            is_capacity_overflow_error,
-            reclaim_and_settle,
-            vram_probe_snapshot,
-        )
-        from backend.services.job_operation_gate import GpuBusyError
+        # Serial background queue: retry a busy/resident refusal with backoff
+        # until the deadline; a capacity refusal is terminal. Eviction belongs to
+        # gpu_session once it has won the slot — this loop never reclaims.
+        from backend.services.gpu_resource_policy import gpu_session, vram_probe_snapshot
+        from backend.services.job_operation_gate import GpuBusyError, GpuCapacityError
         from backend.services.job_types import JobKind
         from backend.services.video_model_registry import vram_mb_for_model
 
@@ -717,6 +875,7 @@ class BatchVideoGenerator:
             if cancel_event and cancel_event.is_set():
                 status.status = "cancelled"
                 status.error = "Cancelled while waiting for GPU/VRAM"
+                status.error_kind = RenderErrorKind.CANCELLED.value
                 status.end_time = datetime.now()
                 self._set_stage(status, "done", save=False)
                 self._save_metadata(status)
@@ -750,6 +909,7 @@ class BatchVideoGenerator:
                     require_fit=True,
                     slot_id=slot_id,
                     lease_seconds=3600,
+                    cancel_event=cancel_event,
                 ):
                     # Clear wait metadata once admitted.
                     status.metadata.pop("gpu_wait_reason", None)
@@ -759,20 +919,20 @@ class BatchVideoGenerator:
                         parallel_comfyui=parallel_comfyui,
                     )
                 return
+            except GpuCapacityError as e:
+                status.status = "error"
+                status.error = f"Could not acquire GPU: {e}"
+                status.error_kind = RenderErrorKind.CARD_TOO_SMALL.value
+                status.end_time = datetime.now()
+                self._set_stage(status, "done", save=False)
+                self._save_metadata(status)
+                logger.error(
+                    "Batch %s capacity refuse (no retry): %s",
+                    batch_request.batch_id,
+                    e,
+                )
+                return
             except GpuBusyError as e:
-                if is_capacity_overflow_error(e):
-                    status.status = "error"
-                    status.error = f"Could not acquire GPU: {e}"
-                    status.end_time = datetime.now()
-                    self._set_stage(status, "done", save=False)
-                    self._save_metadata(status)
-                    logger.error(
-                        "Batch %s capacity refuse (no retry): %s",
-                        batch_request.batch_id,
-                        e,
-                    )
-                    return
-
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     status.status = "error"
@@ -780,6 +940,7 @@ class BatchVideoGenerator:
                         f"Could not acquire enough free VRAM after waiting "
                         f"{int(admit_deadline_s)}s: {e}"
                     )
+                    status.error_kind = RenderErrorKind.VRAM_BUSY.value
                     status.end_time = datetime.now()
                     self._set_stage(status, "done", save=False)
                     self._save_metadata(status)
@@ -791,26 +952,13 @@ class BatchVideoGenerator:
                     return
 
                 logger.warning(
-                    "Batch %s VRAM resident/busy (%s) — reclaiming and retrying "
+                    "Batch %s VRAM resident/busy (%s) — retrying "
                     "in %.0fs (%.0fs left)",
                     batch_request.batch_id,
                     e,
                     min(backoff_s, remaining),
                     remaining,
                 )
-                try:
-                    settled = reclaim_and_settle(
-                        evict_ollama=True, free_comfyui=True, settle_s=3.0
-                    )
-                    status.metadata["vram_free_mb"] = settled.get("free_mb")
-                    status.metadata["gpu_wait_reason"] = (
-                        f"Waiting for VRAM — "
-                        f"{(settled.get('free_mb') or 0) / 1024:.1f}GB free, "
-                        f"need ~{need_mb / 1024:.1f}GB"
-                    )
-                    self._save_metadata(status)
-                except Exception as reclaim_err:
-                    logger.debug("reclaim_and_settle failed: %s", reclaim_err)
 
                 sleep_for = min(backoff_s, max(0.5, deadline - time.time()))
                 # Wake early on cancel.
@@ -957,12 +1105,15 @@ class BatchVideoGenerator:
                 def _process_item(item):
                     """Inner worker: returns (batch_result, completed_delta, failed_delta, oom_flag)"""
                     if cancel_event and cancel_event.is_set():
-                        return (BatchVideoResult(item_id=item.id, success=False, error="cancelled before start"), 0, 0, False)
+                        return (BatchVideoResult(item_id=item.id, success=False, error="cancelled before start",
+                                             error_kind=RenderErrorKind.CANCELLED.value), 0, 0, False)
 
                     try:
                         meta = dict(item.metadata or {})
                         meta.setdefault("item_id", item.id)
                         meta["batch_controlled"] = True
+                        if cast_lora_paths or cast_keyframe_image or getattr(batch_request, "subject_ids", None):
+                            meta["cast"] = True
                         if item.image_path:
                             meta.setdefault("image_path", item.image_path)
 
@@ -1010,10 +1161,12 @@ class BatchVideoGenerator:
                                         require_cast=bool(_cast_ids or cast_lora_paths),
                                     )
                                 except RuntimeError as e:
+                                    from backend.services.job_operation_gate import classify_render_exception
                                     br = BatchVideoResult(
                                         item_id=item.id,
                                         success=False,
                                         error=str(e),
+                                        error_kind=classify_render_exception(e).value,
                                     )
                                     return (br, 0, 1, False)
                                 if kf:
@@ -1025,6 +1178,7 @@ class BatchVideoGenerator:
                                         item_id=item.id,
                                         success=False,
                                         error="Cast keyframe still missing — refusing plain T2V",
+                                        error_kind=RenderErrorKind.OUTPUT_MISSING.value,
                                     )
                                     return (br, 0, 1, False)
                                 # else: non-cast keyframe failed -> fall through to T2V
@@ -1036,16 +1190,14 @@ class BatchVideoGenerator:
                         if item.image_path and not (item.prompt or "").strip():
                             self._set_stage(status, "caption", current_item=item.id)
                             caption = _caption_image_for_i2v(item.image_path)
-                            item.prompt = (
-                                f"{caption} Subtle natural motion; keep the subject, "
-                                f"outfit, and scene exactly as shown."
-                                if caption else
-                                "Animate this image with subtle natural motion. Keep "
-                                "the subject, outfit, and scene exactly as shown."
-                            )
-                            logger.info(
-                                "I2V auto-caption for %s: %s", item.id, item.prompt[:120]
-                            )
+                            item.prompt, caption_empty = _i2v_prompt_from_caption(caption)
+                            meta["caption_empty"] = caption_empty
+                            if caption_empty:
+                                meta["caption"] = None
+                                logger.info("I2V auto-caption empty for %s — motion-only prompt", item.id)
+                            else:
+                                meta["caption"] = caption
+                                logger.info("I2V auto-caption for %s: %s", item.id, item.prompt[:120])
 
                         self._set_stage(status, "generate", current_item=item.id)
                         gen_request = VideoGenerationRequest(
@@ -1059,6 +1211,7 @@ class BatchVideoGenerator:
                             motion_strength=batch_request.motion_strength,
                             num_inference_steps=batch_request.num_inference_steps,
                             guidance_scale=batch_request.guidance_scale,
+                            cfg_explicit=batch_request.cfg_explicit,
                             seed=batch_request.seed,
                             generate_frames_only=batch_request.generate_frames_only,
                             frames_per_batch=batch_request.frames_per_batch,
@@ -1069,13 +1222,24 @@ class BatchVideoGenerator:
                             prompt_style=batch_request.prompt_style,
                             enhance_prompt=batch_request.enhance_prompt,
                             fidelity_mode=batch_request.fidelity_mode,
+                            wan_sampler_profile=batch_request.wan_sampler_profile,
                             freeu=batch_request.freeu,
                             face_restore=batch_request.face_restore,
                             lora_name=batch_request.lora_name,
                             lora_strength=batch_request.lora_strength,
+                            adapters=list(batch_request.adapters or []),
+                            text_encoder=batch_request.text_encoder,
+                            speed_profile=batch_request.speed_profile,
+                            style_embedding=batch_request.style_embedding,
+                            last_frame_path=item.last_frame_path,
+                            guides=list(item.guides or []),
+                            ref_images=list((item.metadata or {}).get("ref_images") or meta.get("ref_images") or []),
+                            ref_videos=list((item.metadata or {}).get("ref_videos") or meta.get("ref_videos") or []),
+                            ref_audios=list((item.metadata or {}).get("ref_audios") or meta.get("ref_audios") or []),
                         )
 
-                        result: VideoGenerationResult = self.video_generator.generate_video(gen_request)
+                        result: VideoGenerationResult = self._render_with_retries(
+                            gen_request, cancel_event, item.id)
                         br = BatchVideoResult(
                             item_id=item.id,
                             success=result.success,
@@ -1083,13 +1247,19 @@ class BatchVideoGenerator:
                             frame_paths=result.frame_paths,
                             thumbnail_path=result.thumbnail_path,
                             error=result.error,
-                            metadata=dict(result.metadata or {}),
+                            error_kind=result.error_kind or (None if result.success else RenderErrorKind.UNKNOWN.value),
+                            metadata={
+                                **dict(result.metadata or {}),
+                                **({k: meta[k] for k in ("caption_empty", "caption") if k in meta}),
+                            },
                         )
                         if result.success and result.video_path:
                             self._set_stage(status, "post", current_item=item.id, save=False)
+                            from backend.services.comfyui_video_generator import resolve_generated_video_path
                             self._attach_quality_metrics(
                                 br,
-                                video_path=result.video_path,
+                                video_path=str(resolve_generated_video_path(result, batch_dir)),
+                                expected=self._expected_output(gen_request),
                                 keyframe_path=meta.get("image_path"),
                                 cinematic=bool(meta.get("cinematic_keyframe")),
                                 high_consistency=bool(
@@ -1112,10 +1282,12 @@ class BatchVideoGenerator:
                                 self.video_generator.service_available = False
                             except Exception:
                                 pass
+                        from backend.services.job_operation_gate import classify_render_exception
                         br = BatchVideoResult(
                             item_id=item.id,
                             success=False,
                             error=err_str + oom_note,
+                            error_kind=classify_render_exception(e).value,
                         )
                         return (br, 0, 1, is_oom)
 
@@ -1175,8 +1347,17 @@ class BatchVideoGenerator:
                     max_workers = 1
                 else:
                     max_workers = max(1, min(4, len(items)))
+                from backend.services.gpu_resource_policy import adopt_gpu_session
+
+                def _process_item_adopted(it):
+                    # The batch holds gpu_session on this thread's parent; pool
+                    # workers must adopt so the router session is a pass-through
+                    # instead of a degraded second exclusive claim.
+                    with adopt_gpu_session():
+                        return _process_item(it)
+
                 with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="video-item") as ex:
-                    future_map = {ex.submit(_process_item, it): it for it in items}
+                    future_map = {ex.submit(_process_item_adopted, it): it for it in items}
                     for fut in as_completed(future_map):
                         if cancel_event and cancel_event.is_set():
                             status.status = "cancelled"
@@ -1192,7 +1373,10 @@ class BatchVideoGenerator:
                             it = future_map[fut]
                             logger.error(f"Item worker {it.id} failed: {e}")
                             status.failed_videos += 1
-                            status.results.append(BatchVideoResult(item_id=it.id, success=False, error=str(e)))
+                            from backend.services.job_operation_gate import classify_render_exception
+                            status.results.append(BatchVideoResult(
+                                item_id=it.id, success=False, error=str(e),
+                                error_kind=classify_render_exception(e).value))
                         finally:
                             self._save_metadata(status)
 
@@ -1218,13 +1402,30 @@ class BatchVideoGenerator:
                             batch_id = batch_request.batch_id
                             ensure_subfolder("Videos", batch_id)
                             batch_dir = Path(batch_request.output_dir)
+                            # What the clip is and who made it travels with the
+                            # Document: the editor keeps a soundtrack it knows is
+                            # there, and publishing can carry the attribution the
+                            # model's license asks for.
+                            file_meta = {"source": "batch_generation", "batch_id": batch_id,
+                                         "model": batch_request.model}
+                            try:
+                                from backend.services.video_model_registry import VIDEO_MODEL_REGISTRY
+                                lic = (VIDEO_MODEL_REGISTRY.get(batch_request.model) or {}).get("license") or {}
+                                if lic.get("attribution"):
+                                    file_meta["attribution"] = lic["attribution"]
+                            except Exception:
+                                pass
+                            audio_clips = {
+                                Path(r.video_path).name for r in status.results
+                                if r.success and r.video_path and (r.metadata or {}).get("has_audio") == "1"
+                            }
                             # Register all video files found in the batch directory
                             for vid_file in sorted(batch_dir.rglob("*.mp4")):
                                 register_file(
                                     physical_path=str(vid_file),
                                     folder_name="Videos",
                                     subfolder_name=batch_id,
-                                    file_metadata={"source": "batch_generation", "batch_id": batch_id},
+                                    file_metadata={**file_meta, "has_audio": vid_file.name in audio_clips},
                                 )
                             logger.info(f"Registered batch {batch_id} videos into Documents system")
                         finally:
@@ -1245,9 +1446,13 @@ class BatchVideoGenerator:
     ) -> BatchVideoStatus:
         from backend.services.output_registration import bates_name
         batch_id = params.get("batch_id") or bates_name("video_batch", "", self.base_output_dir)
+        guides_per_item = list(params.pop("guides", None) or [])
         items = [
-            BatchVideoItem(id=str(uuid.uuid4()), prompt=p, metadata={"source": "prompt"})
-            for p in prompts
+            BatchVideoItem(
+                id=str(uuid.uuid4()), prompt=p, metadata={"source": "prompt"},
+                guides=list(guides_per_item[i] or []) if i < len(guides_per_item) else [],
+            )
+            for i, p in enumerate(prompts)
         ]
         metadata = dict(params.get("metadata") or {})
         if not metadata.get("display_name") and prompts:
@@ -1263,6 +1468,10 @@ class BatchVideoGenerator:
         from backend.services.output_registration import bates_name
         batch_id = params.get("batch_id") or bates_name("video_batch", "", self.base_output_dir)
         user_prompt = params.pop("prompt", "")
+        # Index-paired with image_paths: an end frame per item (flf2v) and the
+        # guides per item. Shorter lists leave the remaining items without.
+        last_frame_paths = list(params.pop("last_frame_paths", None) or [])
+        guides_per_item = list(params.pop("guides", None) or [])
         items = [
             BatchVideoItem(
                 id=str(uuid.uuid4()),
@@ -1271,9 +1480,11 @@ class BatchVideoGenerator:
                 # placeholder here used to drive identity drift in LTX I2V).
                 prompt=user_prompt or "",
                 image_path=path,
+                last_frame_path=(last_frame_paths[i] if i < len(last_frame_paths) else None) or None,
+                guides=list(guides_per_item[i] or []) if i < len(guides_per_item) else [],
                 metadata={"source": "image", "image_path": path},
             )
-            for path in image_paths
+            for i, path in enumerate(image_paths)
         ]
         metadata = dict(params.get("metadata") or {})
         if not metadata.get("display_name"):
@@ -1295,18 +1506,35 @@ class BatchVideoGenerator:
             except Exception:
                 seed_value = None
 
+        from backend.services.video_model_registry import clip_defaults_for
+        model_id = params.get("model") or "wan22-5b"
+        native = clip_defaults_for(model_id)
+
+        def _param_int(key, fallback):
+            raw = params.get(key)
+            if raw in (None, ""):
+                return fallback
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return fallback
+
+        guidance = params.get("guidance_scale")
+        cfg_explicit = guidance not in (None, "")
+
         batch_request = BatchVideoRequest(
             batch_id=batch_id,
             items=items,
             output_dir=str(batch_dir),
-            model=params.get("model", "wan22-5b"),
-            duration_frames=int(params.get("duration_frames", 25)),
-            fps=int(params.get("fps", 7)),
-            width=int(params.get("width", 512)),
-            height=int(params.get("height", 512)),
+            model=model_id,
+            duration_frames=_param_int("duration_frames", native["duration_frames"]),
+            fps=_param_int("fps", native["fps"]),
+            width=_param_int("width", native["width"]),
+            height=_param_int("height", native["height"]),
             motion_strength=float(params.get("motion_strength", 1.0)),
-            num_inference_steps=int(params.get("num_inference_steps", 25)),
-            guidance_scale=float(params.get("guidance_scale", 7.5)),
+            num_inference_steps=_param_int("num_inference_steps", native["num_inference_steps"]),
+            guidance_scale=float(guidance) if cfg_explicit else 7.5,
+            cfg_explicit=cfg_explicit,
             seed=seed_value,
             generate_frames_only=bool(params.get("generate_frames_only", False)),
             frames_per_batch=int(params.get("frames_per_batch", 1)),
@@ -1315,11 +1543,16 @@ class BatchVideoGenerator:
             prompt_style=params.get("prompt_style", "cinematic"),
             enhance_prompt=bool(params.get("enhance_prompt", True)),
             fidelity_mode=bool(params.get("fidelity_mode", False)),
+            wan_sampler_profile=params.get("wan_sampler_profile") or None,
             negative_prompt=params.get("negative_prompt", "") or "",
             freeu=bool(params.get("freeu", False)),
             face_restore=bool(params.get("face_restore", False)),
             lora_name=params.get("lora_name"),
             lora_strength=float(params.get("lora_strength", 1.0)),
+            adapters=list(params.get("adapters") or []) if isinstance(params.get("adapters"), list) else [],
+            text_encoder=params.get("text_encoder") or None,
+            speed_profile=params.get("speed_profile") or None,
+            style_embedding=params.get("style_embedding") or None,
             subject_ids=[int(s) for s in (params.get("subject_ids") or []) if str(s).strip()],
             director_mode=bool(params.get("director_mode", False)),
             cinematic_keyframe=bool(params.get("cinematic_keyframe", False)),
@@ -1352,7 +1585,8 @@ class BatchVideoGenerator:
                 "height": batch_request.height,
                 "motion_strength": batch_request.motion_strength,
                 "num_inference_steps": batch_request.num_inference_steps,
-                "guidance_scale": batch_request.guidance_scale,
+                # A retry of a batch that named no guidance names none either.
+                "guidance_scale": batch_request.guidance_scale if batch_request.cfg_explicit else None,
                 "seed": batch_request.seed,
                 "generate_frames_only": batch_request.generate_frames_only,
                 "frames_per_batch": batch_request.frames_per_batch,
@@ -1361,11 +1595,18 @@ class BatchVideoGenerator:
                 "prompt_style": batch_request.prompt_style,
                 "enhance_prompt": batch_request.enhance_prompt,
                 "fidelity_mode": batch_request.fidelity_mode,
+                "wan_sampler_profile": batch_request.wan_sampler_profile,
+                # A profile carries its own step count; saving the steps without it
+                # restores a 4-step Lightning batch as a 4-step Standard one.
+                "speed_profile": batch_request.speed_profile,
+                "style_embedding": batch_request.style_embedding,
                 "negative_prompt": batch_request.negative_prompt,
                 "freeu": batch_request.freeu,
                 "face_restore": batch_request.face_restore,
                 "lora_name": batch_request.lora_name,
                 "lora_strength": batch_request.lora_strength,
+                "adapters": list(batch_request.adapters or []),
+                "text_encoder": batch_request.text_encoder,
                 "subject_ids": list(batch_request.subject_ids or []),
                 "cinematic_keyframe": bool(batch_request.cinematic_keyframe),
                 "director_mode": bool(batch_request.director_mode),
@@ -1467,6 +1708,7 @@ class BatchVideoGenerator:
                     stage=data.get("stage") or "done",
                     current_item=data.get("current_item"),
                     progress_pct=data.get("progress_pct"),
+                    error_kind=data.get("error_kind"),
                 )
             except Exception as e:  # pragma: no cover
                 logger.error(f"Failed to load batch status for {batch_id}: {e}")
@@ -1493,6 +1735,7 @@ class BatchVideoGenerator:
 
             was_running = (status.status == "running") or (self._running_batch_id == batch_id)
             status.status = "cancelled"
+            status.error_kind = RenderErrorKind.CANCELLED.value
             status.end_time = datetime.now()
             if not status.error:
                 status.error = "Cancelled by user"
@@ -1688,7 +1931,10 @@ class BatchVideoGenerator:
             gate = get_gate()
             snap = gate.snapshot()
             holder = snap.get("gpu_holder") or {}
-            if holder.get("kind") == JobKind.VIDEO_RENDER.value:
+            # Only a claim one of these batches made: a Studio image batch or a
+            # router render also claims VIDEO_RENDER and is still running.
+            if (holder.get("kind") == JobKind.VIDEO_RENDER.value
+                    and str(holder.get("native_id", "")) in {str(b) for b in cancelled}):
                 gate.release_gpu_exclusive(JobKind.VIDEO_RENDER, str(holder.get("native_id", "")))
         except Exception as e:
             logger.warning(f"cancel_all_active: gate release failed: {e}")
@@ -1815,10 +2061,24 @@ class BatchVideoGenerator:
             shutil.rmtree(batch_dir)
             with self.batch_lock:
                 self.active_batches.pop(batch_id, None)
-            return True
         except Exception as e:  # pragma: no cover
             logger.error(f"Failed to delete batch {batch_id}: {e}")
             return False
+
+        # The directory is gone, so the rows that pointed into it have to go
+        # too — otherwise the Documents tree keeps an empty folder and the
+        # Jobs page keeps history for a batch that no longer exists. A database
+        # failure does not undo the files that are already deleted.
+        try:
+            from backend.services.generation_history_service import delete_batch_history_rows
+            delete_batch_history_rows(
+                video_batch_ids=[batch_id], triggered_by="batch_video_delete"
+            )
+        except Exception as e:
+            logger.error(
+                "Batch %s files deleted but its database rows remain: %s", batch_id, e
+            )
+        return True
 
     def rename_batch(self, batch_id: str, new_name: str) -> bool:
         batch_dir = self._get_batch_dir(batch_id)
@@ -1853,7 +2113,10 @@ class BatchVideoGenerator:
         # Determine target item directory
         item_dir: Optional[Path] = None
         if item_id:
-            candidate = batch_dir / item_id
+            try:
+                candidate = contained(batch_dir, item_id)
+            except PathEscapesRoot:
+                return None
             if candidate.exists():
                 item_dir = candidate
         else:

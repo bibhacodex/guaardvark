@@ -15,6 +15,7 @@ from backend.utils.plugin_secrets import (
     secret_field_names,
 )
 from ..plugins import get_plugin_manager
+from backend.utils.path_guard import PathEscapesRoot, contained, contained_path
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,10 @@ def _read_plugin_log_text(plugin_id: str, lines: int) -> tuple[str, int, str]:
     candidates = PLUGIN_LOG_CANDIDATES.get(plugin_id, [f"{plugin_id}.log"])
     log_dir = Path(LOG_DIR)
     for name in candidates:
-        path = log_dir / name
+        try:
+            path = contained(log_dir, name)
+        except PathEscapesRoot:
+            continue
         if path.is_file():
             text, count = _tail_text_file(path, lines)
             return text, count, str(path)
@@ -313,9 +317,15 @@ def update_plugin_config(plugin_id):
         # Work on a shallow copy so we can strip secrets safely.
         updates = dict(data)
         secret_result = apply_secret_updates(plugin_id, updates)
-        if secret_result.get("env_result", {}).get("error"):
+        # env_result is present-but-None whenever no secret was written (i.e.
+        # every plugin except discord, and discord itself when the token field
+        # is untouched). dict.get's default only applies to a MISSING key, so
+        # the old `.get("env_result", {})` handed back None and every config
+        # save raised AttributeError -> 500.
+        env_result = secret_result.get("env_result") or {}
+        if env_result.get("error"):
             return error_response(
-                f"Failed to save secret: {secret_result['env_result']['error']}",
+                f"Failed to save secret: {env_result['error']}",
                 500,
                 "PLUGIN_SECRET_WRITE_ERROR",
             )

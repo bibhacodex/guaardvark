@@ -7,18 +7,26 @@ and the cast endpoint already records the user's chosen action."""
 from __future__ import annotations
 import json
 import logging
+import os
 from pathlib import Path
 from celery import Celery
 from flask import current_app
 
 from backend.models import db, Subject
+from backend.utils.clock import utcnow
+from backend.utils.platform import (
+    LORA_REAP_STUCK_AFTER_S,
+    LORA_TRAIN_TASK_SOFT_TIME_LIMIT_S,
+    LORA_TRAIN_TASK_TIME_LIMIT_S,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def _output_dir() -> str:
+    from backend.config import STORAGE_DIR
     return (current_app.config.get("LORA_OUTPUT_DIR")
-            or "data/training/loras")
+            or os.path.join(STORAGE_DIR, "training", "loras"))
 
 
 def _train_impl(subject_id: int, job_id: str | None = None) -> dict:
@@ -171,9 +179,14 @@ def _train_impl(subject_id: int, job_id: str | None = None) -> dict:
             # which left no room for SDXL on the 16GB card. The bare gate did no
             # VRAM math, so training claimed "exclusive" while ollama still owned
             # 6.7GB → CUDA OOM. Reclaim runs only AFTER we hold the slot.
+            # cross_process: the Flask API renders stills under its own in-PID
+            # gate, so only the file lease keeps training off a card mid-render.
+            from backend.services.gpu_resource_policy import compositor_vram_reserve_mb
             with gpu_session(JobKind.LORA_TRAIN, f"subject_{s.id}",
                              evict_ollama=True, free_comfyui=True,
-                             vram_estimate_mb=12000, require_fit=True):
+                             vram_estimate_mb=12000, require_fit=True,
+                             cross_process=True, lease_seconds=4 * 3600,
+                             vram_reserve_mb=compositor_vram_reserve_mb()):
                 if job_id:
                     try:
                         get_unified_progress().update_process(job_id, 30, "GPU claimed, training epochs running (can take hours)")
@@ -227,11 +240,13 @@ def _train_impl(subject_id: int, job_id: str | None = None) -> dict:
     # Reaching here means the real trainer was NOT selected. Outside of pytest that
     # is a hard failure — we do NOT silently produce a fake LoRA (NO-MOCKS policy).
     # The most common cause in 'auto' is that RealLoraTrainer.is_available() returned
-    # False: the venv-torch CUDA probe didn't see a GPU (or timed out under contention).
-    # Fail loud with guidance; the caller marks the Subject 'failed' with this message.
+    # False: the accelerator probe (CUDA or Apple MPS) didn't see a device (or timed
+    # out under contention). Fail loud with guidance; the caller marks the Subject
+    # 'failed' with this message.
     if not allow_mock:
-        msg = ("Real LoRA trainer unavailable (venv-torch/CUDA probe failed). "
-               "Verify the GPU is free (nvidia-smi) and the trainer venv exists "
+        msg = ("Real LoRA trainer unavailable (accelerator probe failed: no CUDA or "
+               "Apple MPS). Verify the GPU is free (nvidia-smi) or MPS is available "
+               "(Apple Silicon), and the trainer venv exists "
                "(plugins/lora_trainer/scripts/setup_venv.sh), then retry. To bypass "
                "the probe under contention, set GUAARDVARK_LORA_BACKEND=real. "
                "Mock training is disabled by policy.")
@@ -264,7 +279,16 @@ def _train_impl(subject_id: int, job_id: str | None = None) -> dict:
 
 
 def create_lora_trainer_tasks(celery_app: Celery):
-    @celery_app.task(name="lora_trainer.train_lora")
+    # Task limits are derived from the one platform flag in backend.utils.platform
+    # so the daemon caps, these task limits, and the reaper cutoff cannot drift
+    # apart. On stock (CUDA) both are None, so the global task_soft_time_limit /
+    # task_time_limit apply unchanged.
+    task_limits = {}
+    if LORA_TRAIN_TASK_TIME_LIMIT_S is not None:
+        task_limits["soft_time_limit"] = LORA_TRAIN_TASK_SOFT_TIME_LIMIT_S
+        task_limits["time_limit"] = LORA_TRAIN_TASK_TIME_LIMIT_S
+
+    @celery_app.task(name="lora_trainer.train_lora", **task_limits)
     def train_lora_task(subject_id: int, job_id: str | None = None):
         with current_app.app_context():
             train_subject_lora_for_subject(subject_id, job_id=job_id)
@@ -308,7 +332,40 @@ def train_subject_lora_for_subject(subject_id: int, job_id: str | None = None) -
         except Exception:
             pass
 
-    result = _train_impl(subject_id, job_id=job_id)
+    try:
+        result = _train_impl(subject_id, job_id=job_id)
+    except Exception as e:
+        # Daemon protocol failures (stdout closed, watchdog kill, non-JSON reply)
+        # escape _train_impl; without this the Subject sits at 'training' until
+        # the reaper notices.
+        logger.exception("lora train for %s crashed", subject_id)
+        db.session.rollback()
+        s = db.session.get(Subject, subject_id)
+        if s is not None and s.training_status == "training":
+            s.training_status = "failed"
+            s.training_error = f"{type(e).__name__}: {e}"[:2000]
+            db.session.commit()
+        if job_id:
+            try:
+                get_unified_progress().error_process(job_id, f"training crashed: {e}")
+            except Exception:
+                pass
+        return
+
+    # Cancel or delete may have moved the row while the GPU work ran; only a
+    # Subject still marked 'training' may be promoted to 'trained'.
+    db.session.refresh(s)
+    if s.training_status != "training":
+        logger.warning(
+            "lora train for %s finished but status is %r; result not recorded",
+            subject_id, s.training_status,
+        )
+        if job_id:
+            try:
+                get_unified_progress().error_process(job_id, f"training superseded (status={s.training_status})")
+            except Exception:
+                pass
+        return
 
     # Perform all DB updates and commit BEFORE notifying the progress system.
     # This avoids a race where the frontend receives the "complete" event and
@@ -320,8 +377,7 @@ def train_subject_lora_for_subject(subject_id: int, job_id: str | None = None) -
         s.lora_version = result.get("lora_version", 1)
         s.training_status = "trained"
         s.training_error = None
-        from datetime import datetime
-        s.last_trained_at = datetime.utcnow()
+        s.last_trained_at = utcnow()
 
         # Only record image lists + promote samples after a *verified real* train.
         # real_trainer writes sidecar mock=false; anything else (or a tiny weights
@@ -429,15 +485,25 @@ def train_subject_lora_for_subject(subject_id: int, job_id: str | None = None) -
         logger.warning(f"lora train failed for subject {subject_id}: {err}")
 
         if "CUDA not available" in err or "cuda.is_available" in err.lower():
-            s.training_error = (
-                "CUDA not available inside the isolated trainer venv.\n\n"
-                "Your RTX 4070 Ti SUPER should work. Run these on the host:\n"
-                "  1. nvidia-smi   (must show your 4070 Ti SUPER and a recent driver)\n"
-                "  2. cd plugins/lora_trainer && ./scripts/setup_venv.sh\n"
-                "  3. Reboot if drivers were just installed.\n"
-                "Then click 'Train LoRA' again from the Cast page.\n\n"
-                "Original error: " + err
-            )[:2000]
+            from backend.utils.platform import describe, has_cuda
+
+            if has_cuda():
+                # The host sees a CUDA GPU but the trainer's own venv does not:
+                # a driver/venv mismatch, repairable on the host.
+                guidance = (
+                    "CUDA not available inside the isolated trainer venv, although this host "
+                    f"has one ({describe()}). Run on the host:\n"
+                    "  1. nvidia-smi   (must list the GPU and a recent driver)\n"
+                    "  2. cd plugins/lora_trainer && ./scripts/setup_venv.sh\n"
+                    "  3. Reboot if drivers were just installed.\n"
+                    "Then click 'Train LoRA' again from the Cast page."
+                )
+            else:
+                guidance = (
+                    f"LoRA training needs an NVIDIA GPU (CUDA). This machine: {describe()}. "
+                    "Apple Silicon (Metal) is not supported by the trainer yet."
+                )
+            s.training_error = (guidance + "\n\nOriginal error: " + err)[:2000]
         db.session.commit()
 
         if job_id:
@@ -452,14 +518,18 @@ def reap_stuck_training_subjects() -> dict:
     'failed' so the UI re-enables the Train button. A worker that dies mid-run
     (its trainer daemon now reaped by PR_SET_PDEATHSIG) loses the Celery task, so
     nothing marks the Subject failed — it would otherwise stay 'training' forever.
-    The 45-minute cutoff is deliberately > the 30-min _TRAIN_TIMEOUT_S, so a job
-    that is genuinely still running is never reaped. Uses the DB clock to avoid
-    process/DB timezone skew."""
+    The cutoff comes from the one platform flag in backend.utils.platform
+    (LORA_REAP_STUCK_AFTER_S) so it cannot drift from the daemon and task limits:
+    on Apple Silicon it sits past the 255 min task hard-limit, on stock CUDA it
+    stays the long-standing 45 min (> the 30 min train cap). Uses the DB clock to
+    avoid process/DB timezone skew."""
     from sqlalchemy import text
+
     stale = (
         Subject.query
         .filter(Subject.training_status == "training",
-                Subject.updated_at < text("now() - interval '45 minutes'"))
+                Subject.updated_at < text("now() - make_interval(secs => :stale_s)"))
+        .params(stale_s=LORA_REAP_STUCK_AFTER_S)
         .all()
     )
     for s in stale:

@@ -15,6 +15,8 @@ from enum import Enum
 import threading
 import time
 
+from backend.utils.path_guard import PathEscapesRoot, contained
+
 logger = logging.getLogger(__name__)
 
 
@@ -456,6 +458,8 @@ class UnifiedProgressSystem:
         # completed jobs back into activeProcesses, preventing ProgressFooterBar from hiding
         # Updated to 60s to give frontend enough time to read final state before disk cleanup
         cleanup_timer = threading.Timer(60.0, self._cleanup_process, args=[process_id])
+        # Housekeeping timers must never keep the interpreter alive at exit.
+        cleanup_timer.daemon = True
         cleanup_timer.start()
         self._timeout_timers[f"{process_id}_cleanup"] = cleanup_timer
         
@@ -469,6 +473,7 @@ class UnifiedProgressSystem:
         
         # Schedule new timeout timer
         timeout_timer = threading.Timer(timeout_seconds, self._timeout_stuck_process, args=[process_id])
+        timeout_timer.daemon = True
         timeout_timer.start()
         self._timeout_timers[f"{process_id}_timeout"] = timeout_timer
         
@@ -577,7 +582,7 @@ class UnifiedProgressSystem:
             
         try:
             progress_dir = Path(str(self._output_dir)) / ".progress_jobs"
-            job_dir = progress_dir / process_id
+            job_dir = contained(progress_dir, process_id)
             metadata_file = job_dir / "metadata.json"
             
             if not metadata_file.exists():
@@ -620,7 +625,7 @@ class UnifiedProgressSystem:
             
         try:
             progress_dir = Path(str(self._output_dir)) / ".progress_jobs"
-            metadata_file = progress_dir / process_id / "metadata.json"
+            metadata_file = contained(progress_dir, process_id, "metadata.json")
             
             if metadata_file.exists():
                 raw = metadata_file.read_text(encoding="utf-8")
@@ -646,7 +651,7 @@ class UnifiedProgressSystem:
             
         try:
             progress_dir = Path(str(self._output_dir)) / ".progress_jobs"
-            metadata_file = progress_dir / process_id / "metadata.json"
+            metadata_file = contained(progress_dir, process_id, "metadata.json")
             
             if metadata_file.exists():
                 raw = metadata_file.read_text(encoding="utf-8")
@@ -706,7 +711,7 @@ class UnifiedProgressSystem:
         if self._file_based_enabled and self._output_dir:
             try:
                 progress_dir = Path(self._output_dir) / ".progress_jobs"
-                job_dir = progress_dir / process_id
+                job_dir = contained(progress_dir, process_id)
                 if job_dir.exists():
                     shutil.rmtree(job_dir)
                     logger.info(f"Cleaned up process files: {process_id}")

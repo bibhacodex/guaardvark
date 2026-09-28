@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import math
 import re
-from datetime import datetime, timezone
 from typing import Any
 
 MEMORY_TYPES = {
@@ -44,6 +43,7 @@ MEMORY_SOURCES = {
     "cli",
     "agent",
     "auto",
+    "bundle",
     "lesson_summary",
     "learned_from_feedback",
     "candidate_recipe",
@@ -64,6 +64,7 @@ DEFAULT_IMPORTANCE_BY_TYPE = {
 SOURCE_TRUST_WEIGHTS = {
     "manual": 1.0,
     "cli": 0.95,
+    "bundle": 0.93,
     "chat": 0.88,
     "lesson_summary": 0.86,
     "learned_from_feedback": 0.84,
@@ -135,10 +136,6 @@ def coerce_confidence(value: Any) -> float:
 
 def source_trust_weight(source: Any) -> float:
     return SOURCE_TRUST_WEIGHTS.get(str(source or "").lower(), 0.7)
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def query_tokens(text: str | None) -> set[str]:

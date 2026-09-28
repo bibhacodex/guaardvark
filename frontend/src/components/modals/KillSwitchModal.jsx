@@ -25,11 +25,13 @@ import {
   Speed as SpeedIcon
 } from '@mui/icons-material';
 import voiceService from '../../api/voiceService';
+import { ConfirmActionDialog } from '../settings/ui';
 
 const KillSwitchModal = ({ open, onClose }) => {
   const [isLoading, setIsLoading] = useState(false);
   const [systemStatus, setSystemStatus] = useState(null);
   const [killResult, setKillResult] = useState(null);
+  const [confirmKill, setConfirmKill] = useState(false);
   const [error, setError] = useState(null);
 
   const handleGetSystemStatus = async () => {
@@ -267,7 +269,7 @@ const KillSwitchModal = ({ open, onClose }) => {
         </Button>
         
         <Button 
-          onClick={handleKillAllProcesses}
+          onClick={() => setConfirmKill(true)}
           disabled={isLoading}
           variant="contained"
           color="error"
@@ -275,6 +277,18 @@ const KillSwitchModal = ({ open, onClose }) => {
         >
           KILL ALL PROCESSES
         </Button>
+        <ConfirmActionDialog
+          open={confirmKill}
+          onClose={() => setConfirmKill(false)}
+          onConfirm={() => {
+            setConfirmKill(false);
+            handleKillAllProcesses();
+          }}
+          title="Kill all LLM processes"
+          description="Force-terminates every model process. Any chat reply, generation or index job in flight is lost, and the next request will reload the model from scratch."
+          keeps="documents, chats, media and settings."
+          confirmLabel="Kill all"
+        />
         
         <Button onClick={onClose} disabled={isLoading}>
           Close

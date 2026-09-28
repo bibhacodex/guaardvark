@@ -62,3 +62,58 @@ class TestPhaseTransition:
         history = [{"status": "discard"} for _ in range(9)]
         history.append({"status": "keep"})
         assert agent.should_advance_phase(history) is False
+
+
+class TestTpeAndProgram:
+    def test_research_program_path_is_shared(self):
+        from backend.services.rag_experiment_agent import RESEARCH_PROGRAM_RELPATH
+        assert RESEARCH_PROGRAM_RELPATH.replace("\\", "/").endswith(
+            "data/rag_research_program.md"
+        )
+
+    def test_tpe_proposes_when_history_is_rich(self):
+        agent = RAGExperimentAgent()
+        history = [
+            {
+                "parameter_changed": "top_k",
+                "new_value": "8",
+                "composite_score": 4.0 + i * 0.01,
+                "status": "keep",
+            }
+            for i in range(10)
+        ]
+        with patch.object(agent, "_call_llm", return_value="not json"):
+            proposal = agent.propose_experiment(
+                history=history,
+                current_config={"top_k": 5, "dedup_threshold": 0.85},
+                phase=1,
+            )
+        assert proposal["source"] == "tpe"
+        assert proposal["parameter"] == "top_k"
+        assert proposal["new_value"] == 8
+
+
+def test_proposer_binds_saved_active_model_when_app_has_no_llm():
+    """The proposer runs in a Celery worker whose app never builds LLAMA_INDEX_LLM."""
+    from unittest.mock import MagicMock, patch
+    from backend.services.rag_experiment_agent import RAGExperimentAgent
+    agent = RAGExperimentAgent()
+    calls = []
+
+    def fake_get_llm_instance(model=None):
+        calls.append(model)
+        return MagicMock(model=model) if model else None
+
+    with patch("backend.utils.llm_service.get_llm_instance", side_effect=fake_get_llm_instance), \
+         patch("backend.utils.llm_service.get_saved_active_model_name", return_value="gemma4:12b"), \
+         patch("backend.models.Setting") as setting:
+        setting.query.filter_by.return_value.first.return_value = None
+        llm = agent._get_llm()
+    assert llm is not None and agent.proposer_model_name == "gemma4:12b"
+    assert calls == [None, "gemma4:12b"]
+
+
+def test_phase_without_tunable_params_does_not_fabricate_a_proposal():
+    from backend.services.rag_experiment_agent import RAGExperimentAgent
+    with pytest.raises(ValueError):
+        RAGExperimentAgent().propose_experiment([], {"top_k": 5}, phase=3)

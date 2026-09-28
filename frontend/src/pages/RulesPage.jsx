@@ -19,6 +19,8 @@ import {
   CircularProgress,
   Alert as MuiAlert,
   Chip,
+  ToggleButton,
+  ToggleButtonGroup,
   Tooltip,
   Snackbar,
   Button,
@@ -63,7 +65,9 @@ function descendingComparator(a, b, orderBy) {
   } else if (orderBy === "x_column") {
     // For X column, sort by type first, then command_label
     const getXValue = (item) => {
-      const isSystemPrompt = item.name === "qa_default" || item.name === "global_default_chat_system_prompt";
+      const isSystemPrompt =
+        item.name === "qa_default" ||
+        item.name === "global_default_chat_system_prompt";
 
       if (item.type === "COMMAND_RULE") {
         return `1_${item.command_label || ""}`;
@@ -102,6 +106,8 @@ const RulesPage = () => {
   const { activeModel } = useStatus();
 
   const [rules, setRules] = useState([]);
+  // "all" or "LEARNED": rules the chat added on its own from corrections.
+  const [levelFilter, setLevelFilter] = useState("all");
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   const [feedback, setFeedback] = useState({
@@ -125,7 +131,7 @@ const RulesPage = () => {
         const parsed = JSON.parse(savedState);
         return {
           order: parsed.order || "asc",
-          orderBy: parsed.orderBy || "name"
+          orderBy: parsed.orderBy || "name",
         };
       }
     } catch (e) {
@@ -144,7 +150,7 @@ const RulesPage = () => {
       const state = {
         order: newOrder,
         orderBy: newOrderBy,
-        savedAt: new Date().toISOString()
+        savedAt: new Date().toISOString(),
       };
       localStorage.setItem("rulesPage_sortingState", JSON.stringify(state));
     } catch (e) {
@@ -156,7 +162,9 @@ const RulesPage = () => {
     setIsLoading(true);
     setError(null);
     try {
-      const allItems = await apiService.getRules();
+      const allItems = await apiService.getRules(
+        levelFilter === "LEARNED" ? { level: "LEARNED", per_page: 100 } : {},
+      );
       if (allItems.error) throw new Error(allItems.error);
 
       const processedItems = allItems.map((item) => ({
@@ -181,7 +189,7 @@ const RulesPage = () => {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [levelFilter]);
 
   useEffect(() => {
     loadRules();
@@ -309,10 +317,10 @@ const RulesPage = () => {
 
   const handleToggleActive = async (rule) => {
     // Optimistically update the UI immediately
-    setRules(prevRules =>
-      prevRules.map(r =>
-        r.id === rule.id ? { ...r, is_active: !r.is_active } : r
-      )
+    setRules((prevRules) =>
+      prevRules.map((r) =>
+        r.id === rule.id ? { ...r, is_active: !r.is_active } : r,
+      ),
     );
 
     try {
@@ -334,10 +342,10 @@ const RulesPage = () => {
     } catch (err) {
       logger.error("Update rule status failed:", err);
       // Revert the optimistic update on error
-      setRules(prevRules =>
-        prevRules.map(r =>
-          r.id === rule.id ? { ...r, is_active: rule.is_active } : r
-        )
+      setRules((prevRules) =>
+        prevRules.map((r) =>
+          r.id === rule.id ? { ...r, is_active: rule.is_active } : r,
+        ),
       );
       setFeedback({
         open: true,
@@ -382,7 +390,13 @@ const RulesPage = () => {
     { id: "name", label: "Name / Description", sortable: true, minWidth: 300 }, // Made wider
     { id: "x_column", label: "X", sortable: true }, // Merged column
     { id: "target_models", label: "Target Model(s)", sortable: true }, // Now sortable
-    { id: "is_active", label: "Status", sortable: true, minWidth: 80, align: "center" }, // Status Column (clickable chip)
+    {
+      id: "is_active",
+      label: "Status",
+      sortable: true,
+      minWidth: 80,
+      align: "center",
+    }, // Status Column (clickable chip)
     { id: "actions", label: "", sortable: false, align: "right" }, // Removed Column Title "Actions"
   ];
 
@@ -396,358 +410,412 @@ const RulesPage = () => {
       title="Rules Management"
       variant="standard"
       actions={
-        <Button
-          variant="contained"
-          startIcon={<AddIcon />}
-          onClick={() => handleOpenActionModal(null)}
-          disabled={isLoading || isModalSaving}
-          size="small"
-        >
-          New
-        </Button>
+        <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+          <ToggleButtonGroup
+            size="small"
+            exclusive
+            value={levelFilter}
+            onChange={(e, v) => v && setLevelFilter(v)}
+            aria-label="Rule filter"
+          >
+            <ToggleButton value="all" sx={{ px: 1.25, py: 0.25 }}>
+              All
+            </ToggleButton>
+            <ToggleButton value="LEARNED" sx={{ px: 1.25, py: 0.25 }}>
+              Learned
+            </ToggleButton>
+          </ToggleButtonGroup>
+          <Button
+            variant="contained"
+            startIcon={<AddIcon />}
+            onClick={() => handleOpenActionModal(null)}
+            disabled={isLoading || isModalSaving}
+            size="small"
+          >
+            New
+          </Button>
+        </Box>
+      }
+      headerContent={
+        levelFilter === "LEARNED" ? (
+          <Typography
+            variant="caption"
+            color="text.secondary"
+            sx={{ display: "block", px: 2, pb: 1 }}
+          >
+            Rules the chat added on its own from corrections and preferences.
+            Delete any that are wrong here; Settings can clear all of them at
+            once.
+          </Typography>
+        ) : null
       }
       modelStatus
       activeModel={activeModel}
     >
-        <Snackbar
-          open={feedback.open}
-          autoHideDuration={6000}
+      <Snackbar
+        open={feedback.open}
+        autoHideDuration={6000}
+        onClose={handleCloseFeedback}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <AlertSnackbar
           onClose={handleCloseFeedback}
-          anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+          severity={feedback.severity || "info"}
+          sx={{ width: "100%" }}
         >
-          <AlertSnackbar
-            onClose={handleCloseFeedback}
-            severity={feedback.severity || "info"}
-            sx={{ width: "100%" }}
-          >
-            {feedback.message}
-          </AlertSnackbar>
-        </Snackbar>
-        {error && !isLoading && (
-          <MuiAlert severity="error" sx={{ mb: 2 }}>
-            {error}
-          </MuiAlert>
-        )}
-        <Paper elevation={2} sx={{ mb: 1, overflow: "hidden" }}>
-          <TableContainer
-            sx={{ maxHeight: "calc(100vh - 64px - 48px - 70px - 48px)" }}
-          >
-            <Table stickyHeader size="small">
-              <TableHead>
+          {feedback.message}
+        </AlertSnackbar>
+      </Snackbar>
+      {error && !isLoading && (
+        <MuiAlert severity="error" sx={{ mb: 2 }}>
+          {error}
+        </MuiAlert>
+      )}
+      <Paper elevation={2} sx={{ mb: 1, overflow: "hidden" }}>
+        <TableContainer
+          sx={{ maxHeight: "calc(100vh - 64px - 48px - 70px - 48px)" }}
+        >
+          <Table stickyHeader size="small">
+            <TableHead>
+              <TableRow>
+                {headCells.map((headCell) => (
+                  <TableCell
+                    key={headCell.id}
+                    align={headCell.align || "left"}
+                    sortDirection={orderBy === headCell.id ? order : false}
+                    sx={{
+                      fontWeight: "bold",
+                      minWidth: headCell.minWidth ? headCell.minWidth : "auto",
+                    }}
+                  >
+                    {headCell.sortable ? (
+                      <TableSortLabel
+                        active={orderBy === headCell.id}
+                        direction={orderBy === headCell.id ? order : "asc"}
+                        onClick={() => handleSortRequest(headCell.id)}
+                      >
+                        {headCell.label}
+                      </TableSortLabel>
+                    ) : (
+                      headCell.label
+                    )}
+                  </TableCell>
+                ))}
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {isLoading && sortedRules.length === 0 ? (
                 <TableRow>
-                  {headCells.map((headCell) => (
-                    <TableCell
-                      key={headCell.id}
-                      align={headCell.align || "left"}
-                      sortDirection={orderBy === headCell.id ? order : false}
-                      sx={{
-                        fontWeight: "bold",
-                        minWidth: headCell.minWidth
-                          ? headCell.minWidth
-                          : "auto",
-                      }}
-                    >
-                      {headCell.sortable ? (
-                        <TableSortLabel
-                          active={orderBy === headCell.id}
-                          direction={orderBy === headCell.id ? order : "asc"}
-                          onClick={() => handleSortRequest(headCell.id)}
-                        >
-                          {headCell.label}
-                        </TableSortLabel>
-                      ) : (
-                        headCell.label
-                      )}
-                    </TableCell>
-                  ))}
+                  <TableCell
+                    colSpan={headCells.length}
+                    align="center"
+                    sx={{ py: 3 }}
+                  >
+                    <CircularProgress size={24} sx={{ mr: 1 }} /> Loading
+                    rules...
+                  </TableCell>
                 </TableRow>
-              </TableHead>
-              <TableBody>
-                {isLoading && sortedRules.length === 0 ? (
-                  <TableRow>
-                    <TableCell
-                      colSpan={headCells.length}
-                      align="center"
-                      sx={{ py: 3 }}
-                    >
-                      <CircularProgress size={24} sx={{ mr: 1 }} /> Loading
-                      rules...
+              ) : !isLoading && sortedRules.length === 0 && !error ? (
+                <TableRow>
+                  <TableCell
+                    colSpan={headCells.length}
+                    align="center"
+                    sx={{ py: 0 }}
+                  >
+                    <EmptyState
+                      icon={<GavelOutlined />}
+                      title={
+                        levelFilter === "LEARNED"
+                          ? "No learned rules"
+                          : "No rules found"
+                      }
+                      description={
+                        levelFilter === "LEARNED"
+                          ? "The chat has not added any rules on its own yet."
+                          : "Create a rule to define system prompts and commands"
+                      }
+                    />
+                  </TableCell>
+                </TableRow>
+              ) : (
+                sortedRules.map((rule) => (
+                  <TableRow
+                    key={rule.id}
+                    hover
+                    sx={{
+                      "&:last-child td, &:last-child th": { border: 0 },
+                    }}
+                    onClick={() => handleOpenActionModal(rule)}
+                  >
+                    <TableCell sx={{ minWidth: 10, maxWidth: 50 }}>
+                      <Tooltip title={`Rule ID: ${rule.id}`}>
+                        <Typography
+                          variant="body2"
+                          sx={{
+                            fontFamily: "monospace",
+                            fontSize: "0.875rem",
+                            color: "text.secondary",
+                          }}
+                        >
+                          {rule.id}
+                        </Typography>
+                      </Tooltip>
                     </TableCell>
-                  </TableRow>
-                ) : !isLoading && sortedRules.length === 0 && !error ? (
-                  <TableRow>
-                    <TableCell
-                      colSpan={headCells.length}
-                      align="center"
-                      sx={{ py: 0 }}
-                    >
-                      <EmptyState
-                        icon={<GavelOutlined />}
-                        title="No rules found"
-                        description="Create a rule to define system prompts and commands"
-                      />
-                    </TableCell>
-                  </TableRow>
-                ) : (
-                  sortedRules.map((rule) => (
-                    <TableRow
-                      key={rule.id}
-                      hover
-                      sx={{
-                        "&:last-child td, &:last-child th": { border: 0 },
-                      }}
-                      onClick={() => handleOpenActionModal(rule)}
-                    >
-                      <TableCell sx={{ minWidth: 10, maxWidth: 50 }}>
-                        <Tooltip title={`Rule ID: ${rule.id}`}>
-                          <Typography 
-                            variant="body2" 
-                            sx={{ 
-                              fontFamily: 'monospace',
-                              fontSize: '0.875rem',
-                              color: 'text.secondary'
-                            }}
-                          >
-                            {rule.id}
-                          </Typography>
-                        </Tooltip>
-                      </TableCell>
-                      <TableCell sx={{ minWidth: 300, maxWidth: 400 }}>
-                        {" "}
-                        {/* Wider Name/Description Column */}
+                    <TableCell sx={{ minWidth: 300, maxWidth: 400 }}>
+                      {" "}
+                      {/* Wider Name/Description Column */}
+                      <Box
+                        sx={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 0.75,
+                          minWidth: 0,
+                        }}
+                      >
                         <Tooltip title={rule.name || "N/A"}>
                           <Typography variant="body2" noWrap>
                             {rule.name || "Unnamed Rule"}
                           </Typography>
                         </Tooltip>
-                        <Typography
-                          variant="caption"
-                          display="block"
-                          color="text.secondary"
-                          noWrap
-                        >
-                          {rule.description || "No description"}
-                        </Typography>
-                      </TableCell>
-                      <TableCell>
-                        {(() => {
-                          const isSystemPrompt = rule.name === "qa_default" || rule.name === "global_default_chat_system_prompt";
-                          
-                          if (rule.type === "COMMAND_RULE") {
-                            return (
-                              <Typography
-                                variant="body2"
-                                sx={{
-                                  backgroundColor: 'primary.main',
-                                  color: 'common.white',
-                                  px: 0.75,
-                                  py: 0.25,
-                                  borderRadius: '3px',
-                                  fontWeight: 'medium',
-                                  fontSize: '11px',
-                                  display: 'inline-block',
-                                  maxWidth: 80
-                                }}
-                                noWrap
-                              >
-                                {rule.command_label || "/cmd"}
-                              </Typography>
-                            );
-                          } else if (isSystemPrompt) {
-                            return (
-                              <Typography
-                                variant="body2"
-                                sx={{
-                                  backgroundColor: 'error.main',
-                                  color: 'common.white',
-                                  px: 0.75,
-                                  py: 0.25,
-                                  borderRadius: '3px',
-                                  fontWeight: 'medium',
-                                  fontSize: '11px',
-                                  display: 'inline-block'
-                                }}
-                              >
-                                SYSTEM
-                              </Typography>
-                            );
-                          } else {
-                            return (
-                              <Typography
-                                variant="body2"
-                                sx={{
-                                  backgroundColor: 'warning.main',
-                                  color: 'common.white',
-                                  px: 0.75,
-                                  py: 0.25,
-                                  borderRadius: '3px',
-                                  fontWeight: 'medium',
-                                  fontSize: '11px',
-                                  display: 'inline-block'
-                                }}
-                              >
-                                PROMPT
-                              </Typography>
-                            );
-                          }
-                        })()}
-                      </TableCell>
-                      <TableCell sx={{ maxWidth: 150 }}>
-                        <Tooltip
-                          title={
-                            rule.target_models.includes("__ALL__")
-                              ? "All Models"
-                              : rule.target_models.join(", ")
-                          }
-                        >
-                          <Box
-                            sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}
-                          >
-                            {rule.target_models.includes("__ALL__") ||
-                            rule.target_models.length === 0 ? (
-                              <Chip
-                                label="All Models"
-                                size="small"
-                                variant="outlined"
-                                color="primary"
-                              />
-                            ) : (
-                              rule.target_models
-                                .slice(0, 2)
-                                .map((model) => (
-                                  <Chip
-                                    key={model}
-                                    label={model}
-                                    size="small"
-                                    variant="outlined"
-                                  />
-                                ))
-                            )}
-                            {rule.target_models.length > 2 &&
-                              !rule.target_models.includes("__ALL__") && (
-                                <Chip
-                                  label={`+${rule.target_models.length - 2}`}
-                                  size="small"
-                                />
-                              )}
-                          </Box>
-                        </Tooltip>
-                      </TableCell>
-                      <TableCell
-                        align="center"
-                        sx={{ minWidth: 80 }}
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <Tooltip
-                          title={`Click to ${rule.is_active ? "deactivate" : "activate"}`}
-                        >
+                        {rule.level === "LEARNED" && (
                           <Chip
-                            label={rule.is_active ? "Active" : "Inactive"}
+                            label="learned"
                             size="small"
-                            color={rule.is_active ? "success" : "default"}
-                            variant={rule.is_active ? "filled" : "outlined"}
-                            onClick={() => handleToggleActive(rule)}
-                            sx={{
-                              fontWeight: 'medium',
-                              fontSize: '11px',
-                              height: '20px',
-                              backgroundColor: rule.is_active
-                                ? theme.palette.success.main
-                                : theme.palette.mode === "dark"
-                                  ? theme.palette.grey[700]
-                                  : theme.palette.grey[200],
-                              color: rule.is_active
-                                ? 'white'
-                                : theme.palette.text.secondary,
-                              cursor: 'pointer',
-                              '&:hover': {
-                                opacity: 0.8,
-                                transform: 'scale(1.05)',
-                              },
-                              transition: 'all 0.2s ease-in-out',
-                            }}
+                            variant="outlined"
+                            sx={{ height: 18, fontSize: "0.65rem" }}
                           />
-                        </Tooltip>
-                      </TableCell>
-                      <TableCell
-                        align="right"
-                        onClick={(e) => e.stopPropagation()}
+                        )}
+                      </Box>
+                      <Typography
+                        variant="caption"
+                        display="block"
+                        color="text.secondary"
+                        noWrap
                       >
-                        <Tooltip title="Duplicate Rule">
-                          <IconButton
-                            onClick={() => handleDuplicateRule(rule)}
-                            size="small"
-                            color="primary"
-                          >
-                            <FileCopyIcon fontSize="small" />
-                          </IconButton>
-                        </Tooltip>
-                        <Tooltip title="Delete Rule">
-                          <IconButton
-                            onClick={() => handleDeleteRule(rule.id)}
-                            size="small"
-                            color="primary"
-                            sx={{
-                              "&:hover": { color: theme.palette.error.light },
-                            }}
-                          >
-                            <CloseIcon fontSize="small" />
-                          </IconButton>
-                        </Tooltip>
-                      </TableCell>
-                    </TableRow>
-                  ))
-                )}
-              </TableBody>
-            </Table>
-          </TableContainer>
-          {rules.length > 0 && !isLoading && (
-            <Typography
-              variant="caption"
-              display="block"
-              sx={{
-                textAlign: "right",
-                p: 1,
-                color: "text.secondary",
-                borderTop: 1,
-                borderColor: "divider",
-              }}
-            >
-              Total Rules: {rules.length}
-            </Typography>
-          )}
-        </Paper>
-        {actionModalOpen && (
-          <RuleActionModal
-            open={actionModalOpen}
-            onClose={handleCloseActionModal}
-            ruleData={selectedRuleForModal}
-            onSave={handleSaveRule}
-            onDelete={handleDeleteRule}
-            onOpenLinker={handleOpenLinkingModal}
-            isSaving={isModalSaving}
-          />
+                        {rule.description || "No description"}
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      {(() => {
+                        const isSystemPrompt =
+                          rule.name === "qa_default" ||
+                          rule.name === "global_default_chat_system_prompt";
+
+                        if (rule.type === "COMMAND_RULE") {
+                          return (
+                            <Typography
+                              variant="body2"
+                              sx={{
+                                backgroundColor: "primary.main",
+                                color: "common.white",
+                                px: 0.75,
+                                py: 0.25,
+                                borderRadius: "3px",
+                                fontWeight: "medium",
+                                fontSize: "11px",
+                                display: "inline-block",
+                                maxWidth: 80,
+                              }}
+                              noWrap
+                            >
+                              {rule.command_label || "/cmd"}
+                            </Typography>
+                          );
+                        } else if (isSystemPrompt) {
+                          return (
+                            <Typography
+                              variant="body2"
+                              sx={{
+                                backgroundColor: "error.main",
+                                color: "common.white",
+                                px: 0.75,
+                                py: 0.25,
+                                borderRadius: "3px",
+                                fontWeight: "medium",
+                                fontSize: "11px",
+                                display: "inline-block",
+                              }}
+                            >
+                              SYSTEM
+                            </Typography>
+                          );
+                        } else {
+                          return (
+                            <Typography
+                              variant="body2"
+                              sx={{
+                                backgroundColor: "warning.main",
+                                color: "common.white",
+                                px: 0.75,
+                                py: 0.25,
+                                borderRadius: "3px",
+                                fontWeight: "medium",
+                                fontSize: "11px",
+                                display: "inline-block",
+                              }}
+                            >
+                              PROMPT
+                            </Typography>
+                          );
+                        }
+                      })()}
+                    </TableCell>
+                    <TableCell sx={{ maxWidth: 150 }}>
+                      <Tooltip
+                        title={
+                          rule.target_models.includes("__ALL__")
+                            ? "All Models"
+                            : rule.target_models.join(", ")
+                        }
+                      >
+                        <Box
+                          sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}
+                        >
+                          {rule.target_models.includes("__ALL__") ||
+                          rule.target_models.length === 0 ? (
+                            <Chip
+                              label="All Models"
+                              size="small"
+                              variant="outlined"
+                              color="primary"
+                            />
+                          ) : (
+                            rule.target_models
+                              .slice(0, 2)
+                              .map((model) => (
+                                <Chip
+                                  key={model}
+                                  label={model}
+                                  size="small"
+                                  variant="outlined"
+                                />
+                              ))
+                          )}
+                          {rule.target_models.length > 2 &&
+                            !rule.target_models.includes("__ALL__") && (
+                              <Chip
+                                label={`+${rule.target_models.length - 2}`}
+                                size="small"
+                              />
+                            )}
+                        </Box>
+                      </Tooltip>
+                    </TableCell>
+                    <TableCell
+                      align="center"
+                      sx={{ minWidth: 80 }}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <Tooltip
+                        title={`Click to ${rule.is_active ? "deactivate" : "activate"}`}
+                      >
+                        <Chip
+                          label={rule.is_active ? "Active" : "Inactive"}
+                          size="small"
+                          color={rule.is_active ? "success" : "default"}
+                          variant={rule.is_active ? "filled" : "outlined"}
+                          onClick={() => handleToggleActive(rule)}
+                          sx={{
+                            fontWeight: "medium",
+                            fontSize: "11px",
+                            height: "20px",
+                            backgroundColor: rule.is_active
+                              ? theme.palette.success.main
+                              : theme.palette.mode === "dark"
+                                ? theme.palette.grey[700]
+                                : theme.palette.grey[200],
+                            color: rule.is_active
+                              ? "white"
+                              : theme.palette.text.secondary,
+                            cursor: "pointer",
+                            "&:hover": {
+                              opacity: 0.8,
+                              transform: "scale(1.05)",
+                            },
+                            transition: "all 0.2s ease-in-out",
+                          }}
+                        />
+                      </Tooltip>
+                    </TableCell>
+                    <TableCell
+                      align="right"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <Tooltip title="Duplicate Rule">
+                        <IconButton
+                          onClick={() => handleDuplicateRule(rule)}
+                          size="small"
+                          color="primary"
+                        >
+                          <FileCopyIcon fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                      <Tooltip title="Delete Rule">
+                        <IconButton
+                          onClick={() => handleDeleteRule(rule.id)}
+                          size="small"
+                          color="primary"
+                          sx={{
+                            "&:hover": { color: theme.palette.error.light },
+                          }}
+                        >
+                          <CloseIcon fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </TableContainer>
+        {rules.length > 0 && !isLoading && (
+          <Typography
+            variant="caption"
+            display="block"
+            sx={{
+              textAlign: "right",
+              p: 1,
+              color: "text.secondary",
+              borderTop: 1,
+              borderColor: "divider",
+            }}
+          >
+            Total Rules: {rules.length}
+          </Typography>
         )}
-        {isLinkingModalOpen && linkingModalRule && (
-          <LinkingModal
-            open={isLinkingModalOpen}
-            onClose={handleCloseLinkingModal}
-            primaryEntityType="rule"
-            primaryEntityId={linkingModalRule.id}
-            primaryEntityName={linkingModalRule.name}
-            linkableTypesConfig={[
-              {
-                entityType: "project",
-                singularLabel: "Project",
-                pluralLabel: "Projects",
-                apiServiceFunction: apiService.getProjects,
-              },
-            ]}
-            apiGetLinkedItems={apiService.getCurrentlyLinkedItems} // Ensure this is adapted or correctly implemented
-            apiUpdateLinks={apiService.updateEntityLinks} // Ensure this is adapted or correctly implemented
-            onLinksUpdated={handleLinksUpdated}
-          />
-        )}
+      </Paper>
+      {actionModalOpen && (
+        <RuleActionModal
+          open={actionModalOpen}
+          onClose={handleCloseActionModal}
+          ruleData={selectedRuleForModal}
+          onSave={handleSaveRule}
+          onDelete={handleDeleteRule}
+          onOpenLinker={handleOpenLinkingModal}
+          isSaving={isModalSaving}
+        />
+      )}
+      {isLinkingModalOpen && linkingModalRule && (
+        <LinkingModal
+          open={isLinkingModalOpen}
+          onClose={handleCloseLinkingModal}
+          primaryEntityType="rule"
+          primaryEntityId={linkingModalRule.id}
+          primaryEntityName={linkingModalRule.name}
+          linkableTypesConfig={[
+            {
+              entityType: "project",
+              singularLabel: "Project",
+              pluralLabel: "Projects",
+              apiServiceFunction: apiService.getProjects,
+            },
+          ]}
+          apiGetLinkedItems={apiService.getCurrentlyLinkedItems} // Ensure this is adapted or correctly implemented
+          apiUpdateLinks={apiService.updateEntityLinks} // Ensure this is adapted or correctly implemented
+          onLinksUpdated={handleLinksUpdated}
+        />
+      )}
     </PageLayout>
   );
 };

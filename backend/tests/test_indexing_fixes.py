@@ -44,10 +44,18 @@ def test_session_in_transaction_never_raises_on_broken_session(monkeypatch):
 # #5 — add_text_to_index distinguishes empty (None) from failure (False).
 # --------------------------------------------------------------------------
 def _fake_chunker(nodes):
+    """Stand in for the process-wide chunker.
+
+    Patches `get_shared_chunker`, not `EnhancedRAGChunker`. The class is only
+    constructed on the first call and cached in a module global, so patching it
+    does nothing once any earlier test has warmed the singleton — these two
+    tests passed alone and failed after `test_rag_rearchitecture.py`, which is
+    an order dependency, not a real result. `get_shared_chunker` is the seam
+    `add_text_to_index` actually calls.
+    """
     inst = MagicMock()
     inst.chunk_documents.return_value = nodes
-    cls = MagicMock(return_value=inst)
-    return cls
+    return lambda: inst
 
 
 def test_add_text_to_index_returns_none_when_no_nodes(monkeypatch):
@@ -55,7 +63,7 @@ def test_add_text_to_index_returns_none_when_no_nodes(monkeypatch):
     monkeypatch.setattr(ix, "storage_context", MagicMock())
     monkeypatch.setattr(ix, "_lazy_load_llamaindex", lambda: None)
     monkeypatch.setattr(ix, "LlamaDocument", lambda **kw: object())
-    with patch("backend.utils.enhanced_rag_chunking.EnhancedRAGChunker", _fake_chunker([])):
+    with patch("backend.utils.enhanced_rag_chunking.get_shared_chunker", _fake_chunker([])):
         assert ix.add_text_to_index("anything", metadata={}) is None  # empty, not False
 
 
@@ -65,7 +73,7 @@ def test_add_text_to_index_returns_none_when_all_nodes_empty(monkeypatch):
     monkeypatch.setattr(ix, "_lazy_load_llamaindex", lambda: None)
     monkeypatch.setattr(ix, "LlamaDocument", lambda **kw: object())
     empty_node = SimpleNamespace(text="", metadata={})  # has attrs but empty text -> invalid
-    with patch("backend.utils.enhanced_rag_chunking.EnhancedRAGChunker", _fake_chunker([empty_node])):
+    with patch("backend.utils.enhanced_rag_chunking.get_shared_chunker", _fake_chunker([empty_node])):
         assert ix.add_text_to_index("anything", metadata={}) is None
 
 
@@ -92,9 +100,22 @@ def test_purge_requires_a_selection(purge_client):
     assert "Select at least one" in resp.get_json()["error"]
 
 
-def test_purge_no_longer_returns_placebo_acknowledged(purge_client):
+def test_purge_no_longer_returns_placebo_acknowledged(purge_client, monkeypatch):
     # The old placebo returned 200 "acknowledged" for any input. With a real
     # selection it must do real work (or fail honestly), never the placebo 200.
+    #
+    # The endpoint falls back to initialize_llama_index_from_service() whenever the
+    # app config has no index -- which is exactly this bare test app. Unpatched, that
+    # loads the REAL index and purges it: this test used to delete live indexed data
+    # as a side effect (measured: 417 -> 63 vectors). Hand it a stand-in so the
+    # endpoint's contract is exercised against nothing real.
+    from backend.api import index_mgmt_api as mod
+
+    fake_index = MagicMock()
+    fake_index.storage_context = MagicMock()
+    fake_index.storage_context.docstore.docs = {}
+    monkeypatch.setattr(mod, "initialize_llama_index_from_service", lambda: fake_index)
+
     resp = purge_client.post("/api/meta/purge-index", json={"purgeDocuments": True})
     body = resp.get_json()
     assert not (resp.status_code == 200 and body.get("message", "").startswith("Purge request acknowledged"))

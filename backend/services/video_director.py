@@ -118,12 +118,14 @@ def _chat_json(system: str, user: str, *, model: str, n: int) -> str:
     """Single Ollama JSON-mode chat call. Returns raw content ('' on any failure)."""
     try:
         import ollama
+        from backend.utils.ollama_resource_manager import think_payload
         resolved = _resolve_model(model or DEFAULT_DIRECTOR_MODEL)
         resp = ollama.chat(
             model=resolved,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             format="json",
             options=_options(n),
+            **think_payload(resolved),
         )
         # ollama-lib returns a dict-like / object with message.content.
         msg = resp.get("message") if hasattr(resp, "get") else getattr(resp, "message", None)

@@ -141,7 +141,11 @@ def fake_gen(monkeypatch):
         lambda: gen,
     )
     monkeypatch.setattr(
-        "backend.api.batch_video_generation_api.preflight_video_model",
+        "backend.api.batch_video_generation_api.prepare_video_model",
+        lambda model_id: (True, ""),
+    )
+    monkeypatch.setattr(
+        "backend.services.video_model_registry.preflight_video_model",
         lambda model_id: (True, ""),
     )
     monkeypatch.setattr(
@@ -157,6 +161,25 @@ def client(fake_gen):
     app.config["TESTING"] = True
     app.register_blueprint(batch_video_bp)
     return app.test_client()
+
+
+def test_generate_text_omitted_model_uses_resolver(client, fake_gen, monkeypatch):
+    from backend.api import batch_video_generation_api as api
+    monkeypatch.setattr(api, "resolve_active_video_model", lambda role, explicit=None, surface=None: ("wan22-5b", None))
+    captured = {}
+    orig = fake_gen.start_batch_from_prompts
+
+    def _start(prompts, **params):
+        captured.update(params)
+        return orig(prompts, **params)
+
+    fake_gen.start_batch_from_prompts = _start
+    resp = client.post("/api/batch-video/generate/text", json={"prompts": ["a red cube"]})
+    assert resp.status_code == 200
+    assert captured.get("model") == "wan22-5b"
+    assert captured.get("fps") == 24
+    assert captured.get("num_inference_steps") >= 20
+    assert captured.get("width", 0) * captured.get("height", 0) > 512 * 512
 
 
 def test_generate_text_returns_queued_with_stage(client, fake_gen):
@@ -193,6 +216,24 @@ def test_status_includes_stage_fields(client, fake_gen):
     assert data["current_item"] == "item-1"
     assert data["progress_pct"] == 42
     assert data["status"] == "running"
+
+
+def test_status_counts_finished_clips_that_were_flagged(client, fake_gen):
+    create = client.post(
+        "/api/batch-video/generate/text",
+        json={"prompts": ["a", "b"], "model": "wan22-5b"},
+    )
+    batch_id = create.get_json()["data"]["batch_id"]
+    st = fake_gen._batches[batch_id]
+    washed = {"flagged": True, "flags": [{"code": "washed_out", "message": "washed out"}]}
+    st.results = [
+        BatchVideoResult(item_id="1", success=True, video_path="1/videos/a.mp4", metadata={"quality": washed}),
+        BatchVideoResult(item_id="2", success=True, video_path="2/videos/b.mp4",
+                         metadata={"quality": {"flagged": False, "flags": []}}),
+    ]
+    data = client.get(f"/api/batch-video/status/{batch_id}").get_json()["data"]
+    assert data["flagged_videos"] == 1
+    assert data["results"][0]["metadata"]["quality"]["flags"][0]["code"] == "washed_out"
 
 
 def test_cancel_batch_lifecycle(client, fake_gen):
@@ -242,7 +283,7 @@ def test_retry_creates_new_batch(client, fake_gen):
 
 def test_preflight_failure_blocks_enqueue(client, monkeypatch, fake_gen):
     monkeypatch.setattr(
-        "backend.api.batch_video_generation_api.preflight_video_model",
+        "backend.api.batch_video_generation_api.prepare_video_model",
         lambda model_id: (False, "Wan requires ComfyUI. Start the ComfyUI plugin, then retry."),
     )
     resp = client.post(
@@ -293,4 +334,7 @@ def test_attach_quality_metrics_fail_open(tmp_path):
         high_consistency=True,
     )
     assert "quality" in br.metadata
-    assert br.metadata["quality"]["flagged"] is False
+    # The checkers fail open (nothing raises), but a clip that is not on disk is
+    # the one thing a finished item must not be: it is flagged, not passed.
+    assert br.metadata["quality"]["flagged"] is True
+    assert [f["code"] for f in br.metadata["quality"]["flags"]] == ["unreadable"]

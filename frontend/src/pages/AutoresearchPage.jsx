@@ -25,7 +25,9 @@ import {
   DialogContentText,
   DialogActions,
   Tooltip,
+  Switch,
 } from "@mui/material";
+import { alpha } from "@mui/material/styles";
 import {
   Science as ScienceIcon,
   Refresh as RefreshIcon,
@@ -33,11 +35,16 @@ import {
   RestartAlt as RevertIcon,
   CheckCircle as ActivateIcon,
   NightsStay as NightIcon,
+  Stop as StopIcon,
+  Check as SavedIcon,
+  DeleteSweep as ResetDefaultsIcon,
 } from "@mui/icons-material";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { io } from "socket.io-client";
 import { SOCKET_URL } from "../api/apiClient";
 import { ragAutoresearchService } from "../api/ragAutoresearchService";
+import { selfImprovementService } from "../api/selfImprovementService";
 import AlertSnackbar from "../components/common/AlertSnackbar";
 
 const RUN_STATUS_COLORS = {
@@ -61,13 +68,70 @@ const formatDate = (iso) => {
 const formatScore = (v) =>
   typeof v === "number" ? v.toFixed(3) : "—";
 
+const AUTO_START_ID = "autoresearch-auto-start";
+
+const SETTING_FIELDS = [
+  {
+    key: "autoresearch_proposer_model",
+    label: "Proposer model",
+    placeholder: "(active model)",
+    width: 200,
+  },
+  {
+    key: "autoresearch_judge_model",
+    label: "Judge model",
+    placeholder: "(active model)",
+    width: 200,
+  },
+  {
+    key: "autoresearch_nightly_window",
+    label: "Nightly window",
+    placeholder: "01:00-06:00",
+    width: 170,
+  },
+];
+
+const ScoreSparkline = ({ points }) => {
+  const vals = (points || []).filter((v) => typeof v === "number");
+  if (vals.length < 2) return null;
+  const w = 160;
+  const h = 28;
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
+  const span = max - min || 1;
+  const d = vals
+    .map((v, i) => {
+      const x = (i / (vals.length - 1)) * w;
+      const y = h - 2 - ((v - min) / span) * (h - 4);
+      return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  return (
+    <svg width={w} height={h} aria-label="score sparkline">
+      <path d={d} fill="none" stroke="currentColor" strokeWidth="1.5" />
+    </svg>
+  );
+};
+
 const AutoresearchPage = () => {
   const [runs, setRuns] = useState([]);
   const [promotions, setPromotions] = useState([]);
   const [metrics, setMetrics] = useState([]);
   const [loading, setLoading] = useState(true);
   const [budgetHours, setBudgetHours] = useState(6);
+  const [runMode, setRunMode] = useState("unified");
+  const [codeKeeps, setCodeKeeps] = useState([]);
   const [starting, setStarting] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [status, setStatus] = useState(null);
+  const [settings, setSettings] = useState({});
+  // Text fields are edited as drafts and only written back to `settings`
+  // once the PUT succeeds, so a failed save reverts to the stored value.
+  const [settingDrafts, setSettingDrafts] = useState({});
+  const [savedKeys, setSavedKeys] = useState({});
+  const [resettingConfig, setResettingConfig] = useState(false);
+  const [evalCount, setEvalCount] = useState(null);
+  const [regenerating, setRegenerating] = useState(false);
   const [selectedRun, setSelectedRun] = useState(null);
   const [runDetailLoading, setRunDetailLoading] = useState(false);
   const [revertConfirmOpen, setRevertConfirmOpen] = useState(false);
@@ -78,6 +142,7 @@ const AutoresearchPage = () => {
   });
   const socketRef = useRef(null);
   const pollRef = useRef(null);
+  const savedTimersRef = useRef({});
 
   const showMessage = useCallback((message, severity = "info") => {
     setSnackbar({ open: true, message, severity });
@@ -110,10 +175,58 @@ const AutoresearchPage = () => {
     }
   }, []);
 
+  const fetchStatus = useCallback(async () => {
+    try {
+      const data = await ragAutoresearchService.getStatus();
+      setStatus(data);
+      if (typeof data.eval_pair_count === "number") {
+        setEvalCount(data.eval_pair_count);
+      }
+      if (Array.isArray(data.code_keeps)) {
+        setCodeKeeps(data.code_keeps);
+      }
+    } catch (e) {
+      /* ignore */
+    }
+  }, []);
+
+  const fetchSettings = useCallback(async () => {
+    try {
+      const data = await ragAutoresearchService.getSettings();
+      setSettings(data || {});
+      setSettingDrafts({});
+    } catch (e) {
+      /* ignore */
+    }
+  }, []);
+
+  const fetchEvalPairs = useCallback(async () => {
+    try {
+      const data = await ragAutoresearchService.getEvalPairs();
+      setEvalCount(data.count ?? (data.pairs || []).length);
+    } catch (e) {
+      /* ignore */
+    }
+  }, []);
+
   const fetchAll = useCallback(async () => {
-    await Promise.all([fetchRuns(), fetchPromotions(), fetchMetrics()]);
+    await Promise.all([
+      fetchRuns(),
+      fetchPromotions(),
+      fetchMetrics(),
+      fetchStatus(),
+      fetchSettings(),
+      fetchEvalPairs(),
+    ]);
     setLoading(false);
-  }, [fetchRuns, fetchPromotions, fetchMetrics]);
+  }, [
+    fetchRuns,
+    fetchPromotions,
+    fetchMetrics,
+    fetchStatus,
+    fetchSettings,
+    fetchEvalPairs,
+  ]);
 
   // Initial load + 30s poll (same cadence as the dashboard card) +
   // Socket.IO push updates, following the GpuStatusCard pattern.
@@ -131,36 +244,163 @@ const AutoresearchPage = () => {
       socket.on("autoresearch:experiment_complete", () => {
         fetchMetrics();
         fetchRuns();
+        fetchStatus();
       });
 
       socket.on("autoresearch:run_complete", () => {
         fetchRuns();
         fetchPromotions();
         fetchMetrics();
+        fetchStatus();
       });
     } catch {
       // Socket not available — polling covers it
     }
 
-    pollRef.current = setInterval(fetchRuns, 30000);
+    pollRef.current = setInterval(() => {
+      fetchRuns();
+      fetchStatus();
+    }, 30000);
 
+    const savedTimers = savedTimersRef.current;
     return () => {
       if (socketRef.current) {
         socketRef.current.disconnect();
         socketRef.current = null;
       }
       if (pollRef.current) clearInterval(pollRef.current);
+      Object.values(savedTimers).forEach(clearTimeout);
     };
-  }, [fetchAll, fetchRuns, fetchPromotions, fetchMetrics]);
+  }, [fetchAll, fetchRuns, fetchPromotions, fetchMetrics, fetchStatus]);
 
-  const activeRun = runs.find(
-    (r) => r.status === "running" || r.status === "pending",
+  const activeRun =
+    runs.find((r) => r.status === "running" || r.status === "pending") ||
+    status?.active_run ||
+    null;
+
+  const handleStop = async () => {
+    setStopping(true);
+    try {
+      await ragAutoresearchService.stop();
+      showMessage("Stop requested — the run will halt at the next check", "info");
+      fetchStatus();
+      fetchRuns();
+    } catch (e) {
+      showMessage(`Failed to stop: ${e.message}`, "error");
+    } finally {
+      setStopping(false);
+    }
+  };
+
+  const markSaved = useCallback((key) => {
+    setSavedKeys((s) => ({ ...s, [key]: true }));
+    if (savedTimersRef.current[key]) clearTimeout(savedTimersRef.current[key]);
+    savedTimersRef.current[key] = setTimeout(() => {
+      setSavedKeys((s) => {
+        const next = { ...s };
+        delete next[key];
+        return next;
+      });
+      delete savedTimersRef.current[key];
+    }, 2500);
+  }, []);
+
+  // Writes one setting. On failure the stored value stands and the field
+  // snaps back to it — a rejected save must never look like it took.
+  const saveSetting = useCallback(
+    async (key, value, label) => {
+      const next = String(value);
+      try {
+        await ragAutoresearchService.updateSettings({ [key]: next });
+        setSettings((s) => ({ ...s, [key]: next }));
+        setSettingDrafts((d) => {
+          const rest = { ...d };
+          delete rest[key];
+          return rest;
+        });
+        markSaved(key);
+        return true;
+      } catch (e) {
+        setSettingDrafts((d) => {
+          const rest = { ...d };
+          delete rest[key];
+          return rest;
+        });
+        showMessage(`Failed to save ${label}: ${e.message}`, "error");
+        return false;
+      }
+    },
+    [markSaved, showMessage],
   );
+
+  const commitSettingField = useCallback(
+    (key, label) => {
+      const draft = settingDrafts[key];
+      if (draft === undefined) return;
+      if (draft === (settings[key] ?? "")) {
+        setSettingDrafts((d) => {
+          const rest = { ...d };
+          delete rest[key];
+          return rest;
+        });
+        return;
+      }
+      saveSetting(key, draft, label);
+    },
+    [settingDrafts, settings, saveSetting],
+  );
+
+  const settingFieldValue = (key) =>
+    settingDrafts[key] !== undefined
+      ? settingDrafts[key]
+      : (settings[key] ?? "");
+
+  const handleSettingFieldChange = (key, value) =>
+    setSettingDrafts((d) => ({ ...d, [key]: value }));
+
+  const RESET_CONFIRM =
+    "Reset autoresearch to defaults?\n\n" +
+    "This discards the tuned retrieval parameters, the baseline score and phase progress " +
+    "learned by previous nightly runs, and clears the proposer, judge, window and auto-start settings.\n\n" +
+    "Past experiment records are kept. This cannot be undone.";
+
+  const handleResetToDefaults = async () => {
+    if (!window.confirm(RESET_CONFIRM)) return;
+    setResettingConfig(true);
+    try {
+      await ragAutoresearchService.resetConfig();
+      setSettingDrafts({});
+      await fetchAll();
+      showMessage(
+        "Autoresearch reset: tuned parameters, baseline and settings are back to defaults",
+        "success",
+      );
+    } catch (e) {
+      showMessage(`Failed to reset autoresearch: ${e.message}`, "error");
+    } finally {
+      setResettingConfig(false);
+    }
+  };
+
+  const handleRegeneratePairs = async () => {
+    setRegenerating(true);
+    try {
+      const data = await ragAutoresearchService.regenerateEvalPairs();
+      showMessage(`Regenerated ${data.count ?? 0} eval pairs`, "success");
+      fetchEvalPairs();
+      fetchStatus();
+    } catch (e) {
+      showMessage(`Failed to regenerate eval pairs: ${e.message}`, "error");
+    } finally {
+      setRegenerating(false);
+    }
+  };
 
   const handleResearchTonight = async () => {
     setStarting(true);
     try {
       await ragAutoresearchService.createRun({
+        mode: runMode,
         budget_hours: Number(budgetHours) || 6,
       });
       showMessage("Research run started", "success");
@@ -195,6 +435,21 @@ const AutoresearchPage = () => {
       fetchPromotions();
     } catch (e) {
       showMessage(`Failed to activate: ${e.message}`, "error");
+    }
+  };
+
+  const handleCodeKeep = async (fixId, action) => {
+    try {
+      if (action === "approve") {
+        await selfImprovementService.approveFix(fixId);
+        showMessage("Code keep approved — apply from Settings Pending Fixes", "success");
+      } else {
+        await selfImprovementService.rejectFix(fixId);
+        showMessage("Code keep rejected", "info");
+      }
+      fetchStatus();
+    } catch (e) {
+      showMessage(`Failed to ${action} code keep: ${e.message}`, "error");
     }
   };
 
@@ -249,6 +504,23 @@ const AutoresearchPage = () => {
               writes a report when it finishes.
             </Typography>
           </Box>
+          <Box sx={{ display: "flex", gap: 0.5 }}>
+            {[
+              { id: "unified", label: "Unified" },
+              { id: "rag_tuning", label: "Retrieval" },
+              { id: "code_tuning", label: "Code" },
+            ].map((m) => (
+              <Button
+                key={m.id}
+                size="small"
+                variant={runMode === m.id ? "contained" : "outlined"}
+                onClick={() => setRunMode(m.id)}
+                disabled={Boolean(activeRun)}
+              >
+                {m.label}
+              </Button>
+            ))}
+          </Box>
           <TextField
             label="Budget (hours)"
             type="number"
@@ -268,6 +540,38 @@ const AutoresearchPage = () => {
           >
             Research Tonight
           </Button>
+          <Button
+            variant="outlined"
+            color="warning"
+            startIcon={
+              stopping ? <CircularProgress size={16} /> : <StopIcon />
+            }
+            onClick={handleStop}
+            disabled={stopping || !activeRun}
+          >
+            Stop
+          </Button>
+        </Box>
+        <Box
+          sx={{
+            display: "flex",
+            alignItems: "center",
+            gap: 2,
+            flexWrap: "wrap",
+            mt: 2,
+          }}
+        >
+          <Typography variant="body2" color="text.secondary">
+            Eval pairs: {evalCount ?? "—"}
+          </Typography>
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={handleRegeneratePairs}
+            disabled={regenerating || Boolean(activeRun)}
+          >
+            {regenerating ? "Regenerating…" : "Regenerate eval pairs"}
+          </Button>
         </Box>
         {activeRun && (
           <Box sx={{ mt: 2 }}>
@@ -280,12 +584,242 @@ const AutoresearchPage = () => {
               <Typography variant="body2">
                 {activeRun.run_tag} — {activeRun.experiments_completed ?? 0}{" "}
                 experiments completed
+                {status?.current_parameter
+                  ? ` · ${status.current_parameter}`
+                  : ""}
               </Typography>
+              <Box sx={{ ml: "auto", color: "primary.main" }}>
+                <ScoreSparkline
+                  points={metrics
+                    .filter(
+                      (m) =>
+                        !activeRun.run_tag || m.run_tag === activeRun.run_tag,
+                    )
+                    .map((m) => m.composite_score)
+                    .reverse()}
+                />
+              </Box>
             </Box>
-            <LinearProgress sx={{ borderRadius: 1 }} />
+            <LinearProgress
+              variant={
+                typeof (status?.active_run?.budget_remaining_s) === "number" &&
+                activeRun.wall_clock_budget_s
+                  ? "determinate"
+                  : "indeterminate"
+              }
+              value={
+                typeof (status?.active_run?.budget_remaining_s) === "number" &&
+                activeRun.wall_clock_budget_s
+                  ? Math.max(
+                      0,
+                      Math.min(
+                        100,
+                        (1 -
+                          status.active_run.budget_remaining_s /
+                            activeRun.wall_clock_budget_s) *
+                          100,
+                      ),
+                    )
+                  : undefined
+              }
+              sx={{ borderRadius: 1 }}
+            />
+            {typeof status?.active_run?.budget_remaining_s === "number" && (
+              <Typography variant="caption" color="text.secondary">
+                {Math.ceil(status.active_run.budget_remaining_s / 60)} min remaining
+              </Typography>
+            )}
           </Box>
         )}
       </Paper>
+
+      {/* --- Settings --- */}
+      <Paper
+        elevation={0}
+        sx={{ p: 2, mb: 3, border: 1, borderColor: "divider" }}
+      >
+        <Typography variant="h6" sx={{ mb: 1 }}>
+          Settings
+        </Typography>
+        <Typography
+          variant="caption"
+          color="text.secondary"
+          sx={{ display: "block", mb: 2 }}
+        >
+          Auto-start hands the nightly window to Beat, which starts at most one
+          run per night. Leave a model blank to use the active chat model. Each
+          field saves when you leave it or press Enter.
+        </Typography>
+
+        <Box
+          sx={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 2,
+            flexWrap: "wrap",
+          }}
+        >
+          <Box
+            sx={{
+              display: "flex",
+              alignItems: "center",
+              gap: 1,
+              minHeight: 40,
+              mt: 0.5,
+            }}
+          >
+            <Typography variant="body2" component="label" htmlFor={AUTO_START_ID}>
+              Auto-start in nightly window
+            </Typography>
+            <Switch
+              size="small"
+              id={AUTO_START_ID}
+              inputProps={{ "aria-label": "Auto-start in nightly window" }}
+              checked={settings.rag_autoresearch_auto_enabled === "true"}
+              disabled={resettingConfig}
+              onChange={(e) =>
+                saveSetting(
+                  "rag_autoresearch_auto_enabled",
+                  e.target.checked,
+                  "auto-start",
+                )
+              }
+            />
+            {savedKeys.rag_autoresearch_auto_enabled && (
+              <Box
+                sx={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 0.25,
+                  color: "success.main",
+                }}
+              >
+                <SavedIcon sx={{ fontSize: 16 }} />
+                <Typography variant="caption">Saved</Typography>
+              </Box>
+            )}
+          </Box>
+
+          {SETTING_FIELDS.map((f) => (
+            <TextField
+              key={f.key}
+              label={f.label}
+              size="small"
+              placeholder={f.placeholder}
+              value={settingFieldValue(f.key)}
+              disabled={resettingConfig}
+              onChange={(e) => handleSettingFieldChange(f.key, e.target.value)}
+              onBlur={() => commitSettingField(f.key, f.label.toLowerCase())}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  e.target.blur();
+                }
+              }}
+              helperText={savedKeys[f.key] ? "Saved" : " "}
+              FormHelperTextProps={{
+                sx: { color: savedKeys[f.key] ? "success.main" : "inherit" },
+              }}
+              sx={{ width: f.width }}
+            />
+          ))}
+        </Box>
+
+        <Box
+          sx={{
+            mt: 2,
+            pt: 2,
+            borderTop: 1,
+            borderColor: "divider",
+            display: "flex",
+            alignItems: "center",
+            gap: 2,
+            flexWrap: "wrap",
+          }}
+        >
+          <Typography variant="caption" color="text.secondary" sx={{ flex: 1 }}>
+            Clears the tuned parameters, baseline and phase progress along with
+            these settings. Past experiment records are kept.
+          </Typography>
+          <Button
+            variant="outlined"
+            color="error"
+            size="small"
+            startIcon={
+              resettingConfig ? (
+                <CircularProgress size={16} />
+              ) : (
+                <ResetDefaultsIcon />
+              )
+            }
+            onClick={handleResetToDefaults}
+            disabled={resettingConfig}
+            // The active theme flattens every outlined button to grey; a
+            // destructive action has to keep reading as destructive.
+            sx={(t) => ({
+              color: "error.main",
+              borderColor: alpha(t.palette.error.main, 0.6),
+              "&:hover": {
+                borderColor: "error.main",
+                backgroundColor: alpha(t.palette.error.main, 0.08),
+              },
+            })}
+          >
+            Reset to Defaults
+          </Button>
+        </Box>
+      </Paper>
+
+      {/* --- Code keeps (PendingFixes staged by the director) --- */}
+      {codeKeeps.length > 0 && (
+        <Paper
+          elevation={0}
+          sx={{ p: 2, mb: 3, border: 1, borderColor: "divider" }}
+        >
+          <Typography variant="h6" sx={{ mb: 1 }}>
+            Code keeps
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
+            Swarm arms that passed preserve-and-extend. Approve here, then apply
+            from Settings — nothing auto-merges to main.
+          </Typography>
+          <TableContainer>
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>Description</TableCell>
+                  <TableCell>Status</TableCell>
+                  <TableCell>Created</TableCell>
+                  <TableCell align="right">Actions</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {codeKeeps.map((fix) => (
+                  <TableRow key={fix.id}>
+                    <TableCell>{fix.fix_description}</TableCell>
+                    <TableCell>
+                      <Chip label={fix.status} size="small" sx={{ height: 20, fontSize: "0.7rem" }} />
+                    </TableCell>
+                    <TableCell>{formatDate(fix.created_at)}</TableCell>
+                    <TableCell align="right">
+                      {fix.status === "proposed" && (
+                        <>
+                          <Button size="small" onClick={() => handleCodeKeep(fix.id, "approve")}>
+                            Approve
+                          </Button>
+                          <Button size="small" color="warning" onClick={() => handleCodeKeep(fix.id, "reject")}>
+                            Reject
+                          </Button>
+                        </>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </Paper>
+      )}
 
       {/* --- Runs --- */}
       <Paper
@@ -397,7 +931,7 @@ const AutoresearchPage = () => {
                   },
                 }}
               >
-                <ReactMarkdown>{selectedRun.report_md}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{selectedRun.report_md}</ReactMarkdown>
               </Box>
             ) : (
               <Typography variant="body2" color="text.secondary">
@@ -547,7 +1081,11 @@ const AutoresearchPage = () => {
                 {metrics.map((exp) => (
                   <TableRow key={exp.id} hover>
                     <TableCell>{formatDate(exp.created_at)}</TableCell>
-                    <TableCell>{exp.parameter}</TableCell>
+                    <TableCell>
+                      <Tooltip title={exp.hypothesis || ""}>
+                        <span>{exp.parameter}</span>
+                      </Tooltip>
+                    </TableCell>
                     <TableCell>{exp.new_value}</TableCell>
                     <TableCell>
                       <Chip

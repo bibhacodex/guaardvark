@@ -45,6 +45,9 @@ class Shot:
     reference: tuple[str, str, str] | None = None
     motion: bool = False               # render image-to-video instead of a push
     variant: int = 0                   # which cached still to use
+    # Figures are excluded from b-roll by default; set where the shot is
+    # about a hand or a stance and the frame is meaningless without one.
+    people: bool = False
 
 
 @dataclass
@@ -71,8 +74,24 @@ def _still_segment(still: Path, seconds: float, dest: Path) -> Path:
     return dest
 
 
+def _pingpong(clip: Path, dest: Path) -> Path:
+    """Follow `clip` with its own reverse, so repeated loops have no jump cut."""
+    run(["ffmpeg", "-y", "-i", str(clip), "-filter_complex",
+         "[0:v]split[a][b];[b]reverse[r];[a][r]concat=n=2:v=1[v]",
+         "-map", "[v]", "-an",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", str(dest)])
+    return dest
+
+
 def _clip_segment(clip: Path, seconds: float, dest: Path) -> Path:
-    """Fit a rendered motion clip to `seconds`, looping if it runs short."""
+    """Fit a rendered motion clip to `seconds`, looping if it runs short.
+
+    I2V returns a few seconds against narration that often runs ten times
+    longer. A camera drift does not end where it began, so the clip is mirrored
+    before looping — otherwise the picture jumps at every seam.
+    """
+    if ffprobe_duration(clip) < seconds:
+        clip = _pingpong(clip, clip.with_name(f"{clip.stem}_pp.mp4"))
     run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(clip),
          "-t", f"{seconds:.2f}",
          "-vf", f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
@@ -174,7 +193,9 @@ def produce(script: TrainingScript, only: list[str] | None = None,
     workdir.mkdir(parents=True, exist_ok=True)
 
     print(f"[{script.slug}] stills for {len(shots)} shot(s)…")
-    library = visuals.stills_for([s.prompt for s in shots])
+    library = visuals.stills_for(
+        [s.prompt for s in shots],
+        people={s.prompt for s in shots if s.people})
 
     # After the stills pass, which may have stopped the voice service to free
     # VRAM. Restarting here also means a missing clip fails before any picture

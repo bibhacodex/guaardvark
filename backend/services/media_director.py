@@ -26,6 +26,7 @@ from typing import Any, List, Optional, Dict
 # Reuse ALL vetted primitives (model safety, parse, chat, guards) to avoid regressions.
 from backend.services.music_video_director import (
     DIRECTOR_MODEL,
+    _director_candidates,
     _resolve_model,
     _is_embedding_model,
     _parse_prompts as _base_parse_prompts,
@@ -61,6 +62,24 @@ Keep the user's core intent. Enrich, never replace.
 Be one flowing descriptive phrase. No narration, no "the image depicts", no meta.
 STYLE (if given) is appended by caller; do not repeat it wholesale.
 Return STRICT JSON: {"prompts": ["enriched1", "enriched2", ...]} exactly one per input, same order."""
+
+# Rewrite contract for natural-language encoders (Z-Image). Ported from the
+# prompt-enhancer template the model's authors ship with their demo: lock the
+# fixed facts, reason out a concrete scene when the idea is a brief rather than
+# a picture, add photographic detail, quote any in-image text, no metaphors, no
+# quality tags. Measured on this box 2026-09-07 with gemma4:e4b: 1-8 s per
+# prompt, 130-155 words, and the couch scene rendered clean on every seed.
+_SYSTEM_ENHANCE_IMAGE_NATURAL = """You rewrite each short image idea into one detailed, concrete visual description for a text-to-image model.
+
+Work in this order for every idea:
+1. Lock the fixed facts: the subjects, how many of them, what they are doing, their pose or state, and any named brand, colour, or text. Keep every one of them exactly. Never add or remove people.
+2. If the idea is a question or a design brief rather than a scene, first decide on one specific, drawable scene that answers it, then describe that scene.
+3. Add photographic detail: framing and camera angle, where each subject is and how their bodies are arranged, lighting and time of day, materials and textures, colour palette, and depth (foreground, midground, background).
+4. Any text that must appear in the image is written verbatim inside double quotes, with its position, size, and font style. If no text is needed, spend the space on visual detail instead.
+
+Rules: objective and physical, no metaphors, no emotional language, no quality tags such as "8K", "masterpiece" or "high quality", and no instructions to the model. Each description is one paragraph of plain prose, 80 to 200 words.
+STYLE (if given) describes the medium or look to honour; weave it in as a short clause, do not repeat it wholesale.
+Return STRICT JSON: {"prompts": ["description1", "description2", ...]} exactly one per input, same order."""
 
 def _options(n: int, sampling: Optional[dict] = None) -> dict:
     n = max(1, n)
@@ -108,6 +127,17 @@ def _style_clause(style: Optional[str]) -> str:
     return f"\nGlobal visual style/aesthetic to honor: {style}." if style else ""
 
 
+def verbatim_prompts_env_forced() -> bool:
+    """True when VERBATIM_PROMPTS in the environment forces verbatim mode on.
+
+    The Settings toggle cannot turn this off; the settings API reports it so
+    the page can show the switch as forced instead of showing a stored value
+    the generators ignore.
+    """
+    import os
+    return os.environ.get("VERBATIM_PROMPTS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def verbatim_prompts_enabled() -> bool:
     """True when the operator turned ON 'verbatim prompts' — send the user's EXACT words
     to the image/video model and SKIP director-LLM rewrite, offline style stuffing, and
@@ -131,8 +161,7 @@ def verbatim_prompts_enabled() -> bool:
       * ImageGeneratorTool / batch image (auto_enhance)
       * comfyui_video_generator prompt enhance
     """
-    import os
-    if os.environ.get("VERBATIM_PROMPTS", "").strip().lower() in ("1", "true", "yes", "on"):
+    if verbatim_prompts_env_forced():
         return True
     try:
         from flask import has_app_context
@@ -172,10 +201,14 @@ def enhance_prompts(
     model: Optional[str] = None,
     cast_descriptors: Optional[List[str]] = None,
     sampling: Optional[dict] = None,
+    prompt_style: Optional[str] = None,
 ) -> List[str]:
     """Enrich a list of user prompts into rich pure-visual shot-ready prompts via director LLM.
     Best-effort: on any failure returns originals (or lightly cued).
     Used by chat ImageGeneratorTool and batch pre-pass.
+
+    ``prompt_style="natural"`` selects the prose contract for LLM-encoder models
+    (Z-Image); anything else keeps the comma-phrase contract for CLIP-era models.
     """
     if not prompts:
         return []
@@ -183,7 +216,6 @@ def enhance_prompts(
         log.info("media_director: verbatim prompts ON — sending user prompts to the model as-is (no director rewrite)")
         return list(prompts)
     n = len(prompts)
-    resolved = _resolve_model(model or DEFAULT_DIRECTOR_MODEL)
     style_c = _style_clause(style)
     guidance = f"\nExtra direction: {extra_guidance.strip()}." if extra_guidance and extra_guidance.strip() else ""
     cast = ""
@@ -196,28 +228,43 @@ def enhance_prompts(
         f"{style_c}{guidance}{cast}\n\n"
         "TASK: Return ONLY JSON with 'prompts' array of exactly N enriched pure-visual prompts. Preserve order and core intent."
     )
-    try:
-        # NOTE: do NOT use the music-director's _director_chat here — its parser hunts for a
-        # "shots" array, but this enrich contract returns {"prompts": [...]}. Mismatched parsing
-        # silently returned [] → originals (the batch-director no-op bug, fixed 2026-06-23).
-        # Mirror storyboard_from_concept: own chat call + _parse_image_prompts (list-aware).
-        import ollama
-        opts = _options(n, sampling)
-        resp = ollama.chat(
-            model=resolved,
-            format="json",
-            messages=[
-                {"role": "system", "content": _SYSTEM_ENHANCE_IMAGE},
-                {"role": "user", "content": user},
-            ],
-            options=opts,
-        )
-        out = _parse_image_prompts(resp["message"]["content"], n)
-        if len(out) == n:
-            return [p.strip() for p in out]
-        log.warning("media_director.enhance_prompts parsed %d/%d prompts; falling back", len(out), n)
-    except Exception as e:  # noqa: BLE001
-        log.warning("media_director.enhance_prompts failed (%s); falling back", e)
+    # NOTE: do NOT use the music-director's _director_chat here — its parser hunts for a
+    # "shots" array, but this enrich contract returns {"prompts": [...]}. Mismatched parsing
+    # silently returned [] → originals (the batch-director no-op bug, fixed 2026-06-23).
+    # Mirror storyboard_from_concept: own chat call + _parse_image_prompts (list-aware).
+    opts = _options(n, sampling)
+    if (prompt_style or "").lower() == "natural":
+        system = _SYSTEM_ENHANCE_IMAGE_NATURAL
+        # Prose descriptions run ~150 words each; the phrase budget clips them.
+        opts["num_predict"] = max(int(opts.get("num_predict", 0)), min(4096, 320 * n + 256))
+    else:
+        system = _SYSTEM_ENHANCE_IMAGE
+    # The active chat model goes first; a model that errors or hands back the wrong
+    # number of prompts is skipped for the next family on the ladder (gemma, qwen, ...).
+    for resolved in _director_candidates(model or DEFAULT_DIRECTOR_MODEL)[:3]:
+        try:
+            import ollama
+            from backend.utils.ollama_resource_manager import think_payload
+            resp = ollama.chat(
+                model=resolved,
+                format="json",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                options=opts,
+                **think_payload(resolved),
+            )
+            out = _parse_image_prompts(resp["message"]["content"], n)
+            if len(out) == n:
+                log.info("media_director.enhance_prompts: %d prompt(s) rewritten by %s", n, resolved)
+                return [p.strip() for p in out]
+            log.warning(
+                "media_director.enhance_prompts: %s parsed %d/%d prompts; trying the next model",
+                resolved, len(out), n,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("media_director.enhance_prompts: %s failed (%s); trying the next model", resolved, e)
     # Fallback: return originals (caller may still do keyword enhance)
     return list(prompts)
 
@@ -247,6 +294,7 @@ def refine_edit_instruction(instruction: str, *, model: Optional[str] = None,
     resolved = _resolve_model(model or DEFAULT_DIRECTOR_MODEL)
     try:
         import ollama
+        from backend.utils.ollama_resource_manager import think_payload
         import json as _json
         resp = ollama.chat(
             model=resolved,
@@ -256,6 +304,7 @@ def refine_edit_instruction(instruction: str, *, model: Optional[str] = None,
                 {"role": "user", "content": f"User edit request: {instr}"},
             ],
             options=_options(1, sampling),
+            **think_payload(resolved),
         )
         data = _json.loads(resp["message"]["content"])
         refined = (data.get("instruction") or "").strip()
@@ -293,6 +342,7 @@ def storyboard_from_concept(
     try:
         # Use a direct chat wrapper for storyboard (rich)
         import ollama
+        from backend.utils.ollama_resource_manager import think_payload
         opts = _options(n, sampling)
         resp = ollama.chat(
             model=resolved,
@@ -302,6 +352,7 @@ def storyboard_from_concept(
                 {"role": "user", "content": user},
             ],
             options=opts,
+            **think_payload(resolved),
         )
         content = resp["message"]["content"]
         data = _parse_storyboard_output(content, n)

@@ -1,6 +1,21 @@
-"""Shared slash-command metadata for help and completion."""
+"""Shared slash-command metadata for help and completion.
 
+COMMAND_TREE is the source of truth for top-level REPL commands and their
+subcommands. SlashRouter, the completer, /help, and the catalog contract
+test must all agree with this map.
+"""
+
+from __future__ import annotations
+
+import difflib
 from collections import OrderedDict
+
+
+# Alias → canonical command. Aliases are listed in COMMAND_TREE so they
+# complete, but they dispatch to the canonical handler.
+COMMAND_ALIASES: dict[str, str] = {
+    "exit": "quit",
+}
 
 
 COMMAND_TREE: dict[str, list[str]] = OrderedDict(
@@ -34,6 +49,8 @@ COMMAND_TREE: dict[str, list[str]] = OrderedDict(
             "videos",
             ["list", "generate", "from-image", "status", "models", "delete", "download", "combine"],
         ),
+        ("music-video", ["list", "create", "status", "cancel", "delete"]),
+        ("film-crew", ["list", "create", "status", "delete"]),
         ("remember", []),
         ("memory", ["list", "search", "delete", "clear"]),
         # Local agentic coding surface
@@ -55,13 +72,30 @@ COMMAND_TREE: dict[str, list[str]] = OrderedDict(
         ("suggest", []),
         ("analyze", []),
         ("init", []),
+        ("load", []),
+        ("skills", []),
         ("new", []),
+        ("abort", []),
         ("clear", []),
         ("history", []),
         ("export", []),
         ("config", ["server", "theme", "timeout", "api_key"]),
         ("theme", []),
         ("quality", ["scorecard"]),
+        ("recipes", ["list", "show", "validate"]),
+        ("plugins", ["list", "start", "stop", "enable", "disable", "logs", "status"]),
+        ("gpu", ["status", "release"]),
+        ("mcp", ["config", "install", "doctor", "list-tools", "client"]),
+        ("audio", ["tts", "play", "music", "sfx", "voices"]),
+        ("swarm", ["list", "run", "status", "logs"]),
+        ("lessons", ["begin", "end", "list"]),
+        # Multi-modal / REPL-only
+        ("imagine", []),
+        ("video", []),
+        ("voice", []),
+        ("ingest", []),
+        ("agent", ["on", "off", "shot"]),
+        ("web", []),
         ("help", []),
         ("quit", []),
         ("exit", []),
@@ -96,6 +130,8 @@ COMMAND_META: dict[str, str] = {
     "tasks": "Task management",
     "images": "Image generation",
     "videos": "Video generation",
+    "music-video": "Beat-synced music video (plan; approve in Studio)",
+    "film-crew": "Five-role Film Crew production (plan; render in Studio)",
     "remember": "Save to memory",
     "memory": "Manage saved memories",
     "ls": "List files (local)",
@@ -117,14 +153,37 @@ COMMAND_META: dict[str, str] = {
     "analyze": "Analyze project/site (explore build.py, CSS, GUAARDVARK.md, create todos)",
     "init": "Recursively scan current project root and auto-create/update GUAARDVARK.md with agent findings",
     "load": "Load a skill / .md instructions file (e.g. load skill path/to/SKILL.md) and inject for session context",
+    "skills": "List SKILL.md files in the project and ~/.guaardvark/skills",
     "new": "New conversation",
+    "abort": "Hard-abort a stuck in-flight chat for this session",
     "clear": "Clear screen",
     "history": "Command history",
     "export": "Export conversation",
     "config": "REPL configuration",
     "theme": "Switch colour theme",
     "quality": "Quality scorecard and gates",
+    "recipes": "Inspect and validate agent recipes",
+    "plugins": "Start/stop GPU and service plugins",
+    "gpu": "GPU status and owner lock",
+    "mcp": "Guaardvark as an MCP server; `mcp client` for the servers it uses",
+    "audio": "Audio Foundry — TTS, music, SFX",
+    "swarm": "Parallel agents in isolated worktrees",
+    "lessons": "Begin/end lesson pearls",
+    "imagine": "Generate an image from a text prompt",
+    "video": "Generate a video from a text prompt",
+    "voice": "Text-to-speech",
+    "ingest": "Index files or a directory for RAG",
+    "agent": "Toggle autonomous screen-agent mode (on/off/shot)",
+    "web": "Open the Guaardvark web UI",
     "help": "Show help",
     "quit": "Exit the REPL",
     "exit": "Exit the REPL",
 }
+
+
+def suggest_command(name: str, n: int = 3, cutoff: float = 0.55) -> list[str]:
+    """Return close command-name matches for an unknown token."""
+    if not name:
+        return []
+    keys = [k for k in COMMAND_TREE if k != name]
+    return difflib.get_close_matches(name.lower(), keys, n=n, cutoff=cutoff)

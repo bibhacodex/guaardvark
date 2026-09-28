@@ -125,6 +125,7 @@ def _parse_consensus_json(raw: str) -> dict[str, str]:
 
 def _default_consensus_llm(*, system: str, user: str, model: str = "gemma4:12b") -> str:
     import ollama
+    from backend.utils.ollama_resource_manager import think_payload
     resp = ollama.chat(
         model=model,
         messages=[
@@ -133,6 +134,7 @@ def _default_consensus_llm(*, system: str, user: str, model: str = "gemma4:12b")
         ],
         format="json",
         options={"temperature": 0.2, "num_predict": 400},
+        **think_payload(model),
     )
     return (resp.get("message") or {}).get("content") or ""
 

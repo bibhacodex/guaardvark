@@ -1,12 +1,15 @@
 
 import logging
 import json
+import threading
 import subprocess
 import time
 import os
+import tempfile
 import shutil
 import urllib.request
 import urllib.parse
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -15,6 +18,8 @@ import uuid
 import requests
 
 logger = logging.getLogger(__name__)
+
+from backend.services.user_video_models import resolve_text_encoder
 
 try:
     from backend.config import CACHE_DIR, COMFYUI_URL, COMFYUI_OUTPUT_DIR, COMFYUI_DIR
@@ -31,6 +36,9 @@ except ImportError:
 try:
     from backend.services.video_model_registry import wan_comfyui_map as _wan_comfyui_map
     from backend.services.video_model_registry import ltx_comfyui_map as _ltx_comfyui_map
+    from backend.services.video_model_registry import hunyuan_comfyui_map as _hunyuan_comfyui_map
+    from backend.services.video_model_registry import minimax_comfyui_map as _minimax_comfyui_map
+    from backend.services.video_model_registry import cogvideox_comfyui_map as _cogvideox_comfyui_map
 except Exception:  # pragma: no cover - defensive
     def _wan_comfyui_map():
         return {}
@@ -38,7 +46,33 @@ except Exception:  # pragma: no cover - defensive
     def _ltx_comfyui_map():
         return {}
 
+    def _hunyuan_comfyui_map():
+        return {}
+
+    def _minimax_comfyui_map():
+        return {}
+
+    def _cogvideox_comfyui_map():
+        return {}
+
 from backend.services.comfyui_video_workflows import ComfyUIVideoWorkflowMixin
+from backend.services import video_render_limits as render_limits
+from backend.services.video_render_limits import family_frame_count
+from backend.services.job_types import RenderErrorKind, RenderFailure, failure_kind, render_failed
+
+# How long a render waits for the orchestrator to free the registry estimate
+# before it gives up instead of queuing into a starved card. Same budget the
+# image batch runner uses (GUAARDVARK_IMAGE_VRAM_WAIT_S).
+VRAM_WAIT_ENV = "GUAARDVARK_VIDEO_VRAM_WAIT_S"
+VRAM_WAIT_DEFAULT_S = 600.0
+
+# Consecutive missed liveness probes (~4 s each: HTTP timeout + 2 s sleep)
+# before a queued prompt is declared orphaned. Large model loads legitimately
+# exceed five: loading a 20 GB+ transformer on a 16 GB card stalls Comfy's
+# HTTP server well past 20 s (observed 247 s renders with ~30 s silent loads
+# on an RTX 5080 / 30 GB RAM box), and the 22B LTX loads were falsely failed
+# at 5. Thirty tolerates about two minutes of silence.
+DEAD_PROBE_LIMIT = 30
 
 
 def _looks_like_blank_video(video_path) -> Optional[str]:
@@ -70,11 +104,20 @@ def _looks_like_blank_video(video_path) -> Optional[str]:
         # blackdetect with pic_th=0.98 flags ~fully-black frames only. A real clip —
         # even a dark/cinematic one — is not 98%-black pixels for ~its whole runtime,
         # so this only trips on a genuinely blank render (very low false-positive).
-        proc = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-nostats", "-i", str(p),
-             "-vf", "blackdetect=d=0.1:pic_th=0.98", "-an", "-f", "null", "-"],
-            capture_output=True, text=True, timeout=120,
-        )
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-nostats", "-i", str(p),
+                 "-vf", "blackdetect=d=0.1:pic_th=0.98", "-an", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=120,
+            )
+        except FileNotFoundError:
+            # No ffmpeg binary: decode with PyAV (backend/requirements.txt) instead.
+            from backend.services.video_consistency_metrics import inspect_video_frames
+            frames = inspect_video_frames(p)
+            sampled = len(frames.get("sampled") or [])
+            if frames.get("readable") and sampled and frames.get("black_sampled") == sampled:
+                return f"render is black in all {sampled} sampled frames — a blank/failed clip"
+            return None
         stderr = proc.stderr or ""
         dur_m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
         if not dur_m:
@@ -102,6 +145,9 @@ class VideoGenerationRequest:
     motion_strength: float = 1.0
     num_inference_steps: int = 25
     guidance_scale: float = 7.5
+    # False: the caller named no guidance and guidance_scale is a placeholder;
+    # with GUAARDVARK_VIDEO_REFERENCE_DEFAULTS the model's own value replaces it.
+    cfg_explicit: bool = False
     seed: Optional[int] = None
     generate_frames_only: bool = False
     frames_per_batch: int = 1
@@ -112,10 +158,31 @@ class VideoGenerationRequest:
     prompt_style: str = "cinematic"   # Enhancement style: cinematic, realistic, artistic, anime, none
     enhance_prompt: bool = True       # Whether to run prompt through the enhancer
     fidelity_mode: bool = False       # Light enhancement only (Exact text / preserve fidelity mode)
+    wan_sampler_profile: Optional[str] = None  # Wan 5B: "adaptive" | "official" (see WAN5B_SAMPLER_PROFILES)
     freeu: bool = False
     face_restore: bool = False
     lora_name: Optional[str] = None
     lora_strength: float = 1.0
+    # User-catalog LoRAs: [{"id": "user-...", "strength": 0.7}]
+    adapters: List[Dict] = field(default_factory=list)
+    # User-catalog text encoder id that replaces the model's shipped CLIPLoader file.
+    text_encoder: Optional[str] = None
+    # Capability-contract inputs (backend/services/video_model_registry.py).
+    # A model that does not declare the capability rejects the field with a
+    # plain message instead of ignoring it.
+    speed_profile: Optional[str] = None       # id from the model's speed_profiles
+    style_embedding: Optional[str] = None     # id from the model's style_embeddings
+    first_frame_path: Optional[str] = None    # alias of metadata["image_path"]
+    last_frame_path: Optional[str] = None     # l2v / flf2v on models with those modes
+    # Anchors for models with audio_in: [{"kind": "audio"|"image", "path": str,
+    # "frame_idx": int, "seek_s": float, "duration_s": float}]
+    guides: List[Dict] = field(default_factory=list)
+    # Reference inputs for ref2v models (paths on this machine).
+    ref_images: List[str] = field(default_factory=list)
+    ref_videos: List[Dict] = field(default_factory=list)   # {"path": str, "audio_path": str|None}
+    ref_audios: List[str] = field(default_factory=list)
+    language: str = "English"                 # dialogue language for the prompt compiler
+    h3_intent: Optional[Dict] = None          # structured intent, compiled by h3_prompt_compiler
 
 
 @dataclass
@@ -127,9 +194,54 @@ class VideoGenerationResult:
     thumbnail_path: Optional[str] = None
     error: Optional[str] = None
     metadata: Dict[str, str] = field(default_factory=dict)
+    # True when the clip carries a soundtrack the model generated (H3 today;
+    # LTX once its audio latent is decoded). Mirrored as metadata["has_audio"].
+    has_audio: bool = False
+    # job_types.RenderErrorKind value of a failure, set with the error.
+    error_kind: Optional[str] = None
+
+    def __post_init__(self):
+        if self.error and not self.error_kind:
+            kind = failure_kind(self.error)
+            self.error_kind = kind.value if kind else None
+
+    def fail(self, kind, message: str) -> "VideoGenerationResult":
+        """Mark the result failed with a kind (job_types.RenderErrorKind); a
+        message that already carries a kind keeps it."""
+        k = failure_kind(message) or RenderErrorKind(kind)
+        self.success = False
+        self.error = str(message)
+        self.error_kind = k.value
+        return self
 
 
 class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
+
+    # Prompt ids this process has queued, newest last. Class-level because
+    # generate and cancel do not always hold the same generator: the batch
+    # runner uses the module singleton, the router keeps its own instance and
+    # replaces it on every get_active_generator(). Bounded, and a stale id
+    # costs nothing — ComfyUI matches it against what is actually running.
+    _queued_prompts: deque = deque(maxlen=16)
+    _queued_prompts_lock = threading.Lock()
+
+    @classmethod
+    def _track_prompt(cls, prompt_id: str) -> None:
+        with cls._queued_prompts_lock:
+            cls._queued_prompts.append(prompt_id)
+
+    @classmethod
+    def _forget_prompt(cls, prompt_id: str) -> None:
+        with cls._queued_prompts_lock:
+            try:
+                cls._queued_prompts.remove(prompt_id)
+            except ValueError:
+                pass
+
+    @classmethod
+    def _known_prompts(cls) -> List[str]:
+        with cls._queued_prompts_lock:
+            return list(cls._queued_prompts)
 
     def __init__(self):
         project_root = Path(__file__).parent.parent.parent
@@ -154,6 +266,8 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
 
         self.service_available = self._check_comfyui_connection()
         self._object_info_cache: Optional[dict] = None
+        self._vram_booking: Optional[str] = None
+        self._project_root = project_root
 
         if self.service_available:
             logger.info(f"ComfyUI video generator connected to {self.comfy_url}")
@@ -169,8 +283,10 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
             response.raise_for_status()
             self._object_info_cache = response.json()
         except Exception as e:
+            # Not cached: ComfyUI is often stopped while another GPU job runs, and an
+            # empty cache would report every node missing until the backend restarts.
             logger.debug(f"Could not fetch ComfyUI object_info: {e}")
-            self._object_info_cache = {}
+            return {}
         return self._object_info_cache
 
     def comfy_node_available(self, class_type: str) -> bool:
@@ -185,58 +301,78 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
         except requests.exceptions.RequestException:
             return False
 
-    def _upload_image_to_comfyui(self, image_path: str) -> Optional[str]:
+    def _upload_input_file(self, path: str, kind: str = "image") -> Optional[str]:
+        """Copy a local file into ComfyUI's input/ and return the name its
+        loader nodes use. ComfyUI has only /upload/image, but it stores any
+        file (server.py compares bytes, it does not decode), so audio guides
+        travel the same road and LoadAudio finds them by name."""
         try:
-            with open(image_path, 'rb') as f:
+            with open(path, 'rb') as f:
                 files = {'image': f}
                 data = {'type': 'input', 'overwrite': 'true'}
                 response = requests.post(
                     f"{self.comfy_url}/upload/image",
                     files=files,
                     data=data,
-                    timeout=30
+                    timeout=60,
                 )
                 response.raise_for_status()
 
             result = response.json()
             uploaded_name = result.get("name")
-            logger.info(f"Uploaded image to ComfyUI as: {uploaded_name}")
+            logger.info(f"Uploaded {kind} to ComfyUI as: {uploaded_name}")
             return uploaded_name
 
         except Exception as e:
-            logger.error(f"Failed to upload image to ComfyUI: {e}")
+            logger.error(f"Failed to upload {kind} to ComfyUI: {e}")
             return None
+
+    def _upload_image_to_comfyui(self, image_path: str) -> Optional[str]:
+        return self._upload_input_file(image_path, "image")
+
+    def _prepare_guide_audio(
+        self, path: str, seek_s: float = 0.0, duration_s: float = 0.0, max_s: Optional[float] = None
+    ) -> str:
+        """Return a WAV holding just the slice a guide needs. The encoder should
+        never see a three-minute song when the clip is five seconds long, so the
+        slice is cut with ffmpeg into the cache before upload. Returns the
+        original path when there is nothing to cut."""
+        limit = float(duration_s or 0)
+        if max_s:
+            limit = min(limit, float(max_s)) if limit else float(max_s)
+        if not seek_s and not limit:
+            return path
+        base = Path(getattr(self, "cache_dir", None) or Path(tempfile.gettempdir())) / "h3_guides"
+        base.mkdir(parents=True, exist_ok=True)
+        out = base / f"{uuid.uuid4().hex}.wav"
+        cmd = ["ffmpeg", "-y", "-i", str(path), "-ss", str(float(seek_s or 0))]
+        if limit:
+            cmd += ["-t", str(limit)]
+        cmd += ["-vn", "-acodec", "pcm_s16le", str(out)]
+        proc = subprocess.run(cmd, capture_output=True, timeout=120)
+        if proc.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+            tail = (proc.stderr or b"").decode(errors="replace").strip().splitlines()[-1:] or [""]
+            raise RuntimeError(f"ffmpeg could not cut the guide audio: {tail[0]}")
+        return str(out)
 
 
     # ── CogVideoX model mapping ──────────────────────────────────────────────
 
+    # cogvideox-5b is a diffusers snapshot the registry installs under
+    # models/CogVideo/CogVideoX-5b; the wrapper's DownloadAndLoadCogVideoModel
+    # resolves that hub id to the same directory and only reaches for Hugging
+    # Face when the directory is absent (and the launch environment now forbids
+    # that: HF_HUB_OFFLINE in plugins/comfyui/scripts/start.sh).
     COGVIDEOX_MODELS = {
         "cogvideox-5b": "THUDM/CogVideoX-5b",
-        "cogvideox-5b-i2v": "kijai/CogVideoX-5b-1.5-I2V",
+        # I2V is deliberately NOT a hub id: it loads the registry's single file
+        # through CogVideoXModelLoader. See COGVIDEOX_I2V_FILES.
+        "cogvideox-5b-i2v": None,
     }
-
-    # Conservative best-effort floor for the TOTAL VRAM a model needs to run at
-    # all (not headroom-for-comfort). Used by the preflight in generate_video to
-    # turn a silent OOM into an honest "this model needs ~N GB" message on the
-    # install base. Keyed by the model id; family fallbacks below cover aliases.
-    #
-    # Note on real hardware (2026-06): "16 GB" consumer cards (e.g. 4070 Ti SUPER)
-    # commonly report 15900-16400 MB total via pynvml/nvidia-smi/ComfyUI because
-    # of driver/display reservation. The GGUF Q5 WAN 14B paths + music-video's
-    # 832x480 preview res were explicitly built for this class of card.
-    # Preflight therefore uses a small tolerance (see _vram_preflight) so it only
-    # hard-blocks on truly under-spec hardware while still giving clear guidance.
-    MODEL_MIN_VRAM_GB = {
-        "cogvideox-2b": 8,
-        "cogvideox-5b": 16,
-        "cogvideox-5b-i2v": 16,
-        "wan22-14b": 16,
-        "wan22-14b-i2v": 16,
-        "ltx23-distilled-fp8": 16,
-        "ltx25-distilled-int8": 16,
-    }
-    # Family floors when an exact id isn't in the table (aliases like "wan22").
-    _FAMILY_MIN_VRAM_GB = {"wan": 16, "cogvideox": 16, "ltx": 16}
+    # Single-file CogVideoX loader map — DERIVED from the registry like Wan/LTX.
+    COGVIDEOX_I2V_FILES = _cogvideox_comfyui_map()
+    # Both wrapper loaders emit COGVIDEOMODEL; the FreeU/LoRA hooks below key on them.
+    _COG_MODEL_LOADER_NODES = ("DownloadAndLoadCogVideoModel", "CogVideoXModelLoader")
 
     # ── Wan 2.2 model mapping ────────────────────────────────────────────────
     # DERIVED from the shared registry (backend/services/video_model_registry.py)
@@ -245,53 +381,73 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
     WAN22_MODELS = _wan_comfyui_map()
     # LTX-2.3 loader map — same SSOT pattern as Wan.
     LTX_MODELS = _ltx_comfyui_map()
-
-    # CogVideoX/Wan are 8x VAE × 2x patch → /16. SVD is U-Net only → /8.
-    # LTX-2.3 spatial downscale is 32 (see EmptyLTXVLatentVideo).
-    # Mirror of MODEL_OPTIONS[*].dimensionAlignment in VideoGeneratorPage.jsx —
-    # the frontend should already snap, this is the defense-in-depth seam for
-    # API/MCP/agent callers that go straight to the workflow builders.
-    _DIMENSION_ALIGNMENT_BY_FAMILY = {
-        "cogvideox": 16,
-        "wan": 16,
-        "svd": 8,
-        "ltx": 32,
-    }
+    # HunyuanVideo loader map — same SSOT pattern.
+    HUNYUAN_MODELS = _hunyuan_comfyui_map()
+    # MiniMax H3 loader map — same SSOT pattern.
+    MINIMAX_MODELS = _minimax_comfyui_map()
 
     @classmethod
     def _ensure_wan_models(cls) -> dict:
-        """The Wan loader map is derived from the registry at IMPORT time (`WAN22_MODELS`
-        above); if that derivation froze to {} (a transient registry/circular-import hiccup
-        at module load) Wan generation would be silently dead for the whole process. Re-resolve
-        lazily here and cache the first non-empty result, so a one-time import-order problem
-        can't permanently break Wan video. No-op once the map is populated."""
-        if not cls.WAN22_MODELS:
-            try:
-                from backend.services.video_model_registry import wan_comfyui_map
-                fresh = wan_comfyui_map() or {}
-                if fresh:
-                    cls.WAN22_MODELS = fresh
-            except Exception:  # pragma: no cover - defensive
-                pass
+        """Re-derive the Wan loader map from the registry.
+
+        Import-time freeze used to stick at the first non-empty result, which
+        hid user-catalog models added later in the process. The map is small.
+        """
+        try:
+            from backend.services.video_model_registry import wan_comfyui_map
+            fresh = wan_comfyui_map() or {}
+            if fresh:
+                cls.WAN22_MODELS = fresh
+        except Exception:  # pragma: no cover - defensive
+            pass
         return cls.WAN22_MODELS
 
     @classmethod
     def _ensure_ltx_models(cls) -> dict:
-        """Same lazy re-resolve as `_ensure_wan_models` for the LTX-2.3 map."""
-        if not cls.LTX_MODELS:
-            try:
-                from backend.services.video_model_registry import ltx_comfyui_map
-                fresh = ltx_comfyui_map() or {}
-                if fresh:
-                    cls.LTX_MODELS = fresh
-            except Exception:  # pragma: no cover - defensive
-                pass
+        """Re-derive the LTX loader map from the registry (includes user catalog)."""
+        try:
+            from backend.services.video_model_registry import ltx_comfyui_map
+            fresh = ltx_comfyui_map() or {}
+            if fresh:
+                cls.LTX_MODELS = fresh
+        except Exception:  # pragma: no cover - defensive
+            pass
         return cls.LTX_MODELS
+
+    @classmethod
+    def _ensure_hunyuan_models(cls) -> dict:
+        """Re-derive the HunyuanVideo loader map from the registry (includes user catalog)."""
+        try:
+            from backend.services.video_model_registry import hunyuan_comfyui_map
+            fresh = hunyuan_comfyui_map() or {}
+            if fresh:
+                cls.HUNYUAN_MODELS = fresh
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return cls.HUNYUAN_MODELS
+
+    @classmethod
+    def _ensure_minimax_models(cls) -> dict:
+        """Re-derive the MiniMax H3 loader map from the registry (includes user catalog)."""
+        try:
+            from backend.services.video_model_registry import minimax_comfyui_map
+            fresh = minimax_comfyui_map() or {}
+            if fresh:
+                cls.MINIMAX_MODELS = fresh
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return cls.MINIMAX_MODELS
 
     @classmethod
     def _model_family(cls, model: str) -> str:
         cls._ensure_wan_models()  # unfreeze the map if it froze empty at import
         cls._ensure_ltx_models()
+        cls._ensure_hunyuan_models()
+        cls._ensure_minimax_models()
+        if model in cls.MINIMAX_MODELS or str(model).startswith("minimax"):
+            return "minimax"
+        if model in cls.HUNYUAN_MODELS or str(model).startswith("hunyuan"):
+            return "hunyuan"
         if model in cls.LTX_MODELS or str(model).startswith("ltx"):
             return "ltx"
         if model in cls.WAN22_MODELS or model in ("wan22", "wan2.2"):
@@ -301,96 +457,83 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
         return "cogvideox"  # SVD retired; unknown models default to the cogvideox family
 
     @staticmethod
-    def _ltx_frame_count(num_frames: int) -> int:
-        """LTX-2.3 latent length must be 8n+1 (65, 97, 121, 161, …)."""
-        n = max(9, int(num_frames or 65))
-        snapped = ((n - 1) // 8) * 8 + 1
-        if snapped < 9:
-            snapped = 9
-        return snapped
+    def _hunyuan_frame_count(num_frames: int) -> int:
+        """HunyuanVideo latent length is 4n+1 frames (1 = still image)."""
+        return family_frame_count("hunyuan", num_frames)
 
-    # Timeout guard per family: ~1.0 MPx (1280×736) is proven on 16GB cards;
-    # 3.7 MPx (1920×1920) never finished on either Wan. Aspect is preserved.
-    _MAX_PIXEL_AREA_BY_FAMILY = {"wan": 1_050_000, "ltx": 1_050_000}
+    @staticmethod
+    def _minimax_frame_count(num_frames: int) -> int:
+        """MiniMax H3 samples on a 17k+5 frame grid at 24 fps (5, 22, 39, …, 124 ≈ 5s),
+        snapped up like the official template, so a duration is never shortened."""
+        return family_frame_count("minimax", num_frames)
+
+    @staticmethod
+    def _ltx_frame_count(num_frames: int) -> int:
+        """LTX latent length must be 8n+1 (65, 97, 121, 161, …)."""
+        return family_frame_count("ltx", num_frames)
+
+    _ASPECT_RATIOS = render_limits.ASPECT_RATIOS
 
     @classmethod
-    def _clamp_pixel_area(cls, width: int, height: int, model: str) -> tuple[int, int]:
-        """Scale (width, height) down to the family's pixel-area budget,
-        preserving aspect ratio. No-op when unbudgeted or already within it."""
-        cap = cls._MAX_PIXEL_AREA_BY_FAMILY.get(cls._model_family(model))
-        area = int(width) * int(height)
-        if not cap or area <= cap:
-            return width, height
-        scale = (cap / area) ** 0.5
-        new_w, new_h = int(width * scale), int(height * scale)
-        logger.warning(
-            "Clamped %s video dims %dx%d (%.1f MPx) → %dx%d to stay within the "
-            "%.1f MPx budget — larger frames time out on this hardware",
-            model, width, height, area / 1e6, new_w, new_h, cap / 1e6,
-        )
-        return new_w, new_h
+    def _supported_aspect_ratios(cls, model: str) -> list:
+        return render_limits.supported_aspect_ratios(model)
+
+    @classmethod
+    def _clamp_aspect_ratio(cls, width: int, height: int, model: str) -> tuple[int, int]:
+        """Reshape to the nearest aspect the model declares, keeping pixel area.
+        The API still accepts any ratio and old retry_data replays what it stored."""
+        return render_limits.clamp_aspect_ratio(model, width, height)
+
+    @classmethod
+    def _clamp_pixel_area(cls, width: int, height: int, model: str, num_frames: int = 0) -> tuple[int, int]:
+        """Scale (width, height) down to the model's pixel budget, keeping aspect."""
+        return render_limits.clamp_pixel_area(model, width, height, num_frames, cls._model_family(model))
 
     @classmethod
     def _align_dimensions(cls, width: int, height: int, model: str) -> tuple[int, int]:
-        """Snap (width, height) to the model family's required alignment.
-
-        Logs a WARNING when the input wasn't already aligned — that's our
-        breadcrumb if a caller bypasses the frontend's snap.
-        """
-        align = cls._DIMENSION_ALIGNMENT_BY_FAMILY.get(cls._model_family(model), 16)
-        new_w = max(align, round(width / align) * align)
-        new_h = max(align, round(height / align) * align)
-        if (new_w, new_h) != (width, height):
-            logger.warning(
-                "Aligned video dims for %s: %dx%d → %dx%d (must be multiple of %d)",
-                model, width, height, new_w, new_h, align,
-            )
-        return new_w, new_h
+        """Snap (width, height) to the grid the model's family renders on."""
+        return render_limits.align_dimensions(model, width, height, cls._model_family(model))
 
     @classmethod
     def _min_vram_gb_for(cls, model: str) -> int:
-        """Conservative TOTAL-VRAM floor (GB) for `model`. Exact id wins; falls
-        back to the model family; 0 means 'no floor known' (don't block)."""
-        if model in cls.MODEL_MIN_VRAM_GB:
-            return cls.MODEL_MIN_VRAM_GB[model]
-        return cls._FAMILY_MIN_VRAM_GB.get(cls._model_family(model), 0)
-
-    # Wan UMT5 TE is ~6.4 GB fully resident. On 16–20 GB cards that leaves the
-    # ~10 GB GGUF UNet with ~300 MB usable → CPU offload thrash (~150 s/step).
-    # CLIPLoader supports device="cpu" (same weights/math; encode is slower once,
-    # sample runs at full GPU speed). Above this total we leave TE on GPU.
-    # Override: GUAARDVARK_WAN_CLIP_DEVICE=cpu|default
-    WAN_CLIP_CPU_TOTAL_VRAM_MB = 20 * 1024
+        """TOTAL-VRAM floor (GB) the registry declares for `model`, else its
+        family's; 0 means no floor is known (don't block)."""
+        return render_limits.min_vram_gb(model, cls._model_family(model))
 
     @classmethod
     def _wan_clip_device(cls, total_vram_mb: Optional[int] = None) -> str:
-        """Where Wan CLIP/UMT5 should load: ``cpu`` on consumer VRAM, else default.
+        """Where Wan CLIP/UMT5 loads: ``cpu`` on consumer VRAM, else default.
+        Same weights either way; the encode runs once, sampling keeps the card.
+        Override: GUAARDVARK_WAN_CLIP_DEVICE=cpu|default."""
+        return render_limits.text_encoder_device("", total_vram_mb, family="wan")
 
-        Quality-preserving residency control (mirrors CogVideoX force_offload):
-        TE on CPU frees the full card for UNet+VAE instead of stacking TE+UNet
-        until Comfy partial-loads the diffusion model. Same fp/quant weights —
-        no model downshift.
-        """
-        override = (os.environ.get("GUAARDVARK_WAN_CLIP_DEVICE") or "").strip().lower()
-        if override in ("cpu", "default"):
-            return override
+    def _text_encoder_device(self, model_key: str) -> str:
+        return render_limits.text_encoder_device(model_key, family=self._model_family(model_key))
 
-        total_mb = total_vram_mb
-        if total_mb is None:
-            try:
-                from backend.services.gpu_resource_coordinator import get_available_vram
-                info = get_available_vram()
-                if info.get("success"):
-                    total_mb = int(info.get("total_mb") or 0) or None
-            except Exception:  # noqa: BLE001
-                total_mb = None
+    # Wan sampling profiles, used by BOTH the 5B and the 14B MoE workflow.
+    # "adaptive" is the in-house pairing (euler + resolution-scaled shift);
+    # "official" mirrors ComfyUI's bundled template (uni_pc + fixed shift 8 at
+    # every size). Per-job via the request field, default via
+    # GUAARDVARK_WAN5B_SAMPLER. The name keeps its 5B spelling because it is the
+    # public env var and the frontend key; it is not 5B-only.
+    WAN5B_SAMPLER_PROFILES = {
+        "adaptive": {"sampler": "euler", "shift": None},
+        "official": {"sampler": "uni_pc", "shift": 8.0},
+    }
+    # "official" is the ComfyUI template's own config and is what actually renders
+    # cleanly here — verified at both 1280x736 and 736x416. "adaptive" scales shift
+    # linearly with pixel area, which floors at 3.0 by 736x416 against the 8.0 the
+    # model is tuned for, and produced warping and colour bleed at every size.
+    WAN5B_DEFAULT_SAMPLER_PROFILE = "official"
 
-        # Unknown probe → prefer CPU (safe on 16 GB; harmless quality-wise on larger).
-        if total_mb is None or total_mb <= 0:
-            return "cpu"
-        if total_mb <= cls.WAN_CLIP_CPU_TOTAL_VRAM_MB:
-            return "cpu"
-        return "default"
+    @classmethod
+    def _wan5b_sampler_profile(cls, requested: Optional[str] = None) -> str:
+        """Resolve the Wan 5B sampling profile: request → env → the default."""
+        for candidate in (requested, os.environ.get("GUAARDVARK_WAN5B_SAMPLER")):
+            key = (candidate or "").strip().lower()
+            if key in cls.WAN5B_SAMPLER_PROFILES:
+                return key
+        return cls.WAN5B_DEFAULT_SAMPLER_PROFILE
 
     @staticmethod
     def _wan_dynamic_shift(width: int, height: int) -> float:
@@ -402,6 +545,397 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
         """
         base_area = 1280 * 704
         return round(max(3.0, min(12.0, 8.0 * ((width * height) / base_area))), 1)
+
+    @classmethod
+    def _wan14b_t2v_shift(cls, request: VideoGenerationRequest) -> Optional[float]:
+        """Shift for Wan 14B T2V when no speed profile sets one; None keeps the
+        builder's resolution-scaled curve.
+
+        The builder ignored wan_sampler_profile,
+        so it stayed on the curve that I2V and the 5B left for a fixed 8.0 after
+        it produced warping and colour bleed. A named profile's shift is now
+        used, as on I2V; with GUAARDVARK_VIDEO_REFERENCE_DEFAULTS an unnamed one
+        takes the default profile too. The sampler stays euler, as on I2V."""
+        named = (request.wan_sampler_profile or "").strip().lower() in cls.WAN5B_SAMPLER_PROFILES
+        if not (named or render_limits.reference_defaults_enabled()):
+            return None
+        key = request.wan_sampler_profile if named else cls.WAN5B_DEFAULT_SAMPLER_PROFILE
+        return cls.WAN5B_SAMPLER_PROFILES[key.strip().lower()]["shift"]
+
+    @staticmethod
+    def _request_has_character(request: VideoGenerationRequest) -> bool:
+        """A cast member or a LoRA is in the request: the case the identity-bleed
+        negative was written for."""
+        return bool(request.lora_name or request.adapters or (request.metadata or {}).get("cast"))
+
+    @staticmethod
+    def _cogvideox_negative(request: VideoGenerationRequest, user_negative: str) -> str:
+        """The CogVideoX graphs were built without a negative, so even a typed
+        one was dropped. A typed one is sent now; the default one only with the
+        reference defaults on, since sending it changes what a fresh clone
+        renders."""
+        if user_negative or render_limits.reference_defaults_enabled():
+            return request.negative_prompt or ""
+        return ""
+
+    def _resolve_wan_profile(self, request: VideoGenerationRequest, model_key: str) -> tuple:
+        """The Wan speed profile a request names, resolved against the registry:
+        (profile dict, None) with its LoRA filenames, (None, None) when none was
+        asked for, or (None, message) when the model does not declare it or its
+        LoRAs are not installed."""
+        if not request.speed_profile or request.speed_profile == "standard":
+            return None, None
+        from backend.services.video_model_registry import VIDEO_MODEL_REGISTRY, speed_profile_for
+        entry = VIDEO_MODEL_REGISTRY.get(model_key) or {}
+        name = entry.get("name") or model_key
+        profile = speed_profile_for(model_key, request.speed_profile)
+        if profile is None:
+            declared = ", ".join(entry.get("speed_profiles") or {}) or "none"
+            return None, f"{name} declares no speed profile '{request.speed_profile}' (declared: {declared})."
+        if (profile.get("loras") or profile.get("lora")) and not profile.get("lora_installed"):
+            wanted = [VIDEO_MODEL_REGISTRY.get(pid, {}).get("name") or pid
+                      for pid in ([profile["lora"]] if profile.get("lora") else profile["loras"].values())]
+            return None, RenderFailure(RenderErrorKind.COMPANION_MISSING, (
+                f"Speed profile '{profile.get('label') or profile['id']}' needs "
+                f"{' and '.join(wanted)}. Open Manage Video Models and install them."
+            ))
+        return profile, None
+
+    def _resolve_adapters(self, request: VideoGenerationRequest, model_key: str) -> tuple:
+        """User-catalog LoRAs that apply to this generation model.
+
+        Returns (list of {filename, strength}, None) or (None, message).
+        """
+        from backend.services.video_model_registry import VIDEO_MODEL_REGISTRY, is_model_installed
+        from backend.services.user_video_models import DEFAULT_ADAPTER_STRENGTH
+
+        out = []
+        for raw in request.adapters or []:
+            if isinstance(raw, str):
+                aid, strength = raw, None
+            elif isinstance(raw, dict):
+                aid = (raw.get("id") or "").strip()
+                strength = raw.get("strength")
+            else:
+                continue
+            if not aid:
+                continue
+            entry = VIDEO_MODEL_REGISTRY.get(aid) or {}
+            if entry.get("type") != "lora":
+                return None, f"'{aid}' is not a LoRA"
+            applies = entry.get("applies_to") or []
+            if applies and model_key not in applies:
+                return None, f"{entry.get('name') or aid} does not apply to this model"
+            from backend.services.video_model_registry import speed_profile_loras
+            owner = speed_profile_loras(model_key).get(aid)
+            if owner:
+                return None, (
+                    f"{entry.get('name') or aid} belongs to the '{owner}' speed profile. "
+                    "Choose that profile instead of adding it as an adapter."
+                )
+            files = entry.get("files") or []
+            filename = files[0]["dst"] if files else None
+            if not filename:
+                return None, f"{entry.get('name') or aid} has no file"
+            if not is_model_installed(aid):
+                return None, RenderFailure(RenderErrorKind.COMPANION_MISSING, (
+                    f"{entry.get('name') or aid} is not installed. "
+                    "Open Manage Video Models to download it."
+                ))
+            out.append({
+                "filename": filename,
+                "strength": float(
+                    strength if strength is not None else entry.get("strength") or DEFAULT_ADAPTER_STRENGTH
+                ),
+            })
+        return out, None
+
+    def _resolve_minimax_common(self, request: VideoGenerationRequest, model_key: str, caps: dict, entry_name: str) -> tuple:
+        """Speed profile, LoRA, step count and prompt for either H3 build.
+        Returns ((profile, lora_file, lora_strength, steps, prompt), None) or
+        (None, message)."""
+        from backend.services.video_model_registry import (
+            VIDEO_MODEL_REGISTRY, speed_profile_for, style_embedding_token,
+        )
+        profile = None
+        if request.speed_profile:
+            profile = speed_profile_for(model_key, request.speed_profile)
+            if profile is None:
+                return None, (
+                    f"Unknown speed profile '{request.speed_profile}' for {entry_name}; "
+                    f"declared: {', '.join(caps.get('speed_profiles') or {}) or 'none'}."
+                )
+        lora_file = None
+        lora_strength = 1.0
+        if profile and profile.get("lora"):
+            if not profile.get("lora_installed"):
+                lora_name = (VIDEO_MODEL_REGISTRY.get(profile["lora"]) or {}).get("name") or profile["lora"]
+                return None, RenderFailure(RenderErrorKind.COMPANION_MISSING, (
+                    f"Speed profile '{profile.get('label') or profile['id']}' needs "
+                    f"'{lora_name}'. Open Manage Video Models and install it."
+                ))
+            lora_file = profile.get("lora_file")
+            lora_strength = float(profile.get("strength") or 1.0)
+            min_edge = profile.get("min_short_edge")
+            if min_edge and min(int(request.width), int(request.height)) < int(min_edge):
+                return None, (
+                    f"Speed profile '{profile.get('label') or profile['id']}' is tuned for a "
+                    f"{min_edge}px short edge; requested {request.width}x{request.height}. "
+                    f"Pick the 768p canvas or another profile."
+                )
+
+        steps = render_limits.resolve_steps(
+            model_key, request.num_inference_steps, profile=profile,
+            explicit=str((request.metadata or {}).get("steps_explicit", "")).lower() in ("1", "true"),
+        )
+
+        if not caps.get("cfg", True):
+            if request.negative_prompt or (request.guidance_scale is not None and request.guidance_scale > 1.0):
+                logger.info(
+                    "MiniMax H3 runs without CFG (BasicGuider); negative prompt and "
+                    "guidance_scale=%s are not used", request.guidance_scale,
+                )
+
+        prompt = request.prompt or ""
+        if request.style_embedding:
+            token = style_embedding_token(model_key, request.style_embedding)
+            if not token:
+                return None, (
+                    f"Unknown style embedding '{request.style_embedding}' for {entry_name}; "
+                    f"declared: {', '.join(e['id'] for e in caps.get('style_embeddings') or [])}."
+                )
+            prompt = f"{prompt} {token}".strip()
+
+        return (profile, lora_file, lora_strength, steps, prompt), None
+
+    def _build_minimax_ref_request(
+        self, request: VideoGenerationRequest, model_key: str, seed: int, interpolation: int,
+        caps: dict, entry_name: str,
+    ) -> tuple:
+        """The ref2va graph: reference images, clips (with or without their
+        soundtrack, or a separate one) and standalone audio, counted against
+        the registry's ref_limits, uploaded into input/, then wired in the
+        order the prompt's <Picture N> / <Video N> / <Audio N> tags follow."""
+        limits = caps.get("ref_limits") or {}
+        images = list(request.ref_images or [])
+        videos = list(request.ref_videos or [])
+        audios = list(request.ref_audios or [])
+        if request.first_frame_path or request.last_frame_path or request.guides:
+            return None, (
+                f"{entry_name} takes references, not first/last frames or guides; "
+                f"pick MiniMax H3 (Int8) for those."
+            )
+        if not images and not videos:
+            return None, (
+                f"{entry_name} needs at least one reference image or clip; audio "
+                f"cannot be the only reference."
+            )
+        for kind, items, key in (("image", images, "images"), ("clip", videos, "videos"), ("audio", audios, "audios")):
+            cap = limits.get(key)
+            if cap is not None and len(items) > cap:
+                return None, f"{entry_name} takes at most {cap} reference {kind}s; {len(items)} given."
+        total = len(images) + len(videos) + len(audios) + sum(
+            1 for v in videos if isinstance((v or {}).get("audio"), str) and v.get("audio")
+        )
+        if limits.get("files") and total > limits["files"]:
+            return None, f"{entry_name} takes at most {limits['files']} reference files; {total} given."
+
+        common, err = self._resolve_minimax_common(request, model_key, caps, entry_name)
+        if err:
+            return None, err
+        profile, lora_file, lora_strength, steps, prompt = common
+        extra_loras, adapter_err = self._resolve_adapters(request, model_key)
+        if adapter_err:
+            return None, adapter_err
+        te_file, te_err = resolve_text_encoder(model_key, request.text_encoder)
+        if te_err:
+            return None, te_err
+
+        def _upload(path, kind):
+            if not path or not Path(path).exists():
+                return None, f"Reference {kind} not found: {path}"
+            name = self._upload_input_file(path, kind)
+            return (name, None) if name else (None, self._upload_failure(f"reference {kind}"))
+
+        image_names = []
+        for path in images:
+            name, err = _upload(path, "image")
+            if err:
+                return None, err
+            image_names.append(name)
+        video_specs = []
+        for video in videos:
+            video = video if isinstance(video, dict) else {"path": video}
+            name, err = _upload(video.get("path"), "clip")
+            if err:
+                return None, err
+            audio = video.get("audio_path")
+            if audio:
+                audio, err = _upload(audio, "audio")
+                if err:
+                    return None, err
+            else:
+                audio = bool(video.get("include_audio", True))
+            video_specs.append({"filename": name, "audio": audio})
+        audio_names = []
+        for path in audios:
+            name, err = _upload(path, "audio")
+            if err:
+                return None, err
+            audio_names.append(name)
+
+        try:
+            workflow = self._create_minimax_ref_workflow(
+                speed_profile=request.speed_profile,
+                prompt=prompt,
+                model_key=model_key,
+                num_frames=request.duration_frames,
+                num_inference_steps=steps,
+                width=request.width,
+                height=request.height,
+                seed=seed,
+                fps=float(request.fps or 24),
+                interpolation_multiplier=interpolation,
+                ref_images=image_names,
+                ref_videos=video_specs,
+                ref_audios=audio_names,
+                ref_image_size=str((request.metadata or {}).get("ref_image_size") or "match"),
+                lora_name=lora_file,
+                lora_strength=lora_strength,
+                extra_loras=extra_loras,
+                text_encoder=te_file,
+            )
+        except ValueError as e:
+            return None, str(e)
+        logger.info(
+            "Using MiniMax H3 reference-to-video (%s, %d steps%s; %d image(s), %d clip(s), %d audio) via ComfyUI",
+            model_key, steps, f", profile {profile['id']}" if profile else "",
+            len(image_names), len(video_specs), len(audio_names),
+        )
+        return workflow, None
+
+    def _build_minimax_request(
+        self, request: VideoGenerationRequest, model_key: str,
+        image_path: Optional[str], seed: int, interpolation: int,
+    ) -> tuple:
+        """Turn a request into the H3 fl2va graph, or (None, message).
+
+        Everything the request asks for is checked against the capability
+        record the registry declares, so a wrong ask fails with one sentence
+        naming the fix rather than as a ComfyUI validation dump:
+
+        - speed profile → LoRA file (must be installed) and step count; a preset
+          value below the profile's floor is raised to it, a value the person
+          typed (metadata steps_explicit) is kept and logged;
+        - style embedding → its token appended after enhancement;
+        - first and last frame, image and audio guides → uploaded into input/;
+        - reference inputs → refused on this build (they need the ref2va model);
+        - negative prompt and guidance → logged once as ignored (no CFG).
+        """
+        from backend.services.video_model_registry import VIDEO_MODEL_REGISTRY, model_capabilities
+        caps = model_capabilities(model_key)
+        modes = caps.get("modes") or []
+        entry_name = (VIDEO_MODEL_REGISTRY.get(model_key) or {}).get("name") or model_key
+
+        if "ref2v" in modes and "t2v" not in modes:
+            return self._build_minimax_ref_request(request, model_key, seed, interpolation, caps, entry_name)
+        if request.ref_images or request.ref_videos or request.ref_audios:
+            return None, (
+                f"{entry_name} takes no reference images, clips or audio; those need "
+                f"the MiniMax H3 Reference build."
+            )
+
+        common, err = self._resolve_minimax_common(request, model_key, caps, entry_name)
+        if err:
+            return None, err
+        profile, lora_file, lora_strength, steps, prompt = common
+        extra_loras, adapter_err = self._resolve_adapters(request, model_key)
+        if adapter_err:
+            return None, adapter_err
+        te_file, te_err = resolve_text_encoder(model_key, request.text_encoder)
+        if te_err:
+            return None, te_err
+        first_name = None
+        first_path = request.first_frame_path or image_path
+        if first_path:
+            if not Path(first_path).exists():
+                return None, f"First frame not found: {first_path}"
+            first_name = self._upload_image_to_comfyui(first_path)
+            if not first_name:
+                return None, self._upload_failure("first frame")
+        last_name = None
+        if request.last_frame_path:
+            if "l2v" not in modes and "flf2v" not in modes:
+                return None, f"{entry_name} takes no last frame."
+            if not Path(request.last_frame_path).exists():
+                return None, f"Last frame not found: {request.last_frame_path}"
+            last_name = self._upload_image_to_comfyui(request.last_frame_path)
+            if not last_name:
+                return None, self._upload_failure("last frame")
+
+        frames = self._minimax_frame_count(request.duration_frames)
+        fps = float(request.fps or 24)
+        guide_specs = []
+        for guide in request.guides or []:
+            if not caps.get("audio_in"):
+                return None, f"{entry_name} takes no guides."
+            kind = (guide or {}).get("kind")
+            path = (guide or {}).get("path")
+            if kind not in ("audio", "image") or not path:
+                return None, f"A guide needs kind audio|image and a path: {guide!r}"
+            if not Path(path).exists():
+                return None, f"Guide file not found: {path}"
+            frame_idx = int((guide or {}).get("frame_idx") or 0)
+            if kind == "audio":
+                try:
+                    remaining = (frames - frame_idx if frame_idx >= 0 else -frame_idx) / fps
+                    path = self._prepare_guide_audio(
+                        path, float(guide.get("seek_s") or 0), float(guide.get("duration_s") or 0),
+                        max_s=max(0.1, remaining),
+                    )
+                except Exception as e:  # noqa: BLE001 — the message is the diagnosis
+                    return None, str(e)
+            name = self._upload_input_file(path, kind)
+            if not name:
+                return None, self._upload_failure(f"{kind} guide")
+            guide_specs.append({"kind": kind, "filename": name, "frame_idx": frame_idx})
+
+        try:
+            workflow = self._create_minimax_workflow(
+                speed_profile=request.speed_profile,
+                prompt=prompt,
+                model_key=model_key,
+                num_frames=request.duration_frames,
+                num_inference_steps=steps,
+                width=request.width,
+                height=request.height,
+                seed=seed,
+                fps=fps,
+                interpolation_multiplier=interpolation,
+                image_filename=first_name,
+                last_frame_filename=last_name,
+                lora_name=lora_file,
+                lora_strength=lora_strength,
+                extra_loras=extra_loras,
+                guides=guide_specs,
+                text_encoder=te_file,
+            )
+        except ValueError as e:
+            return None, str(e)
+
+        mode = (
+            "first+last-frame" if (first_name and last_name) else
+            "last-frame" if last_name else
+            "first-frame I2V" if first_name else "T2V"
+        )
+        logger.info(
+            "Using MiniMax H3 %s (%s, %d steps%s%s%s) via ComfyUI",
+            mode, model_key, steps,
+            f", profile {profile['id']}" if profile else "",
+            f", {len(guide_specs)} guide(s)" if guide_specs else "",
+            f", style {request.style_embedding}" if request.style_embedding else "",
+        )
+        return workflow, None
 
     def _vram_preflight(self, model: str) -> Optional[str]:
         """Read-only VRAM gate run BEFORE queuing a ComfyUI job, so an
@@ -425,10 +959,20 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
         # probe failure (fail open — don't block a card we just can't read).
         if not info.get("success"):
             reason = info.get("reason") or info.get("error") or ""
+            # On Apple Silicon MPS the NVIDIA probe fails, but ComfyUI can still
+            # render via MPS. Only hard-fail if MPS is not available either.
             if reason == "no_gpu_hardware" or "no NVIDIA" in str(reason):
-                return "GPU required for video generation: no NVIDIA GPU detected on this host."
-            logger.warning("VRAM preflight: probe unavailable (%s); proceeding", reason)
-            return None
+                try:
+                    import torch
+                    mps_ok = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+                except Exception:
+                    mps_ok = False
+                if not mps_ok:
+                    return "GPU required for video generation: no NVIDIA GPU detected on this host."
+                # Fall through and let the MPS path run.
+            else:
+                logger.warning("VRAM preflight: probe unavailable (%s); proceeding", reason)
+                return None
 
         total_mb = info.get("total_mb") or 0
         free_mb = info.get("available_mb") or info.get("free_mb") or 0
@@ -445,7 +989,7 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
         need_mb = need * 1024
         if need and total_mb + 512 < need_mb:  # ~0.5 GB grace
             return (
-                f"{model} needs ~{need}g GB VRAM; detected {total_gb:.2f}g GB "
+                f"{model} needs ~{need} GB VRAM; detected {total_gb:.2f} GB "
                 f"({total_mb} MB total). "
                 "Try a lighter model or preview resolution."
             )
@@ -474,36 +1018,236 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
 
 
 
-    def interrupt(self) -> bool:
-        """Force-stop whatever ComfyUI is currently sampling.
+    def _running_reserve_vram_gb(self) -> Optional[float]:
+        """The --reserve-vram the serving ComfyUI was launched with, from
+        /system_stats (it reports sys.argv); None when it cannot be read."""
+        try:
+            from backend.services.comfyui_launch_flags import reserve_vram_from_argv
+            response = requests.get(f"{self.comfy_url}/system_stats", timeout=5)
+            response.raise_for_status()
+            argv = ((response.json() or {}).get("system") or {}).get("argv") or []
+            return reserve_vram_from_argv(argv)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("ComfyUI /system_stats probe failed: %s", e)
+            return None
 
-        Yells "ABORT!" at the kitchen — ComfyUI bails on the current sampler,
-        history gets a partial entry, and our wait loop returns.
+    def _comfyui_queue_idle(self) -> Optional[bool]:
+        """True when nothing is running or pending in ComfyUI; None if unknown."""
+        try:
+            response = requests.get(f"{self.comfy_url}/queue", timeout=5)
+            response.raise_for_status()
+            data = response.json() or {}
+            return not (data.get("queue_running") or data.get("queue_pending"))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("ComfyUI queue probe failed: %s", e)
+            return None
+
+    def _ensure_comfyui_reserve_for(self, model: str) -> Optional[str]:
+        """Relaunch ComfyUI when its --reserve-vram is not the one this model needs.
+
+        The reserve is declared per model in the registry
+        (comfyui_reserve_vram_gb: MiniMax H3 5.0, Wan 2.2 14B 1.0; measured,
+        see the entries). A ComfyUI launched for one is wrong for the other,
+        so the value for the model about to run is written where the plugin's
+        start.sh reads it and the plugin is restarted through the manager.
+        An explicit GUAARDVARK_COMFYUI_RESERVE_VRAM wins and no restart
+        happens. Another render in ComfyUI's queue is left to finish first.
+        Returns an error string to surface, or None to proceed.
         """
         try:
-            requests.post(f"{self.comfy_url}/interrupt", timeout=5)
+            from backend.services.comfyui_launch_flags import (
+                explicit_reserve_vram_gb, launch_env, write_reserve_request,
+            )
+            from backend.services.video_model_registry import comfyui_reserve_vram_gb_for_model
+        except Exception as e:  # noqa: BLE001
+            logger.debug("reserve helpers unavailable: %s", e)
+            return None
+        needed = comfyui_reserve_vram_gb_for_model(model)
+        if needed is None:
+            return None
+        if explicit_reserve_vram_gb(launch_env(self._project_root)) is not None:
+            logger.debug("%s set explicitly; %s keeps the running ComfyUI reserve", "GUAARDVARK_COMFYUI_RESERVE_VRAM", model)
+            return None
+        running = self._running_reserve_vram_gb()
+        if running is None or abs(running - needed) < 1e-6:
+            return None
+
+        # Do not pull the process out from under another render.
+        deadline = time.time() + VRAM_WAIT_DEFAULT_S
+        while self._comfyui_queue_idle() is False:
+            if time.time() >= deadline:
+                logger.warning(
+                    "ComfyUI still busy after %ds; %s runs with --reserve-vram %g instead of %g",
+                    int(VRAM_WAIT_DEFAULT_S), model, running, needed,
+                )
+                return None
+            time.sleep(5)
+
+        write_reserve_request(self._project_root, needed)
+        logger.info(
+            "Restarting ComfyUI: %s needs --reserve-vram %g, it is running with %g",
+            model, needed, running,
+        )
+        try:
+            from backend.plugins.plugin_manager import get_plugin_manager
+            outcome = get_plugin_manager().restart_plugin("comfyui", cancel_video_jobs=False)
+        except Exception as e:  # noqa: BLE001
+            outcome = {"success": False, "error": str(e)}
+        if not outcome.get("success"):
+            return (
+                f"ComfyUI could not be restarted with --reserve-vram {needed:g} for {model}: "
+                f"{outcome.get('error') or 'unknown error'}"
+            )
+        self._object_info_cache = None
+        self.service_available = self._check_comfyui_connection()
+        if not self.service_available:
+            return f"ComfyUI did not come back after restarting with --reserve-vram {needed:g} for {model}"
+        return None
+
+    def _ensure_vram_for_model(self, model: str, op_id: str) -> Optional[str]:
+        """Book the registry estimate with the orchestrator BEFORE the graph is queued.
+
+        Mirrors offline_image_generator._ensure_vram_for_pipeline: the request
+        evicts what it can (an idle diffusers pipeline left by a keyframe batch,
+        Ollama) and refuses when the card is still short. A refusal is waited
+        out with backoff up to VRAM_WAIT_ENV seconds, because the usual holder
+        is a batch that is about to finish. ComfyUI does not wait on its own: a
+        14B model submitted against a card holding 10 GB of leftover weights
+        loads with ~1 GB usable and offloads the rest to CPU (2026-09-12, 43 min
+        for a 5 s clip). Returns an error string to surface, or None to proceed.
+        Ledger failures never block a render.
+        """
+        try:
+            from backend.services.gpu_memory_orchestrator import get_orchestrator
+            from backend.services.video_model_registry import vram_mb_for_model
+        except Exception as e:  # noqa: BLE001
+            logger.warning("VRAM admission unavailable (%s); queuing without it", e)
+            return None
+        estimate_mb = vram_mb_for_model(model)
+        slot_id = f"video:comfyui:{op_id}"
+        try:
+            budget_s = max(0.0, float(os.environ.get(VRAM_WAIT_ENV, VRAM_WAIT_DEFAULT_S)))
+        except ValueError:
+            budget_s = VRAM_WAIT_DEFAULT_S
+        deadline = time.time() + budget_s
+        backoff_s = 2.0
+        while True:
+            try:
+                orchestrator = get_orchestrator()
+                # No compositor reserve here. The orchestrator's idle-card rule
+                # admits an estimate only if it fits the card minus the reserve,
+                # and CogVideoX declares 16000 MB against 16376 on a 16 GB card:
+                # with 800 held back it could never be admitted. ComfyUI keeps
+                # its own --reserve-vram for the desktop.
+                orchestrator.request_model(
+                    slot_id, estimate_mb, priority=90, hard_fit=True,
+                )
+            except RuntimeError as e:
+                short = str(e)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("VRAM admission failed for %s (%s); queuing without it", model, e)
+                return None
+            else:
+                orchestrator.begin_use(slot_id)
+                self._vram_booking = slot_id
+                return None
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return (
+                    f"Could not free enough VRAM for {model} after waiting "
+                    f"{int(budget_s)}s: {short}"
+                )
+            sleep_for = min(backoff_s, remaining)
+            logger.info(
+                "Waiting for VRAM before queuing %s (~%d MB): %s — retry in %.0fs (%.0fs left)",
+                model, estimate_mb, short, sleep_for, remaining,
+            )
+            time.sleep(sleep_for)
+            backoff_s = min(15.0, backoff_s * 1.5)
+
+    def _release_vram_booking(self) -> None:
+        """Drop the booking made by _ensure_vram_for_model (render finished or failed)."""
+        slot_id, self._vram_booking = self._vram_booking, None
+        if not slot_id:
+            return
+        try:
+            from backend.services.gpu_memory_orchestrator import get_orchestrator_if_created
+            orchestrator = get_orchestrator_if_created()
+            if orchestrator is not None:
+                orchestrator.end_use(slot_id)
+                orchestrator.drop_booking(slot_id)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("drop_booking(%s) failed: %s", slot_id, e)
+
+    def interrupt(self, prompt_id: Optional[str] = None) -> bool:
+        """Stop the named prompt, or every prompt this process queued.
+
+        ComfyUI is a shared sidecar: a bare ``/interrupt`` stops whatever is
+        sampling no matter who queued it, and ``/queue {"clear": true}`` drops
+        other clients' pending work with it. Both are scoped here — ComfyUI
+        matches the id against what is actually running and no-ops otherwise,
+        so a stale id is free.
+
+        Falls back to the unscoped interrupt when this process queued nothing
+        it knows of, which is how a cancel raised in Flask still reaches a clip
+        queued by the Celery worker. The fallback skips the queue clear, and
+        goes away once cancellation is a flag both processes can see.
+        """
+        targets = [prompt_id] if prompt_id else self._known_prompts()
+        if not targets:
+            return self._interrupt_unscoped()
+
+        acked = False
+        for pid in targets:
+            try:
+                requests.post(
+                    f"{self.comfy_url}/interrupt",
+                    json={"prompt_id": pid},
+                    timeout=5,
+                )
+                acked = True
+            except Exception as e:
+                logger.warning(f"Failed to interrupt ComfyUI prompt {pid}: {e}")
+                continue
             try:
                 requests.post(
                     f"{self.comfy_url}/queue",
-                    json={"clear": True},
+                    json={"delete": [pid]},
                     timeout=5,
                 )
-            except Exception as clear_err:
-                logger.debug(f"Queue clear failed (non-fatal): {clear_err}")
-            logger.info("Sent interrupt + queue-clear to ComfyUI")
+            except Exception as delete_err:
+                logger.debug(f"Queue delete for {pid} failed (non-fatal): {delete_err}")
+            self._forget_prompt(pid)
+
+        if acked:
+            logger.info(f"Sent scoped interrupt to ComfyUI for {len(targets)} prompt(s)")
+        return acked
+
+    def _interrupt_unscoped(self) -> bool:
+        """Stop whatever ComfyUI is sampling, whoever queued it."""
+        try:
+            requests.post(f"{self.comfy_url}/interrupt", timeout=5)
+            logger.info("Sent unscoped interrupt to ComfyUI (no prompt of ours tracked)")
             return True
         except Exception as e:
             logger.warning(f"Failed to interrupt ComfyUI: {e}")
             return False
 
-    def _queue_prompt(self, workflow: dict, client_id: Optional[str] = None) -> Optional[str]:
+    def _queue_prompt(
+        self, workflow: dict, client_id: Optional[str] = None, *, live_preview: bool = True,
+    ) -> Optional[str]:
         try:
             payload = {"prompt": workflow}
             # client_id scopes ComfyUI's /ws progress messages back to us so the
             # progress bridge can hear this generation. (server.py:883)
             if client_id:
                 payload["client_id"] = client_id
+            if not live_preview:
+                # Per-prompt override; ComfyUI restores its launch default after
+                # this prompt (execution.py set_preview_method).
+                payload["extra_data"] = {"preview_method": "none"}
             self._last_queue_error = None
+            self._last_queue_error_kind = None
             response = requests.post(
                 f"{self.comfy_url}/prompt",
                 json=payload,
@@ -513,6 +1257,8 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
 
             result = response.json()
             prompt_id = result.get("prompt_id")
+            if prompt_id:
+                self._track_prompt(prompt_id)
             logger.info(f"Queued workflow in ComfyUI: {prompt_id}")
             return prompt_id
 
@@ -545,6 +1291,7 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                 if e.response is not None:
                     detail = (e.response.text or "")[:500]
             self._last_queue_error = detail or str(e)
+            self._last_queue_error_kind = self._prompt_rejection_kind(e.response)
             logger.error(
                 "Failed to queue workflow in ComfyUI: %s%s",
                 e,
@@ -553,6 +1300,11 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
             return None
         except Exception as e:
             self._last_queue_error = str(e)
+            self._last_queue_error_kind = (
+                RenderErrorKind.COMFYUI_DOWN
+                if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+                else RenderErrorKind.UNKNOWN
+            )
             logger.error(f"Failed to queue workflow in ComfyUI: {e}")
             return None
 
@@ -584,6 +1336,56 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                 missing.append(f"{subdir}/{name}")
         return missing
 
+    _COG_I2V_CANONICAL_SUBDIR = "checkpoints"
+    _COG_I2V_LOADER_SUBDIR = "diffusion_models"
+
+    def _cogvideox_i2v_files(self, model_key: str) -> dict:
+        if not self.COGVIDEOX_I2V_FILES:
+            try:
+                from backend.services.video_model_registry import cogvideox_comfyui_map
+                fresh = cogvideox_comfyui_map() or {}
+                if fresh:
+                    type(self).COGVIDEOX_I2V_FILES = fresh
+            except Exception:  # pragma: no cover - defensive
+                pass
+        cfg = self.COGVIDEOX_I2V_FILES.get(model_key, {})
+        return {
+            "unet": cfg.get("unet") or "CogVideoX_1_5_5b_I2V_bf16.safetensors",
+            "vae": cfg.get("vae") or "cogvideox_vae_bf16.safetensors",
+        }
+
+    def _cogvideox_i2v_missing_files(self, model_key: str) -> List[str]:
+        """Relative paths of CogVideoX I2V files the wrapper's loaders cannot see.
+
+        The transformer's canonical home is models/checkpoints (where every
+        existing install put it) but CogVideoXModelLoader enumerates
+        models/diffusion_models, so this reconciles the link a pre-2026-08-28
+        install never got. Empty when everything is in place, or when the
+        models tree isn't local (remote ComfyUI validates for itself)."""
+        if not COMFYUI_DIR:
+            return []
+        models_root = Path(COMFYUI_DIR) / "models"
+        if not models_root.is_dir():
+            return []
+        files = self._cogvideox_i2v_files(model_key)
+        missing: List[str] = []
+        loader_path = models_root / self._COG_I2V_LOADER_SUBDIR / files["unet"]
+        canonical = models_root / self._COG_I2V_CANONICAL_SUBDIR / files["unet"]
+        if not loader_path.exists():
+            if canonical.exists() and canonical.stat().st_size > 0:
+                loader_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(str(canonical), str(loader_path))
+                except OSError:
+                    os.symlink(str(canonical), str(loader_path))
+                logger.info("Linked %s into %s for CogVideoXModelLoader", canonical.name, loader_path.parent)
+            else:
+                missing.append(f"{self._COG_I2V_CANONICAL_SUBDIR}/{files['unet']}")
+        vae_path = models_root / "vae" / files["vae"]
+        if not vae_path.exists():
+            missing.append(f"vae/{files['vae']}")
+        return missing
+
     def _comfyui_alive(self) -> bool:
         """Quick liveness probe — distinct from service_available cache."""
         return self._check_comfyui_connection()
@@ -605,6 +1407,66 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
         except Exception as e:
             logger.debug(f"ComfyUI queue probe failed: {e}")
             return None
+
+    @staticmethod
+    def _prompt_rejection_kind(response) -> RenderErrorKind:
+        """The kind of a /prompt refusal, from ComfyUI's validation body: a node
+        class it does not know, a loader file that is not on disk, or another
+        input it rejected."""
+        try:
+            body = response.json() if response is not None else {}
+        except Exception:  # noqa: BLE001 — an unreadable body is still a refusal
+            body = {}
+        if not isinstance(body, dict):
+            return RenderErrorKind.NODE_ERROR
+        error = body.get("error") if isinstance(body.get("error"), dict) else {}
+        if error.get("type") == "missing_node_type":
+            return RenderErrorKind.NODE_MISSING
+        for node in (body.get("node_errors") or {}).values():
+            for ne in (node or {}).get("errors") or []:
+                input_name = str(((ne or {}).get("extra_info") or {}).get("input_name") or "")
+                if ne.get("type") == "value_not_in_list" and input_name.endswith("_name"):
+                    return RenderErrorKind.MODEL_NOT_INSTALLED
+        return RenderErrorKind.NODE_ERROR
+
+    @staticmethod
+    def _comfyui_down_result(request: "VideoGenerationRequest") -> "VideoGenerationResult":
+        """A node looked missing only because /object_info could not be read:
+        ComfyUI is not answering."""
+        return VideoGenerationResult(
+            success=False, prompt_used=request.prompt, error_kind=RenderErrorKind.COMFYUI_DOWN.value,
+            error="ComfyUI is not answering, so its nodes could not be checked.",
+        )
+
+    def _upload_failure(self, what: str) -> RenderFailure:
+        """The message for a file ComfyUI did not take: unreachable, or refused it."""
+        if not self._check_comfyui_connection():
+            return RenderFailure(RenderErrorKind.COMFYUI_DOWN, f"Failed to upload the {what} to ComfyUI: it is not reachable")
+        return RenderFailure(RenderErrorKind.INVALID_REQUEST, f"Failed to upload the {what} to ComfyUI")
+
+    @staticmethod
+    def _history_failure(entry: dict) -> Optional[RenderFailure]:
+        """What a finished-with-errors history entry says, with its kind: an
+        interrupt is a cancel, an out-of-memory exception is OOM, anything else
+        a node error naming the node."""
+        messages = ((entry or {}).get("status") or {}).get("messages") or []
+        for msg in messages:
+            if not isinstance(msg, (list, tuple)) or len(msg) < 2 or not isinstance(msg[1], dict):
+                continue
+            tag, payload = msg[0], msg[1]
+            if tag == "execution_interrupted":
+                return RenderFailure(RenderErrorKind.CANCELLED, "ComfyUI interrupted the render")
+            if tag == "execution_error":
+                from backend.services.job_operation_gate import is_cuda_oom
+                text = str(payload.get("exception_message") or payload.get("message") or "").strip()
+                etype = str(payload.get("exception_type") or "")
+                node = payload.get("node_type") or ""
+                where = f"{node} (node {payload.get('node_id')})" if node else "a node"
+                first = text.splitlines()[0].strip() if text else etype or "no message"
+                if "OutOfMemory" in etype or is_cuda_oom(RuntimeError(text)):
+                    return RenderFailure(RenderErrorKind.OOM, f"ComfyUI ran out of GPU memory in {where}: {first}")
+                return RenderFailure(RenderErrorKind.NODE_ERROR, f"ComfyUI failed in {where}: {first}")
+        return None
 
     @staticmethod
     def _history_execution_error(entry: dict) -> Optional[str]:
@@ -682,11 +1544,13 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
         start_time = time.time()
         effective_deadline = start_time + soft_budget
         last_log_time = start_time
+        # Why this returns None, for generate_video to report (job_types.RenderFailure).
+        self._last_wait_failure = None
         orphan_grace_s = 30
         idle_kill_s = 90
         idle_since: Optional[float] = None
         consecutive_dead = 0
-        dead_probe_limit = 5
+        dead_probe_limit = DEAD_PROBE_LIMIT
 
         while True:
             now = time.time()
@@ -704,6 +1568,10 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                     snap.get("util_pct"),
                     snap.get("free_mb"),
                 )
+                self._last_wait_failure = RenderFailure(
+                    RenderErrorKind.RENDER_TIMEOUT,
+                    f"ComfyUI had not finished the render after {int(elapsed)}s (the limit for this request)",
+                )
                 return None
 
             if not self._comfyui_alive():
@@ -713,6 +1581,9 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                         "ComfyUI unreachable (%d consecutive probes) while waiting for %s — prompt orphaned",
                         consecutive_dead,
                         prompt_id,
+                    )
+                    self._last_wait_failure = RenderFailure(
+                        RenderErrorKind.COMFYUI_DOWN, "ComfyUI stopped answering during the render",
                     )
                     return None
                 logger.warning(
@@ -739,6 +1610,8 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                     exec_err = self._history_execution_error(entry)
                     if exec_err:
                         logger.error("Generation failed for %s: %s", prompt_id, exec_err)
+                        self._last_wait_failure = self._history_failure(entry) or RenderFailure(
+                            RenderErrorKind.NODE_ERROR, exec_err)
                         return None
                     outputs = entry.get("outputs") or {}
                     if outputs:
@@ -793,6 +1666,10 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                             in_queue,
                             snap.get("util_pct"),
                             snap.get("free_mb"),
+                        )
+                        self._last_wait_failure = RenderFailure(
+                            RenderErrorKind.RENDER_TIMEOUT,
+                            "ComfyUI dropped the render: it left the queue without a result",
                         )
                         return None
 
@@ -900,6 +1777,7 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
             return VideoGenerationResult(
                 success=False,
                 error="ComfyUI service not available. Please start ComfyUI at http://127.0.0.1:8188",
+                error_kind=RenderErrorKind.COMFYUI_DOWN.value,
                 prompt_used=request.prompt,
             )
 
@@ -918,12 +1796,15 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                     "(commonly missing cv2: backend/venv/bin/pip install opencv-python); "
                     "check logs/comfyui.log for the import error, then restart ComfyUI."
                 ),
+                error_kind=RenderErrorKind.NODE_MISSING.value,
                 prompt_used=request.prompt,
-            )
+            ) if self._check_comfyui_connection() else self._comfyui_down_result(request)
 
         # ── Prompt enhancement ───────────────────────────────────────
+        user_negative = request.negative_prompt
         # Settings → Verbatim Prompts (or VERBATIM_PROMPTS=1) means exact user text.
         _verbatim_video = False
+        _enhanced = False
         if request.enhance_prompt and request.prompt:
             try:
                 from backend.services.media_director import verbatim_prompts_enabled
@@ -931,8 +1812,13 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
             except Exception:
                 _verbatim_video = False
         if request.enhance_prompt and request.prompt and not _verbatim_video:
+            withheld = render_limits.withheld_style(
+                request.model, request.prompt_style, self._model_family(request.model))
+            if withheld:
+                return VideoGenerationResult(success=False, error=withheld, prompt_used=request.prompt,
+                                             error_kind=RenderErrorKind.INVALID_REQUEST.value)
             try:
-                from backend.utils.prompt_enhancer import enhance_video_prompt, get_default_negative_prompt
+                from backend.utils.prompt_enhancer import enhance_video_prompt
                 # Pass model_family for motion-aware hints (wan vs cogvideox)
                 mf = self._model_family(request.model)
                 request.prompt = enhance_video_prompt(
@@ -942,14 +1828,25 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                     height=request.height,
                     model_family=mf,
                     fidelity_mode=getattr(request, "fidelity_mode", False),
+                    motion_strength=request.motion_strength,
+                    # Context a family compiler needs (ignored by the suffix path).
+                    duration_s=(request.duration_frames or 0) / float(request.fps or 24),
+                    first_frame=bool(request.first_frame_path or (request.metadata or {}).get("image_path")),
+                    last_frame=bool(request.last_frame_path),
+                    language=request.language,
+                    h3_intent=request.h3_intent,
                 )
-                if not request.negative_prompt:
-                    request.negative_prompt = get_default_negative_prompt(style=request.prompt_style)
+                _enhanced = True
                 logger.info(f"Prompt enhanced (style={request.prompt_style}, family={mf}): {request.prompt[:120]}...")
             except Exception as e:
                 logger.warning(f"Prompt enhancement failed, using original prompt: {e}")
         elif _verbatim_video:
             logger.info("verbatim prompts ON — skipping video prompt enhancement")
+        if not request.negative_prompt and not _verbatim_video:
+            request.negative_prompt = render_limits.default_negative(
+                request.model, request.prompt_style, enhanced=_enhanced,
+                character=self._request_has_character(request), family=self._model_family(request.model),
+            )
 
         if request.output_dir:
             batch_dir = Path(request.output_dir)
@@ -1000,31 +1897,44 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
             model = request.model or "cogvideox-5b"
             seed = request.seed if request.seed is not None else int(time.time() * 1000) % (2**31)
 
+            # The running ComfyUI must carry this model's --reserve-vram.
+            reserve_error = self._ensure_comfyui_reserve_for(model)
+            if reserve_error:
+                return result.fail(RenderErrorKind.COMFYUI_DOWN, reserve_error)
+
             # VRAM preflight: turn a known-under-spec card into an honest error
             # instead of queuing into a silent mid-render OOM. Fail-open on a
             # broken probe (see _vram_preflight); read-only, allocates nothing.
             preflight_error = self._vram_preflight(model)
             if preflight_error:
-                result.error = preflight_error
-                return result
+                return result.fail(RenderErrorKind.CARD_TOO_SMALL, preflight_error)
 
-            # Defense-in-depth: cap pixel area, then snap dims, before they enter
-            # any workflow builder. 1920×1920 (3.7 MPx) requests ran until the
-            # watchdog timeout on both Wan variants and read as a hang — and old
-            # batch retry_data can replay those dims verbatim.
-            # Off-by-one in the snap is the "tensor a (51) must match tensor b (50)" crash.
-            request.width, request.height = self._clamp_pixel_area(
-                request.width, request.height, model
+            # Then make the room: evict/wait before anything is queued.
+            vram_error = self._ensure_vram_for_model(model, item_id)
+            if vram_error:
+                return result.fail(RenderErrorKind.VRAM_BUSY, vram_error)
+
+            # Size and length are held to what the model declares before any
+            # builder sees them (backend/services/video_render_limits.py); old
+            # batch retry_data can replay any size verbatim.
+            family = self._model_family(model)
+            request.width, request.height = render_limits.resolve_canvas(
+                model, request.width, request.height, request.duration_frames, family
             )
-            request.width, request.height = self._align_dimensions(
-                request.width, request.height, model
-            )
+            request.duration_frames = render_limits.resolve_frames(model, request.duration_frames, family)
+            request.fps = render_limits.resolve_fps(model, request.fps, family)
+            if not request.cfg_explicit:
+                unset_cfg = render_limits.cfg_when_unset(model, family)
+                if unset_cfg is not None:
+                    request.guidance_scale = unset_cfg
+            explicit_steps = str((request.metadata or {}).get("steps_explicit", "")).lower() in ("1", "true")
 
             interpolation = request.interpolation_multiplier
 
             # ── Route by model type ──────────────────────────────────
             self._ensure_wan_models()
             self._ensure_ltx_models()
+            self._ensure_hunyuan_models()
             if model in self.WAN22_MODELS or model in ("wan22", "wan2.2"):
                 model_key = model if model in self.WAN22_MODELS else "wan22-14b"
                 cfg = self.WAN22_MODELS[model_key]
@@ -1039,88 +1949,197 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                             "Fix: backend/venv/bin/pip install 'gguf>=0.13.0' sentencepiece protobuf, "
                             "then restart ComfyUI."
                         ),
+                        error_kind=RenderErrorKind.NODE_MISSING.value,
                         prompt_used=request.prompt,
-                    )
+                    ) if self._check_comfyui_connection() else self._comfyui_down_result(request)
 
                 is_i2v = cfg.get("type") == "i2v"
+
+                wan_profile, wan_err = self._resolve_wan_profile(request, model_key)
+                if wan_err:
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, wan_err)
+                wan_steps = render_limits.resolve_steps(
+                    model_key, request.num_inference_steps, explicit=explicit_steps,
+                    profile=wan_profile, family=family,
+                )
+                wan_cfg = request.guidance_scale
+                wan_shift = None
+                wan_lora_high = wan_lora_low = None
+                wan_lora_strength = 1.0
+                if wan_profile:
+                    if wan_profile.get("cfg") is not None:
+                        wan_cfg = float(wan_profile["cfg"])
+                    wan_shift = wan_profile.get("shift")
+                    files = wan_profile.get("lora_files") or {}
+                    wan_lora_high, wan_lora_low = files.get("unet_high"), files.get("unet_low")
+                    wan_lora_strength = float(wan_profile.get("strength") or 1.0)
+
+                extra_loras, adapter_err = self._resolve_adapters(request, model_key)
+                if adapter_err:
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, adapter_err)
+                te_file, te_err = resolve_text_encoder(model_key, request.text_encoder)
+                if te_err:
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, te_err)
+
+                image_path, mode_error = render_limits.start_image(model_key, image_path, family)
+                if mode_error:
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, mode_error)
 
                 if cfg.get("single"):
                     # Wan 2.2 TI2V-5B: ONE model does both — image-to-video if a start
                     # image is given, else text-to-video. Fits 16GB, no MoE two-pass.
                     img_name = None
-                    if image_path and Path(image_path).exists():
+                    if image_path:
                         img_name = self._upload_image_to_comfyui(image_path)
                         if not img_name:
-                            result.error = "Failed to upload image to ComfyUI"
-                            return result
+                            return result.fail(RenderErrorKind.INVALID_REQUEST, self._upload_failure("image"))
                     workflow = self._create_wan22_5b_workflow(
+                        speed_profile=request.speed_profile,
                         prompt=request.prompt,
                         negative_prompt=request.negative_prompt,
                         model_key=model_key,
                         image_filename=img_name,
+                        sampler_profile=request.wan_sampler_profile,
                         num_frames=request.duration_frames,
-                        num_inference_steps=request.num_inference_steps,
+                        num_inference_steps=wan_steps,
                         guidance_scale=request.guidance_scale,
                         width=request.width,
                         height=request.height,
                         seed=seed,
                         fps=request.fps,
                         interpolation_multiplier=interpolation,
+                        extra_loras=extra_loras,
+                        text_encoder=te_file,
                     )
                     logger.info(f"Using Wan 2.2 TI2V-5B ({'i2v' if img_name else 't2v'}, {model_key}) via ComfyUI")
                 elif is_i2v:
-                    if not image_path or not Path(image_path).exists():
-                        result.error = "Wan 2.2 I2V requires an input image."
-                        return result
                     uploaded_image = self._upload_image_to_comfyui(image_path)
                     if not uploaded_image:
-                        result.error = "Failed to upload image to ComfyUI"
-                        return result
+                        return result.fail(RenderErrorKind.INVALID_REQUEST, self._upload_failure("image"))
                     workflow = self._create_wan22_i2v_workflow(
+                        speed_profile=request.speed_profile,
                         image_filename=uploaded_image,
                         prompt=request.prompt,
                         negative_prompt=request.negative_prompt,
                         model_key=model_key,
                         num_frames=request.duration_frames,
-                        num_inference_steps=request.num_inference_steps,
-                        guidance_scale=request.guidance_scale,
+                        num_inference_steps=wan_steps,
+                        guidance_scale=wan_cfg,
+                        sampler_profile=request.wan_sampler_profile,
                         width=request.width,
                         height=request.height,
                         seed=seed,
                         fps=request.fps,
                         interpolation_multiplier=interpolation,
+                        lora_high=wan_lora_high,
+                        lora_low=wan_lora_low,
+                        lora_strength=wan_lora_strength,
+                        shift_override=wan_shift,
+                        extra_loras=extra_loras,
+                        text_encoder=te_file,
                     )
                     logger.info(f"Using Wan 2.2 image-to-video ({model_key}) via ComfyUI GGUF")
                 else:
-                    if image_path:
-                        result.error = f"{model_key} is text-to-video only. Use wan22-14b-i2v for image-to-video."
-                        return result
                     workflow = self._create_wan22_t2v_workflow(
+                        speed_profile=request.speed_profile,
                         prompt=request.prompt,
                         negative_prompt=request.negative_prompt,
                         model_key=model_key,
                         num_frames=request.duration_frames,
-                        num_inference_steps=request.num_inference_steps,
+                        num_inference_steps=wan_steps,
+                        guidance_scale=wan_cfg,
+                        width=request.width,
+                        height=request.height,
+                        seed=seed,
+                        fps=request.fps,
+                        interpolation_multiplier=interpolation,
+                        lora_high=wan_lora_high,
+                        lora_low=wan_lora_low,
+                        lora_strength=wan_lora_strength,
+                        shift_override=wan_shift if wan_shift is not None else self._wan14b_t2v_shift(request),
+                        extra_loras=extra_loras,
+                        text_encoder=te_file,
+                    )
+                    logger.info(f"Using Wan 2.2 text-to-video ({model_key}) via ComfyUI GGUF")
+
+            elif model in self.HUNYUAN_MODELS or str(model).startswith("hunyuan"):
+                model_key = model if model in self.HUNYUAN_MODELS else "hunyuan-t2v"
+                if not self.comfy_node_available("UnetLoaderGGUF"):
+                    return VideoGenerationResult(
+                        success=False,
+                        error=(
+                            "ComfyUI is missing UnetLoaderGGUF (ComfyUI-GGUF custom node). "
+                            "HunyuanVideo GGUF models need gguf in the backend venv. "
+                            "Fix: backend/venv/bin/pip install 'gguf>=0.13.0' sentencepiece protobuf, "
+                            "then restart ComfyUI."
+                        ),
+                        error_kind=RenderErrorKind.NODE_MISSING.value,
+                        prompt_used=request.prompt,
+                    ) if self._check_comfyui_connection() else self._comfyui_down_result(request)
+                frames = request.duration_frames
+                extra_loras, adapter_err = self._resolve_adapters(request, model_key)
+                if adapter_err:
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, adapter_err)
+                te_file, te_err = resolve_text_encoder(model_key, request.text_encoder)
+                if te_err:
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, te_err)
+                image_path, mode_error = render_limits.start_image(model_key, image_path, family)
+                if mode_error:
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, mode_error)
+                if (self.HUNYUAN_MODELS.get(model_key) or {}).get("type") == "i2v":
+                    uploaded_image = self._upload_image_to_comfyui(image_path)
+                    if not uploaded_image:
+                        return result.fail(RenderErrorKind.INVALID_REQUEST, self._upload_failure("image"))
+                    workflow = self._create_hunyuan_i2v_workflow(
+                        speed_profile=request.speed_profile,
+                        image_filename=uploaded_image,
+                        prompt=request.prompt,
+                        model_key=model_key,
+                        num_frames=frames,
+                        num_inference_steps=render_limits.resolve_steps(
+                        model_key, request.num_inference_steps, explicit=explicit_steps, family=family),
                         guidance_scale=request.guidance_scale,
                         width=request.width,
                         height=request.height,
                         seed=seed,
                         fps=request.fps,
                         interpolation_multiplier=interpolation,
+                        extra_loras=extra_loras,
+                        text_encoder=te_file,
                     )
-                    logger.info(f"Using Wan 2.2 text-to-video ({model_key}) via ComfyUI GGUF")
+                    logger.info(f"Using HunyuanVideo image-to-video ({model_key}) via ComfyUI GGUF")
+                else:
+                    workflow = self._create_hunyuan_t2v_workflow(
+                        speed_profile=request.speed_profile,
+                        prompt=request.prompt,
+                        model_key=model_key,
+                        num_frames=frames,
+                        num_inference_steps=render_limits.resolve_steps(
+                        model_key, request.num_inference_steps, explicit=explicit_steps, family=family),
+                        guidance_scale=request.guidance_scale,
+                        width=request.width,
+                        height=request.height,
+                        seed=seed,
+                        fps=request.fps,
+                        interpolation_multiplier=interpolation,
+                        extra_loras=extra_loras,
+                        text_encoder=te_file,
+                    )
+                    logger.info(f"Using HunyuanVideo text-to-video ({model_key}) via ComfyUI GGUF")
 
             elif model == "cogvideox-5b":
-                if image_path:
-                    result.error = f"{model} is text-to-video only. Use cogvideox-5b-i2v for image-to-video."
-                    return result
+                image_path, mode_error = render_limits.start_image(model, image_path, family)
+                if mode_error:
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, mode_error)
                 # Text-to-video via CogVideoX
                 hf_model = self.COGVIDEOX_MODELS.get(model, "THUDM/CogVideoX-5b")
                 workflow = self._create_cogvideox_text2video_workflow(
                     prompt=request.prompt,
+                    negative_prompt=self._cogvideox_negative(request, user_negative),
                     model_name=hf_model,
                     num_frames=request.duration_frames,
-                    num_inference_steps=request.num_inference_steps,
+                    num_inference_steps=render_limits.resolve_steps(
+                        model, request.num_inference_steps, explicit=explicit_steps, family=family),
                     guidance_scale=request.guidance_scale,
                     width=request.width,
                     height=request.height,
@@ -1139,20 +2158,29 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
 
             elif model == "cogvideox-5b-i2v":
                 # Image-to-video via CogVideoX
-                if not image_path or not Path(image_path).exists():
-                    result.error = "CogVideoX image-to-video requires an input image."
-                    return result
+                image_path, mode_error = render_limits.start_image(model, image_path, family)
+                if mode_error:
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, mode_error)
                 uploaded_image = self._upload_image_to_comfyui(image_path)
                 if not uploaded_image:
-                    result.error = "Failed to upload image to ComfyUI"
-                    return result
-                hf_model = self.COGVIDEOX_MODELS.get(model, "THUDM/CogVideoX-5b-I2V")
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, self._upload_failure("image"))
+                missing = self._cogvideox_i2v_missing_files(model)
+                if missing:
+                    return result.fail(RenderErrorKind.MODEL_NOT_INSTALLED, (
+                        f"CogVideoX I2V files missing on this machine: {', '.join(missing)}. "
+                        f"Open Manage Video Models and Install CogVideoX 1.5 5B I2V "
+                        f"(companions auto-pull). Generation never downloads on its own."
+                    ))
+                files = self._cogvideox_i2v_files(model)
                 workflow = self._create_cogvideox_i2v_workflow(
                     image_filename=uploaded_image,
                     prompt=request.prompt,
-                    model_name=hf_model,
+                    negative_prompt=self._cogvideox_negative(request, user_negative),
+                    model_file=files["unet"],
+                    vae_file=files["vae"],
                     num_frames=request.duration_frames,
-                    num_inference_steps=request.num_inference_steps,
+                    num_inference_steps=render_limits.resolve_steps(
+                        model, request.num_inference_steps, explicit=explicit_steps, family=family),
                     guidance_scale=request.guidance_scale,
                     width=request.width,
                     height=request.height,
@@ -1170,6 +2198,13 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                 logger.info(f"Using CogVideoX image-to-video via ComfyUI")
 
             elif model in self.LTX_MODELS or str(model).startswith("ltx"):
+                # Decode the soundtrack the model sampled only when the entry
+                # says so (registry audio_out); the graph is the same otherwise.
+                from backend.services.video_model_registry import VIDEO_MODEL_REGISTRY as _reg
+                ltx_audio = bool((_reg.get(model) or {}).get("audio_out"))
+                if ltx_audio:
+                    result.has_audio = True
+                    result.metadata["has_audio"] = "1"
                 model_key = model if model in self.LTX_MODELS else (
                     "ltx25-distilled-int8" if str(model).startswith("ltx25")
                     else "ltx23-distilled-fp8"
@@ -1180,32 +2215,36 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                 if use_ltx25:
                     missing = self._ltx25_missing_files(model_key)
                     if missing:
-                        result.error = (
+                        return result.fail(RenderErrorKind.MODEL_NOT_INSTALLED, (
                             f"LTX-2.5 model files missing on this machine: "
                             f"{', '.join(missing)}. Transfer or download them into "
                             f"the ComfyUI models tree, then retry. (The audio VAE "
                             f"must be reachable from models/checkpoints/ — a symlink "
                             f"to ../vae/ works and is created automatically on "
                             f"plugin start when the vae/ copy exists.)"
-                        )
-                        return result
+                        ))
                 # Distilled defaults: 8 steps, CFG=1. Don't silently inherit Cog/Wan defaults.
-                ltx_steps = request.num_inference_steps or 8
-                ltx_cfg = request.guidance_scale if request.guidance_scale is not None else 1.0
-                if ltx_cfg > 1.5:
-                    logger.info(
-                        "LTX distilled prefers CFG=1 (got %.2f); keeping caller value but "
-                        "quality may degrade.",
-                        ltx_cfg,
-                    )
-                i2v = bool(image_path and Path(image_path).exists())
+                ltx_steps = render_limits.resolve_steps(
+                    model_key, request.num_inference_steps, explicit=explicit_steps, family=family
+                )
+                ltx_cfg = render_limits.resolve_cfg(model_key, request.guidance_scale, family)
+                extra_loras, adapter_err = self._resolve_adapters(request, model_key)
+                if adapter_err:
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, adapter_err)
+                te_file, te_err = resolve_text_encoder(model_key, request.text_encoder)
+                if te_err:
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, te_err)
+                image_path, mode_error = render_limits.start_image(model_key, image_path, family)
+                if mode_error:
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, mode_error)
+                i2v = bool(image_path)
                 if i2v:
                     uploaded_image = self._upload_image_to_comfyui(image_path)
                     if not uploaded_image:
-                        result.error = "Failed to upload image to ComfyUI"
-                        return result
+                        return result.fail(RenderErrorKind.INVALID_REQUEST, self._upload_failure("image"))
                     if use_ltx25:
                         workflow = self._create_ltx25_i2v_workflow(
+                            speed_profile=request.speed_profile,
                             image_filename=uploaded_image,
                             prompt=request.prompt,
                             negative_prompt=request.negative_prompt,
@@ -1216,12 +2255,16 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                             width=request.width,
                             height=request.height,
                             seed=seed,
-                            fps=request.fps or 16,
+                            fps=request.fps,
                             interpolation_multiplier=interpolation,
+                            audio_out=ltx_audio,
+                            extra_loras=extra_loras,
+                            text_encoder=te_file,
                         )
                         logger.info("Using LTX-2.5 distilled I2V (%s) via ComfyUI", model_key)
                     else:
                         workflow = self._create_ltx23_i2v_workflow(
+                            speed_profile=request.speed_profile,
                             image_filename=uploaded_image,
                             prompt=request.prompt,
                             negative_prompt=request.negative_prompt,
@@ -1232,12 +2275,16 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                             width=request.width,
                             height=request.height,
                             seed=seed,
-                            fps=request.fps or 16,
+                            fps=request.fps,
                             interpolation_multiplier=interpolation,
+                            audio_out=ltx_audio,
+                            extra_loras=extra_loras,
+                            text_encoder=te_file,
                         )
                         logger.info("Using LTX-2.3 distilled I2V (%s) via ComfyUI", model_key)
                 elif use_ltx25:
                     workflow = self._create_ltx25_t2v_workflow(
+                        speed_profile=request.speed_profile,
                         prompt=request.prompt,
                         negative_prompt=request.negative_prompt,
                         model_key=model_key,
@@ -1247,12 +2294,16 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                         width=request.width,
                         height=request.height,
                         seed=seed,
-                        fps=request.fps or 16,
+                        fps=request.fps,
                         interpolation_multiplier=interpolation,
+                            audio_out=ltx_audio,
+                            extra_loras=extra_loras,
+                            text_encoder=te_file,
                     )
                     logger.info("Using LTX-2.5 distilled T2V (%s) via ComfyUI", model_key)
                 else:
                     workflow = self._create_ltx23_t2v_workflow(
+                        speed_profile=request.speed_profile,
                         prompt=request.prompt,
                         negative_prompt=request.negative_prompt,
                         model_key=model_key,
@@ -1262,19 +2313,32 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                         width=request.width,
                         height=request.height,
                         seed=seed,
-                        fps=request.fps or 16,
+                        fps=request.fps,
                         interpolation_multiplier=interpolation,
+                            audio_out=ltx_audio,
+                            extra_loras=extra_loras,
+                            text_encoder=te_file,
                     )
                     logger.info("Using LTX-2.3 distilled T2V (%s) via ComfyUI", model_key)
 
+            elif model in self.MINIMAX_MODELS or str(model).startswith("minimax"):
+                model_key = model if model in self.MINIMAX_MODELS else "minimax-h3-int8"
+                workflow, mm_error = self._build_minimax_request(
+                    request, model_key, image_path, seed, interpolation
+                )
+                if mm_error:
+                    return result.fail(RenderErrorKind.INVALID_REQUEST, mm_error)
+                if render_limits.limits_for(model_key, family).get("audio_out"):
+                    result.has_audio = True
+                    result.metadata["has_audio"] = "1"
+
             else:
-                # SVD retired 2026-05-29. Supported: wan22-*, cogvideox-*, ltx23-*, ltx25-*.
-                result.error = (
+                # SVD retired 2026-05-29. Supported: wan22-*, cogvideox-*, ltx23-*, ltx25-*, minimax-*.
+                return result.fail(RenderErrorKind.INVALID_REQUEST, (
                     f"Unsupported video model '{model}'. Use wan22-5b, wan22-14b, "
                     f"wan22-14b-i2v, cogvideox-5b, cogvideox-5b-i2v, "
-                    f"ltx23-distilled-fp8, or ltx25-distilled-int8."
-                )
-                return result
+                    f"ltx23-distilled-fp8, ltx25-distilled-int8, or minimax-h3-int8."
+                ))
 
             # Apply Real-ESRGAN 2x upscale if requested
             upscale = request.metadata.get("upscale", False) if request.metadata else False
@@ -1327,7 +2391,7 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
             if request.freeu:
                 model_node_id = None
                 for nid, node in workflow.items():
-                    if node.get("class_type") == "DownloadAndLoadCogVideoModel":
+                    if node.get("class_type") in self._COG_MODEL_LOADER_NODES:
                         model_node_id = nid
                         break
                 if model_node_id:
@@ -1361,7 +2425,7 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                 model_node_id = None
                 clip_node_id = None
                 for nid, node in workflow.items():
-                    if node.get("class_type") == "DownloadAndLoadCogVideoModel":
+                    if node.get("class_type") in self._COG_MODEL_LOADER_NODES:
                         model_node_id = nid
                     elif node.get("class_type") == "CLIPLoader":
                         clip_node_id = nid
@@ -1434,16 +2498,18 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
             except Exception as _be:
                 logger.warning(f"Progress bridge unavailable (non-fatal): {_be}")
 
-            prompt_id = self._queue_prompt(workflow, client_id=client_id)
+            from backend.services.video_model_registry import live_preview_for_model
+            prompt_id = self._queue_prompt(
+                workflow, client_id=client_id, live_preview=live_preview_for_model(model),
+            )
 
             if not prompt_id:
                 progress_bridge.stop()
                 queue_detail = getattr(self, "_last_queue_error", None)
-                result.error = (
+                return result.fail(getattr(self, "_last_queue_error_kind", None) or RenderErrorKind.NODE_ERROR, (
                     f"Failed to queue workflow in ComfyUI: {queue_detail}"
                     if queue_detail else "Failed to queue workflow in ComfyUI"
-                )
-                return result
+                ))
 
             # Soft budget scaled to what the GPU actually needs. Activity-aware
             # _wait_for_completion extends past this while Comfy/GPU stay busy.
@@ -1476,18 +2542,19 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
             outputs = self._wait_for_completion(
                 prompt_id, timeout=gen_timeout, hard_ceiling_s=hard_ceiling
             )
+            self._forget_prompt(prompt_id)
             progress_bridge.stop()  # /history poll owns completion; bridge is done
 
             if not outputs:
-                result.error = "ComfyUI generation timed out or failed"
-                return result
+                failure = getattr(self, "_last_wait_failure", None) or RenderFailure(
+                    RenderErrorKind.RENDER_TIMEOUT, "ComfyUI generation timed out or failed")
+                return result.fail(failure.kind, failure)
 
             logger.info("Downloading results from ComfyUI...")
             downloaded_files = self._download_result(outputs, videos_dir)
 
             if not downloaded_files:
-                result.error = "No files were generated by ComfyUI"
-                return result
+                return result.fail(RenderErrorKind.OUTPUT_MISSING, "No files were generated by ComfyUI")
 
             # Separate the rendered video(s) from any exported PNG frame sequence:
             # Q3 frame export adds a SaveImage node alongside VHS_VideoCombine, so the
@@ -1503,13 +2570,12 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
             # when a model/loader fails silently. No opt-out — we do not ship fake output.
             blank_reason = _looks_like_blank_video(Path(primary))
             if blank_reason:
-                result.error = (
+                logger.error(f"Zero-placebo guard rejected ComfyUI output: {blank_reason}")
+                return result.fail(RenderErrorKind.BLANK_OUTPUT, (
                     f"ComfyUI produced an invalid video: {blank_reason}. This usually "
                     "means a model/loader failed silently — verify the model is fully "
                     "installed."
-                )
-                logger.error(f"Zero-placebo guard rejected ComfyUI output: {blank_reason}")
-                return result  # success stays False — no fake 'done'
+                ))  # success stays False — no fake 'done'
 
             result.video_path = str(Path(primary).relative_to(batch_dir))
             # frame_paths exposes the lossless PNG sequence when it was exported (for
@@ -1571,15 +2637,17 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                 or ("RuntimeError" in str(type(e)) and "memory" in err_str.lower())
             )
             if is_oom:
-                result.error = "OOM during ComfyUI video generation (VRAM exhausted; reduce res/steps, disable upscale/LoRA, or free other models first)"
+                result.fail(RenderErrorKind.OOM, "OOM during ComfyUI video generation (VRAM exhausted; reduce res/steps, disable upscale/LoRA, or free other models first)")
                 try:
                     self.service_available = False
                 except Exception:
                     pass
             else:
-                result.error = err_str
-            result.success = False
+                from backend.services.job_operation_gate import classify_render_exception
+                result.fail(classify_render_exception(e), err_str)
             return result
+        finally:
+            self._release_vram_booking()
 
 
 _video_generator_instance: Optional[ComfyUIVideoGenerator] = None
@@ -1638,7 +2706,110 @@ class SvdI2VGenerator:
         )
         result = gen.generate_video(req)
         if not result.success or not result.video_path:
-            raise RuntimeError(f"I2V failed: {result.error or 'no video produced'}")
+            raise RuntimeError(render_failed("I2V", result.error_kind or (RenderErrorKind.OUTPUT_MISSING if result.success else None), result.error))
+        shutil.copyfile(resolve_generated_video_path(result, out_dir), output_path)
+        return output_path
+
+
+class MiniMaxH3SceneGenerator:
+    """MiniMax H3 adapter for the Editor's SceneGenerator protocol: a run of
+    shots becomes one clip with its own soundtrack. The shot list is compiled
+    into the model's prompt (numbered shots, cut times, the cast's lines as
+    tagged dialogue); the storyboard still of the window's first shot is the
+    first frame and the next window's still the last frame, so windows join
+    on frames the keyframe stage drew. With cast reference images and the
+    reference build installed, identity comes from the references instead;
+    otherwise the LoRA-locked still carries it, as on the Wan path.
+    """
+
+    def __init__(self, model: str = "minimax-h3-int8", fps: int = 24, style: str = "cinematic",
+                 language: str = "English", prefer_references: bool = True):
+        self.model = model
+        self.fps = fps
+        self.style = style
+        self.language = language
+        self.prefer_references = prefer_references
+
+    def _reference_model(self) -> Optional[str]:
+        """The installed reference build sharing this model's family, or None."""
+        from backend.services.video_model_registry import (
+            VIDEO_MODEL_REGISTRY, is_model_installed, model_capabilities,
+        )
+        for mid, entry in VIDEO_MODEL_REGISTRY.items():
+            if entry.get("type") != "minimax":
+                continue
+            caps = model_capabilities(mid)
+            if "ref2v" in caps.get("modes", []) and is_model_installed(mid):
+                return mid
+        return None
+
+    def render_scene(self, *, shots, first_frame: str, last_frame: Optional[str], output_path: str,
+                     duration_seconds: float, scene_mood: Optional[str] = None) -> str:
+        from backend.services import h3_prompt_compiler as h3
+        from backend.services.video_model_registry import tier_defaults_for
+
+        refs: list[str] = []
+        subjects: list[tuple] = []
+        seen = set()
+        for shot in shots:
+            name = getattr(shot, "character_name", None)
+            paths = [p for p in (getattr(shot, "ref_image_paths", None) or []) if p and Path(p).exists()]
+            if name and paths and name not in seen:
+                seen.add(name)
+                start = len(refs) + 1
+                refs.extend(paths[:3])
+                subjects.append((name, getattr(shot, "character_description", None) or "", list(range(start, len(refs) + 1))))
+        refs = refs[:9]
+        ref_model = self._reference_model() if (self.prefer_references and refs) else None
+
+        shot_rows = [
+            {
+                "description": getattr(shot, "image_prompt", "") or "",
+                "duration_seconds": float(getattr(shot, "duration_seconds", 0) or 0),
+                "character_name": getattr(shot, "character_name", None),
+                "dialogue_text": getattr(shot, "dialogue_text", None),
+            }
+            for shot in shots
+        ]
+        if ref_model:
+            intent = h3.intent_from_shots(shot_rows, duration_seconds, subjects=subjects, style=self.style,
+                                          language=self.language)
+            model = ref_model
+        else:
+            mode = "fl2va" if last_frame else "i2va"
+            intent = h3.intent_from_shots(shot_rows, duration_seconds, mode=mode, style=self.style,
+                                          language=self.language)
+            model = self.model
+        prompt, diag = h3.compile(intent)
+        if diag.get("warnings"):
+            logger.info("H3 scene prompt warnings: %s", "; ".join(diag["warnings"]))
+
+        tier = tier_defaults_for(model)
+        width, height = int(tier.get("width") or 864), int(tier.get("height") or 480)
+        out_dir = Path(output_path).parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        req = VideoGenerationRequest(
+            model=model,
+            prompt=prompt,
+            duration_frames=diag["frames"],
+            fps=self.fps,
+            width=width,
+            height=height,
+            num_inference_steps=0,
+            enhance_prompt=False,
+            output_dir=out_dir,
+            speed_profile=tier.get("speed_profile") or None,
+            first_frame_path=None if ref_model else first_frame,
+            last_frame_path=None if ref_model else last_frame,
+            ref_images=refs if ref_model else [],
+            h3_intent=h3.intent_to_dict(intent),
+            language=self.language,
+            metadata={"source": "film_crew", "scene_mood": scene_mood or ""},
+        )
+        gen = get_video_generator()
+        result = gen.generate_video(req)
+        if not result.success or not result.video_path:
+            raise RuntimeError(render_failed("MiniMax H3 scene", result.error_kind or (RenderErrorKind.OUTPUT_MISSING if result.success else None), result.error))
         shutil.copyfile(resolve_generated_video_path(result, out_dir), output_path)
         return output_path
 
@@ -1657,21 +2828,29 @@ class Wan22I2VGenerator:
     inside generate_video. Short clips keep identity stable and VRAM in budget on 16 GB.
     """
 
-    def __init__(self, fps: int = 24):
-        self.fps = fps
+    def __init__(self, model: str = "wan22-5b", fps: int | None = None):
+        from backend.services.video_model_registry import model_capabilities
+        self.model = model
+        caps = model_capabilities(model)
+        self.fps = int(fps if fps is not None else (caps.get("native_fps") or 24))
 
     def i2v_from_image(
         self, *, image_path: str, prompt: str, loras: list[str],
         duration_seconds: float, output_path: str,
     ) -> str:
-        # Clamp to a short clip — long Wan I2V drifts the face and blows 16 GB.
-        # generate_video handles Wan's "frames % 8 == 1" alignment internally.
-        frames = max(17, min(49, int(round(duration_seconds * self.fps)) or 25))
+        # Clamp to a short clip — long I2V drifts the face and blows 16 GB.
+        # Snap to the model's declared frame rule (Wan/Hunyuan 4n+1, LTX 8n+1).
+        from backend.services.video_model_registry import snap_frames
+        raw = max(17, min(49, int(round(duration_seconds * self.fps)) or 25))
+        frames = snap_frames(self.model, raw)
+        if frames < 17:
+            # Snapping down left too short a clip; take the next grid point up.
+            frames = snap_frames(self.model, 17, up=True)
         out_dir = Path(output_path).parent
         out_dir.mkdir(parents=True, exist_ok=True)
         gen = get_video_generator()
         req = VideoGenerationRequest(
-            model="wan22-14b-i2v",
+            model=self.model,
             prompt=prompt or "",
             duration_frames=frames,
             fps=self.fps,
@@ -1685,6 +2864,6 @@ class Wan22I2VGenerator:
         )
         result = gen.generate_video(req)
         if not result.success or not result.video_path:
-            raise RuntimeError(f"Wan 2.2 I2V failed: {result.error or 'no video produced'}")
+            raise RuntimeError(render_failed("Wan 2.2 I2V", result.error_kind or (RenderErrorKind.OUTPUT_MISSING if result.success else None), result.error))
         shutil.copyfile(resolve_generated_video_path(result, out_dir), output_path)
         return output_path

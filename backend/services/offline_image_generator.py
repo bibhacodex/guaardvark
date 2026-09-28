@@ -63,6 +63,34 @@ except ImportError as e:
     diffusion_available = False
     logger.warning(f"Diffusion dependencies not available: {e}")
 
+
+# CUDA errors after which the driver has torn the context down. Every later CUDA
+# call in this process fails with the same text; torch cannot rebuild the context,
+# only a process restart can. Out-of-memory is deliberately absent: it is
+# recoverable and belongs to the OOM ladder in generate_image().
+# Observed 2026-09-03 on a 16 GB Blackwell box: one Xid 8 (channel watchdog,
+# "the launch timed out and was terminated") and the backend then failed every
+# image request for nine hours, each reported as a model download problem.
+_FATAL_CUDA_MARKERS = (
+    "launch timed out",            # cudaErrorLaunchTimeout — watchdog / Xid 8
+    "unspecified launch failure",  # cudaErrorLaunchFailure
+    "illegal memory access",       # cudaErrorIllegalAddress
+    "illegal instruction",         # cudaErrorIllegalInstruction
+    "misaligned address",          # cudaErrorMisalignedAddress
+    "invalid program counter",     # cudaErrorInvalidPc
+    "hardware stack error",        # cudaErrorHardwareStackError
+    "device-side assert",          # cudaErrorAssert
+    "uncorrectable ecc error",     # cudaErrorECCUncorrectable
+)
+
+
+def is_fatal_cuda_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a CUDA error that leaves the process's context dead."""
+    msg = (str(exc) or "").lower()
+    if "out of memory" in msg:
+        return False
+    return any(marker in msg for marker in _FATAL_CUDA_MARKERS)
+
 try:
     from diffusers import FlowMatchEulerDiscreteScheduler
 except Exception:
@@ -110,6 +138,7 @@ class ImageGenerationRequest:
     # omit knobs do not inherit SD-era 512/20/7.5.
     width: int = 1024
     height: int = 1024
+    steps_explicit: bool = False
     num_inference_steps: int = 9
     guidance_scale: float = 0.0
     style: str = "realistic"
@@ -168,6 +197,18 @@ def normalize_zimage_lora_state_dict(state_dict: Dict[str, Any]) -> Dict[str, An
     return out
 
 
+def _image_limits_for(model: str) -> dict:
+    from backend.services.image_render_limits import limits_for
+    return limits_for(model)
+
+
+def _offline_family_values(field: str) -> dict:
+    """``{family: value}`` for the Diffusers families that declare ``field``."""
+    from backend.services.image_render_limits import family_values
+    return {fam: value for fam, value in family_values(field).items()
+            if _image_limits_for(fam).get("engine") == "offline"}
+
+
 class OfflineImageGenerator:
 
     def __init__(self):
@@ -208,6 +249,12 @@ class OfflineImageGenerator:
         self.hidden_models: set[str] = set()
         # Offline Diffusers cannot load these — batch/API must route to ComfyUI.
         self.comfy_only_models = {"flux-dev"}
+        # User-added entries (backend/services/user_image_models.py): family by id
+        # or repo, file-kind entries keyed by their "user:<id>" sentinel, and the
+        # catalog rows themselves. Filled by load_user_catalog() below.
+        self.family_overrides: Dict[str, str] = {}
+        self.user_files: Dict[str, Dict[str, Any]] = {}
+        self.user_entries: Dict[str, Dict[str, Any]] = {}
         # UI metadata for the visible models (label/description/recommended/order).
         # Drives the centralized dropdown via get_available_models().
         self.model_meta = {
@@ -308,6 +355,9 @@ class OfflineImageGenerator:
         self._img2img_pipeline = None
         self._img2img_family = None
         self._current_model = None
+        # Set by _mark_gpu_fault() after a context-killing CUDA error; read by
+        # every entry point so the process fails fast and says why.
+        self._gpu_fault: Optional[Dict[str, Any]] = None
         # Offload mode of the resident pipeline: None | "sequential" | "model" | "full"
         self._pipeline_offload_mode = None
         # One-shot force sequential reload after a mid-inference OOM.
@@ -324,6 +374,19 @@ class OfflineImageGenerator:
                 self._device = "cuda"
             except Exception as e:
                 logger.warning(f"CUDA is available but not usable (e.g., PyTorch compatibility issue), falling back to CPU: {e}")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            # Apple Silicon: Metal shares system memory with the CPU, so there is no
+            # separate VRAM pool. Probe with a tiny op so a broken MPS build degrades
+            # to CPU instead of failing mid-generation. Z-Image/Krea 2 are DiTs whose
+            # weights (~20GB bf16) fit unified memory but NOT a CPU fp32 run — see the
+            # family guard in _generate().
+            try:
+                dummy = torch.zeros(1, device="mps")
+                _ = dummy + dummy
+                torch.mps.synchronize()
+                self._device = "mps"
+            except Exception as e:
+                logger.warning(f"MPS is available but not usable, falling back to CPU: {e}")
         
         self._generation_lock = threading.RLock()
         # One-shot / once-per-process: avoid WARNING spam when xformers is absent.
@@ -335,17 +398,53 @@ class OfflineImageGenerator:
 
         self.service_available = diffusion_available
 
+        try:
+            from backend.services.user_image_models import load_user_catalog
+            n_user = load_user_catalog(self)
+            if n_user:
+                logger.info("Registered %d user image model(s) from the user catalog", n_user)
+        except Exception as e:  # noqa: BLE001 — a broken catalog must not stop image generation
+            logger.error("user image catalog failed to load: %s", e)
+
         logger.info(f"OfflineImageGenerator initialized - Device: {self._device}, Models dir: {self.models_dir}")
 
     def _get_model_path(self, model_id: str) -> Path:
+        uf = self.user_files.get(model_id)
+        if uf:
+            return self.models_dir / uf["dir"]
         model_name = model_id.replace("/", "--")
         return self.models_dir / model_name
 
+    def _user_file_entry(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """The user file entry for a key or its sentinel, or None."""
+        uf = self.user_files.get(model_id)
+        if uf is None:
+            uf = self.user_files.get(self.available_models.get(model_id, ""))
+        return uf
+
     def _is_model_downloaded(self, model_id: str) -> bool:
-        # Comfy-only models (FLUX.1-dev): check ComfyUI unet asset, not HF snapshot.
+        if self._user_file_entry(model_id) is not None:
+            from backend.services.user_image_models import user_files_present, user_sentinel
+            sentinel = model_id if model_id in self.user_files else self.available_models.get(model_id, user_sentinel(model_id))
+            return user_files_present(self, sentinel)
+        # Comfy-only catalog keys: the video-registry install plan is the source of
+        # truth (flux-dev, qwen-image-edit, …), not a diffusers snapshot.
         mid = (model_id or "").lower()
-        if mid.startswith("comfy:") or mid == "flux-dev" or "flux1-dev" in mid or mid.endswith("flux-dev"):
-            return self._flux_dev_assets_present()
+        catalog_key = mid.split(":", 1)[1] if mid.startswith("comfy:") else None
+        if catalog_key or mid in getattr(self, "comfy_only_models", set()) or mid == "flux-dev" or mid.endswith("flux-dev") or "flux1-dev" in mid:
+            try:
+                from backend.services.video_model_registry import is_model_installed
+                key = catalog_key or (
+                    "flux-dev" if (mid == "flux-dev" or mid.endswith("flux-dev") or "flux1-dev" in mid)
+                    else (model_id if model_id in getattr(self, "comfy_only_models", set()) else None)
+                )
+                if key:
+                    return bool(is_model_installed(key))
+            except Exception:
+                pass
+            if mid == "flux-dev" or "flux1-dev" in mid or (catalog_key == "flux-dev"):
+                return self._flux_dev_assets_present()
+            return False
         model_path = self._get_model_path(model_id)
         # A non-empty directory is NOT enough. An aborted gated download leaves a
         # README and an empty images/ folder behind — observed with Krea 2 (1 MB of
@@ -443,7 +542,12 @@ class OfflineImageGenerator:
 
     def is_comfy_only_model(self, model_key: str) -> bool:
         key = (model_key or "").strip().lower()
-        return key in getattr(self, "comfy_only_models", set()) or key.startswith("flux")
+        if key in getattr(self, "comfy_only_models", set()) or key.startswith("flux"):
+            return True
+        entry = (getattr(self, "user_entries", None) or {}).get(model_key) or {}
+        if (entry.get("engine") == "comfy" and entry.get("role") == "generation"):
+            return True
+        return key.startswith("user-flux")
 
     # How long a repo-access verdict stays good. The menu asks per model, so without
     # a cache every dropdown open would fan out HTTP requests.
@@ -475,12 +579,21 @@ class OfflineImageGenerator:
             return hit[0]
 
         verdict = "unreachable"
+        # A user file entry has no model_index.json; probe the file it names.
+        uf = self.user_files.get(repo_id)
+        if uf and uf.get("files"):
+            probe_url = (
+                f"https://huggingface.co/{uf['hf_repo']}/resolve/{uf.get('revision') or 'main'}/"
+                f"{uf['files'][0]['src']}"
+            )
+        else:
+            probe_url = f"https://huggingface.co/{repo_id}/resolve/main/model_index.json"
         try:
             import requests
             token = self._hf_token()
             headers = {"Authorization": f"Bearer {token}"} if token else {}
             resp = requests.head(
-                f"https://huggingface.co/{repo_id}/resolve/main/model_index.json",
+                probe_url,
                 headers=headers, timeout=6, allow_redirects=True,
             )
             if resp.status_code == 200:
@@ -497,8 +610,58 @@ class OfflineImageGenerator:
         cache[repo_id] = (verdict, now)
         return verdict
 
+    def _mark_gpu_fault(self, exc: BaseException, where: str) -> str:
+        """Record a context-killing CUDA error; return the user-facing message.
+
+        Only the first fault is recorded — everything after it is the same dead
+        context reporting itself. No CUDA calls are made here: freeing tensors on
+        a dead context raises again, and the process is being restarted anyway.
+        """
+        if self._gpu_fault is None:
+            first_line = (str(exc) or type(exc).__name__).strip().splitlines()[0]
+            self._gpu_fault = {
+                "error": first_line,
+                "where": where,
+                "at": datetime.now().isoformat(timespec="seconds"),
+            }
+            logger.critical(
+                "GPU FAULT during %s: %s — the CUDA context in this process is dead. "
+                "Every GPU job will fail until the backend is restarted. Driver report: "
+                "journalctl -k -b | grep -i xid",
+                where, first_line,
+            )
+        return self.gpu_fault_message()
+
+    def gpu_fault_message(self) -> Optional[str]:
+        """The message every GPU entry point returns once a fault is recorded."""
+        fault = self._gpu_fault
+        if not fault:
+            return None
+        return (
+            f"GPU fault at {fault['at']} during {fault['where']}: {fault['error']}. "
+            "The GPU driver reset this backend's CUDA context and it cannot be "
+            "recovered in-process. Restart the backend, then retry — the model and "
+            "its download are fine. Driver details: journalctl -k -b | grep -i xid"
+        )
+
+    def get_status(self) -> Dict[str, Any]:
+        """Lightweight operational status of the image generator.
+
+        Returns device, current loaded model, pipeline state, and any
+        recorded GPU fault.
+        """
+        return {
+            "device": self._device,
+            "current_model": self._current_model,
+            "pipeline_loaded": self._pipeline is not None,
+            "gpu_fault": self._gpu_fault,
+        }
+
     def _load_failure_reason(self, model_key: str, model_id: str) -> str:
         """Explain a load failure in terms the user can act on."""
+        fault = self.gpu_fault_message()
+        if fault:
+            return fault
         if self.is_comfy_only_model(model_key or ""):
             return (
                 f"'{model_key}' runs through ComfyUI and its weights are not installed. "
@@ -556,6 +719,11 @@ class OfflineImageGenerator:
 
         Drives pipeline class, scheduler, VRAM strategy, and generation params.
         """
+        override = self.family_overrides.get(model_id or "") or self.family_overrides.get(
+            self._resolve_model_ref(model_id or "")
+        )
+        if override:
+            return override
         key = (model_id or "").lower()
         mid = self._resolve_model_ref(model_id).lower()
         if key.startswith("krea2") or (
@@ -621,11 +789,14 @@ class OfflineImageGenerator:
     # wall of resident Ollama models (gemma 4.95GB + qwen3-embedding 4.32GB).
     # zimage: WITH enable_model_cpu_offload. krea2 model-offload peak ~14GB on 16GB
     # (2026-07-11); sequential offload is used on consumer cards and peaks lower.
-    _FAMILY_VRAM_MB = {"krea2": 14000, "zimage": 11000, "sdxl": 8000, "sd": 4000}
-    _KREA2_SEQUENTIAL_VRAM_MB = 10000  # layer-by-layer offload on ≤18GB cards
+    # Per-family prices are declared in media_model_registry.IMAGE_FAMILY_SPECS
+    # (vram_mb, vram_mb_sequential, ram_gb, *_slope_*), with the measurements
+    # behind them; the Diffusers families are read here.
+    _FAMILY_VRAM_MB = _offline_family_values("vram_mb")
+    _KREA2_SEQUENTIAL_VRAM_MB = _offline_family_values("vram_mb_sequential")["krea2"]  # layer-by-layer offload on ≤18GB cards
     # CPU-RAM footprint with enable_model_cpu_offload (weights + PyTorch arena).
     # Observed: ~47 GB RSS on 60 GB box during Z-Image batch; gate before load.
-    _FAMILY_RAM_GB = {"krea2": 24.0, "zimage": 21.0, "sdxl": 10.0, "sd": 6.0}
+    _FAMILY_RAM_GB = _offline_family_values("ram_gb")
     # zimage 24.0 -> 21.0 (2026-08-05): 24.0 predated the ladder/unload leak fixes
     # (the "~47 GB RSS" note above is from that era). The CALIBRATED comment below
     # measured peak RSS flat at 20.9-21.0 GB across 1024/1448/2048 AFTER those fixes.
@@ -647,8 +818,8 @@ class OfflineImageGenerator:
     # Tiled peaks are noisy but bounded WELL under 16GB, so slopes are modest:
     # they price bigger canvases without refusing tiled 2K on 16GB cards.
     # Override via GUAARDVARK_VRAM_SLOPE_MB_PER_MP / GUAARDVARK_RAM_SLOPE_GB_PER_MP.
-    _FAMILY_VRAM_SLOPE_MB_PER_MP = {"krea2": 1000, "zimage": 500, "sdxl": 1500, "sd": 800}
-    _FAMILY_RAM_SLOPE_GB_PER_MP = {"krea2": 1.0, "zimage": 1.0, "sdxl": 1.0, "sd": 0.5}
+    _FAMILY_VRAM_SLOPE_MB_PER_MP = _offline_family_values("vram_slope_mb_per_mp")
+    _FAMILY_RAM_SLOPE_GB_PER_MP = _offline_family_values("ram_slope_gb_per_mp")
 
     @staticmethod
     def _extra_megapixels(width: Optional[int], height: Optional[int]) -> float:
@@ -656,6 +827,25 @@ class OfflineImageGenerator:
         if not width or not height:
             return 0.0
         return max(0.0, (int(width) * int(height)) / 1_048_576.0 - 1.0)
+
+    def _uses_grouped_query_attention(self) -> bool:
+        """True when the loaded transformer has fewer KV heads than query heads.
+
+        That mismatch is what disqualifies the fused SDPA kernels: flash and the
+        mem-efficient kernel both refuse dense GQA, so a masked call falls through
+        to math. Krea 2 is 48/12; Z-Image is 30/30 and unaffected. Read from the
+        config rather than keyed on a model name so a future GQA model is covered
+        without anyone remembering to add it.
+        """
+        cfg = getattr(getattr(self._pipeline, "transformer", None), "config", None)
+        if cfg is None:
+            return False
+        q = getattr(cfg, "num_attention_heads", None) or getattr(cfg, "n_heads", None)
+        kv = getattr(cfg, "num_key_value_heads", None) or getattr(cfg, "n_kv_heads", None)
+        try:
+            return bool(q and kv and int(kv) < int(q))
+        except (TypeError, ValueError):
+            return False
 
     def _will_use_sequential_for_krea2(self) -> bool:
         """True when krea2 loads with sequential CPU offload (≤18GB CUDA cards)."""
@@ -679,7 +869,7 @@ class OfflineImageGenerator:
         else:
             family = self._model_family(model_id)
             if family == "flux":
-                base = 12000
+                base = int(_image_limits_for("flux")["vram_mb"])
             elif family == "krea2" and self._will_use_sequential_for_krea2():
                 base = self._KREA2_SEQUENTIAL_VRAM_MB
             else:
@@ -701,7 +891,7 @@ class OfflineImageGenerator:
         else:
             family = self._model_family(model_id)
             if family == "flux":
-                base = 16.0
+                base = float(_image_limits_for("flux")["ram_gb"])
             else:
                 base = self._FAMILY_RAM_GB.get(family, 6.0)
         extra_mp = self._extra_megapixels(width, height)
@@ -725,10 +915,15 @@ class OfflineImageGenerator:
         """
         if self._pipeline is not None and self._current_model == model_id:
             return  # already resident — its VRAM is already spent
+        fault = self.gpu_fault_message()
+        if fault:
+            raise RuntimeError(fault)
         estimate_mb = self._vram_estimate_mb(model_id, width, height)
         # Probe/evict is best-effort: a failing CUDA query must not kill the
         # request (2026-08-04: pinned by test_admission_failure_never_raises —
-        # only the orchestrator's hard_fit refusal below may raise).
+        # only the orchestrator's hard_fit refusal below may raise). The one
+        # exception is a context-killing CUDA error: the request is doomed and
+        # so is every request after it, so say that instead of admitting.
         try:
             if self._device == "cuda" and torch.cuda.is_available():
                 if self._pipeline is None:
@@ -746,6 +941,8 @@ class OfflineImageGenerator:
                     )
                     evict_ollama_models()
         except Exception as probe_err:
+            if is_fatal_cuda_error(probe_err):
+                raise RuntimeError(self._mark_gpu_fault(probe_err, "VRAM probe")) from probe_err
             logger.warning(
                 f"VRAM probe/evict failed (continuing to orchestrator admit): {probe_err}"
             )
@@ -795,13 +992,57 @@ class OfflineImageGenerator:
 
         return _cb
 
+    # "no text", "without any letters", "no visible typography or signage":
+    # a prompt ruling text OUT. The shared keyword detector matches the noun
+    # regardless, so these are removed before it looks (2026-09-12: a 16:9 key
+    # art prompt ending "no text, no letters, no typography, no signage" was
+    # routed to text mode and rendered 1024x1024 instead of 960x544).
+    _NEGATED_TEXT_RE = re.compile(
+        r"\b(?:no|without|free\s+of|not\s+any|zero|avoid(?:ing)?)\s+"
+        r"(?:(?:any|visible|readable|legible|on-?screen|on-?image|written)\s+)*"
+        r"(?:text|texts|letters?|lettering|typography|signage|signs?|words?|captions?|"
+        r"subtitles?|watermarks?|logos?|labels?|writing|titles?|banners?|slogans?|headlines?)"
+        r"(?:\s+(?:or|and|,)\s*(?:text|letters?|lettering|typography|signage|signs?|words?|"
+        r"captions?|subtitles?|watermarks?|logos?|labels?|writing|titles?|banners?|slogans?|headlines?))*"
+        r"(?:\s+(?:visible|shown|present|anywhere|at\s+all|in\s+(?:the\s+)?(?:frame|image|scene)))?",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _without_negated_text(cls, prompt: str) -> str:
+        return cls._NEGATED_TEXT_RE.sub(" ", prompt or "")
+
     def _has_text_intent(self, prompt: str) -> bool:
         """True if the prompt asks for on-image text — bypass enhancement to keep
         spelling intact (HULK -> HUK otherwise). Shared detector lives in
-        prompt_enhancer.has_text_intent so image + video stay in sync.
+        prompt_enhancer.has_text_intent so image + video stay in sync; phrases
+        that rule text out are removed first.
         """
         from backend.utils.prompt_enhancer import has_text_intent
-        return has_text_intent(prompt)
+        return has_text_intent(self._without_negated_text(prompt))
+
+    # SD-era placeholder canvas. Every modern family defaults to 1024 (see
+    # stills_defaults), so a request at or below this on both axes is the old
+    # default, not a choice.
+    _LEGACY_CANVAS = 512
+
+    @classmethod
+    def _text_canvas(cls, width: int, height: int, family: str) -> Tuple[int, int]:
+        """Canvas for a prompt that asks for on-image text.
+
+        Crisp type needs room: at 512 it renders as mush, so the legacy 512
+        placeholder is enlarged to 1024 on families that can. Any other size
+        was chosen by the caller and is kept: an explicit value wins (the
+        2026-09-12 batch above asked 960x544 and got a 1024x1024 file while
+        its metadata still said 960x544).
+        """
+        if (
+            family in ("sdxl", "zimage", "krea2")
+            and width <= cls._LEGACY_CANVAS
+            and height <= cls._LEGACY_CANVAS
+        ):
+            return 1024, 1024
+        return width, height
 
     def _cuda_total_vram_gb(self) -> float:
         """Total device VRAM in GB, or 0 if CUDA is unavailable."""
@@ -811,6 +1052,21 @@ class OfflineImageGenerator:
         except Exception:
             pass
         return 0.0
+
+    def _seed_generator(self, seed: int) -> "torch.Generator":
+        """Seeded RNG on the pipeline device, falling back to CPU when CUDA cannot
+        be initialised (no device, driver mismatch). A CPU generator is accepted by
+        every diffusers pipeline, so such a process still reaches admission and
+        OOM handling instead of failing at RNG construction. On a working CUDA box
+        the generator stays on the GPU, so seeds reproduce as before.
+        """
+        device = self._device
+        if device == "cuda" and not torch.cuda.is_available():
+            device = "cpu"
+        try:
+            return torch.Generator(device=device).manual_seed(seed)
+        except RuntimeError:
+            return torch.Generator().manual_seed(seed)
 
     @staticmethod
     def _is_cuda_oom(exc: BaseException) -> bool:
@@ -887,51 +1143,21 @@ class OfflineImageGenerator:
 
         Used on the primary generate path so Batch UI High / slider values actually run.
         Hard defaults live in ``_apply_family_sampling`` (fallback / family switch only).
+        The envelope (steps_range, cfg_range, default, measured floor) is the
+        model's registry row: a typed step count stands, an unset or runaway one
+        takes the default, and guidance outside the range takes the default.
         """
         if family == "zimage":
-            # Official HF: 9 steps / guidance 0. Soft envelope matches settings_validator.
-            steps = int(request.num_inference_steps or 0)
-            if steps < 4 or steps > 30:
-                request.num_inference_steps = 9
-            else:
-                request.num_inference_steps = steps
-            try:
-                g = float(request.guidance_scale)
-            except (TypeError, ValueError):
-                g = -1.0
-            if g < 0.0 or g > 2.0:
-                request.guidance_scale = 0.0
-            else:
-                request.guidance_scale = g
+            key = "zimage-turbo"
         elif family == "krea2":
-            if self._krea2_variant(request.model or "") == "raw":
-                steps = int(request.num_inference_steps or 0)
-                if steps < 20 or steps > 80:
-                    request.num_inference_steps = 52
-                else:
-                    request.num_inference_steps = steps
-                try:
-                    g = float(request.guidance_scale)
-                except (TypeError, ValueError):
-                    g = -1.0
-                if g < 1.0 or g > 7.0:
-                    request.guidance_scale = 3.5
-                else:
-                    request.guidance_scale = g
-            else:
-                steps = int(request.num_inference_steps or 0)
-                if steps < 4 or steps > 20:
-                    request.num_inference_steps = 8
-                else:
-                    request.num_inference_steps = steps
-                try:
-                    g = float(request.guidance_scale)
-                except (TypeError, ValueError):
-                    g = -1.0
-                if g < 0.0 or g > 1.0:
-                    request.guidance_scale = 0.0
-                else:
-                    request.guidance_scale = g
+            key = "krea2-raw" if self._krea2_variant(request.model or "") == "raw" else "krea2-turbo"
+        else:
+            return
+        from backend.services.image_render_limits import envelope_cfg, envelope_steps
+        request.num_inference_steps = envelope_steps(
+            key, request.num_inference_steps, explicit=bool(request.steps_explicit),
+        )
+        request.guidance_scale = envelope_cfg(key, request.guidance_scale)
 
     def _apply_family_sampling(self, request: ImageGenerationRequest, family: str) -> None:
         """Force family-appropriate steps/guidance after model switch or fallback."""
@@ -1050,13 +1276,20 @@ class OfflineImageGenerator:
         logger.error(msg)
         return False, msg
 
-    def _download_model(self, model_id: str) -> tuple[bool, str | None]:
+    def _download_model(self, model_id: str, stop=None) -> tuple[bool, str | None]:
         if not self.service_available:
             msg = "Diffusion service not available for model download"
             logger.error(msg)
             return False, msg
 
         try:
+            if stop is not None and stop.is_set():
+                return False, "Download stalled"
+            if self._user_file_entry(model_id) is not None:
+                from backend.services.user_image_models import download_user_files
+                sentinel = model_id if model_id in self.user_files else self.available_models.get(model_id)
+                return download_user_files(self, sentinel, stop=stop)
+
             model_path = self._get_model_path(model_id)
 
             # LOUD first-run banner: this download is multi-GB and used to be
@@ -1116,6 +1349,8 @@ class OfflineImageGenerator:
             # Use bf16 on Ada Lovelace+, fp16 otherwise
             if self._device == "cuda":
                 gpu_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            elif self._device == "mps":
+                gpu_dtype = torch.bfloat16
             else:
                 gpu_dtype = torch.float32
 
@@ -1200,6 +1435,11 @@ class OfflineImageGenerator:
     def _load_pipeline(self, model_id: str, *, force_sequential: bool = False) -> bool:
         if not self.service_available:
             return False
+        if self._gpu_fault is not None:
+            logger.error(
+                "Refusing to load %s: %s", model_id, self.gpu_fault_message()
+            )
+            return False
 
         try:
             want_sequential = bool(force_sequential or self._force_sequential_offload)
@@ -1245,6 +1485,11 @@ class OfflineImageGenerator:
                 else:
                     gpu_dtype = torch.float16
                     logger.info("Using float16")
+            elif self._device == "mps":
+                # Metal supports bfloat16 on Apple Silicon; fp32 would double the
+                # unified-memory footprint of a ~20GB DiT.
+                gpu_dtype = torch.bfloat16
+                logger.info("Using bfloat16 (Apple MPS)")
             else:
                 gpu_dtype = torch.float32
 
@@ -1256,10 +1501,18 @@ class OfflineImageGenerator:
                 load_kwargs["safety_checker"] = None
                 load_kwargs["requires_safety_checker"] = False
 
-            self._pipeline = pipeline_class.from_pretrained(
-                model_path,
-                **load_kwargs
-            )
+            user_file = self._user_file_entry(model_id)
+            if user_file and user_file.get("kind") == "single_file":
+                # A merged checkpoint (SD / SDXL): diffusers rebuilds the pipeline
+                # from the one file instead of a component tree.
+                checkpoint = model_path / user_file["files"][0]["dst"]
+                logger.info(f"Loading single-file checkpoint {checkpoint.name} (family: {family})")
+                self._pipeline = pipeline_class.from_single_file(str(checkpoint), **load_kwargs)
+            else:
+                self._pipeline = pipeline_class.from_pretrained(
+                    model_path,
+                    **load_kwargs
+                )
 
             # Flow-matching DiTs ship their own scheduler — don't force DPM (SD/SDXL only).
             if family not in ('zimage', 'krea2'):
@@ -1322,7 +1575,41 @@ class OfflineImageGenerator:
                     )
                     logger.info("Enabled channels_last (NHWC) memory format for transformer")
 
+            # Attention backend for grouped-query DiTs (2026-08-24 incident).
+            #
+            # Krea 2 is 48 query heads / 12 KV heads, and its processor forwards the
+            # pipeline's text padding mask into SDPA. On torch 2.5.1 flash refuses a
+            # mask and the mem-efficient kernel refuses the GQA head mismatch, so the
+            # dispatch silently lands on MATH — which materializes the whole
+            # [1, heads, S, S] score matrix. At 1024² (S=4609) that is ~3.8GB and
+            # survives; at 2048² (S=16897) it is **51.05GB** and the batch dies on
+            # denoise step 0, on a card with 10.8GB free. Measured on this box, same
+            # shapes: math 51.05GB (OOM) vs cuDNN 794MB vs no-mask flash 499MB.
+            #
+            # cuDNN attention takes both the mask and the GQA shape, so name it
+            # explicitly rather than leaving the choice to a fallback chain that
+            # picks the one kernel that cannot do this. Z-Image is 30/30 heads (no
+            # GQA) and never hit this; setting the backend is harmless there.
+            self._attention_backend_active = None
+            _transformer = getattr(self._pipeline, "transformer", None)
+            if _transformer is not None and hasattr(_transformer, "set_attention_backend"):
+                for _backend in ("_native_cudnn", "_native_efficient", "_native_flash"):
+                    try:
+                        _transformer.set_attention_backend(_backend)
+                        self._attention_backend_active = _backend
+                        logger.info("Attention backend set to %s for %s", _backend, family)
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("Attention backend %s unavailable: %s", _backend, e)
+                if self._attention_backend_active is None:
+                    logger.warning(
+                        "No explicit attention backend could be set for %s; large "
+                        "canvases may fall back to the quadratic math kernel", family,
+                    )
+
             if hasattr(self._pipeline, "enable_attention_slicing"):
+                # No-op for DiT transformers (it drives UNet set_attention_slice), but
+                # still correct for the SD/SDXL pipelines that share this path.
                 self._pipeline.enable_attention_slicing()
 
             if hasattr(self._pipeline, "enable_xformers_memory_efficient_attention"):
@@ -1410,6 +1697,8 @@ class OfflineImageGenerator:
 
         except Exception as e:
             logger.error(f"Failed to load pipeline with model {model_id}: {e}")
+            if is_fatal_cuda_error(e):
+                self._mark_gpu_fault(e, "pipeline load")
             self._pipeline = None
             self._current_model = None
             self._pipeline_offload_mode = None
@@ -1555,6 +1844,26 @@ class OfflineImageGenerator:
         preset = self.content_presets.get(preset_name, self.content_presets["general"])
         style_config = self.style_configs.get(style, self.style_configs["realistic"])
 
+        if self._prompt_style(family) == "natural":
+            # LLM-encoder families read tag suffixes as scene content (see
+            # stills_defaults._FAMILY_DEFAULTS). The person's sentence goes
+            # through as written, plus one prose clause for a non-photo style.
+            # Negatives are still assembled for callers whose model uses CFG.
+            enhanced_prompt = self._natural_style_prompt(prompt, style)
+            negative_prompt = ", ".join(
+                p for p in (self.base_negative, style_config.get("negative_prompt", ""))
+                if p
+            )
+            detection["preset_used"] = preset_name
+            detection["style_used"] = style
+            detection["enhancements_applied"] = []
+            detection["prompt_style"] = "natural"
+            logger.debug(
+                "Image prompt enhancement skipped for %s (natural-language encoder); "
+                "prompt sent as written", family,
+            )
+            return enhanced_prompt, negative_prompt, detection
+
         # (priority, text) — priority decides what survives when a long-context
         # encoder budget forces a re-fit: 0 = subject/coherence guards,
         # 1 = anatomy/scene logic, 2 = preset, 3 = style boilerplate.
@@ -1654,6 +1963,35 @@ class OfflineImageGenerator:
         detection["enhancements_applied"] = unique_enhancements
 
         return enhanced_prompt, negative_prompt, detection
+
+    # One prose clause per style for natural-language encoders. "realistic" adds
+    # nothing: Z-Image renders a bare scene as a photograph already (2026-09-07
+    # A/B), and "photorealistic, professional photography" pushed it toward a
+    # posed catalogue look.
+    _NATURAL_STYLE_CLAUSES = {
+        "artistic": "painted as a piece of fine art",
+        "cartoon": "drawn as a colourful cartoon illustration with clean lines and flat cel shading",
+        "sketch": "drawn as a monochrome pencil sketch with visible hand-drawn linework",
+        "infographic": "designed as a flat vector infographic with simple geometric shapes and no people",
+        "technical": "drawn as a clean technical illustration with precise lines",
+    }
+
+    @staticmethod
+    def _prompt_style(family: str) -> str:
+        try:
+            from backend.services.stills_defaults import prompt_style_for_family
+            return prompt_style_for_family(family)
+        except Exception:
+            return "tags"
+
+    def _natural_style_prompt(self, prompt: str, style: str) -> str:
+        """User prompt plus at most one prose style clause (natural families)."""
+        text = (prompt or "").strip()
+        clause = self._NATURAL_STYLE_CLAUSES.get((style or "").lower())
+        if not clause or not text:
+            return text
+        sep = "" if text.endswith((".", "!", "?")) else "."
+        return f"{text}{sep} The image is {clause}."
 
     def _enhance_prompt(self, prompt: str, style: str) -> Tuple[str, str]:
         """Light style packaging only. Prefer generate_image's auto_enhance path for
@@ -1877,6 +2215,10 @@ Negative Prompt: {negative_prompt}""",
         if not self.service_available:
             result.error = "Image generation service not available - missing dependencies"
             return result
+        fault = self.gpu_fault_message()
+        if fault:
+            result.error = fault
+            return result
 
         with self._generation_lock:
             self._notify_vision_pipeline("start")
@@ -1980,13 +2322,14 @@ Negative Prompt: {negative_prompt}""",
                 # an older build). fp32 CPU inference of a 6B DiT consumes tens of GB
                 # of RAM and locks the desktop — identical symptoms to the GPU crash,
                 # with only one WARNING line as evidence. Fail loud instead.
-                if family in ('zimage', 'krea2') and self._device != "cuda":
+                if family in ('zimage', 'krea2') and self._device not in ("cuda", "mps"):
                     result.error = (
-                        f"CUDA is unavailable/unusable on this box (device="
+                        f"No CUDA or Apple MPS accelerator available (device="
                         f"{self._device}) — refusing to run {family} on CPU (fp32 CPU "
-                        "inference = tens of GB of RAM + desktop lockup). Check that "
-                        "torch.cuda.get_arch_list() includes this GPU's architecture "
-                        "(e.g. sm_120 for RTX 5060 Ti) and install a matching torch."
+                        "inference = tens of GB of RAM + desktop lockup). On Apple "
+                        "Silicon this means torch.backends.mps.is_available() was "
+                        "False; otherwise check that torch.cuda.get_arch_list() "
+                        "includes this GPU's architecture (e.g. sm_120 for RTX 5060 Ti)."
                     )
                     result.generation_time = time.time() - start_time
                     return result
@@ -2078,22 +2421,24 @@ Negative Prompt: {negative_prompt}""",
                         len(enhanced_prompt or ""),
                     )
                 elif text_mode:
-                    # Crisp text/logos need a larger canvas — at 512 the type renders
-                    # as mush. Bump capable models to 1024 when the request is below it
-                    # (within the per-model max already clamped above: 1536 for these).
-                    if family in ("sdxl", "zimage", "krea2") and request.width < 1024 and request.height < 1024:
+                    # Legible type needs a larger canvas than the SD-era 512
+                    # placeholder; a size the caller chose is kept (_text_canvas).
+                    text_w, text_h = self._text_canvas(request.width, request.height, family)
+                    if (text_w, text_h) != (request.width, request.height):
                         logger.info(
-                            f"Text intent: enlarging canvas {request.width}x{request.height} -> 1024x1024 for legible type"
+                            f"Text intent: enlarging canvas {request.width}x{request.height} -> {text_w}x{text_h} for legible type"
                         )
-                        request.width = 1024
-                        request.height = 1024
+                        request.width = text_w
+                        request.height = text_h
                         result.image_size = (request.width, request.height)
                     style_config = self.style_configs.get(
                         request.style, self.style_configs.get("realistic", {})
                     )
                     style_negative = style_config.get("negative_prompt", "") or ""
                     enhanced_prompt = request.prompt
-                    if request.style == "realistic":
+                    if self._prompt_style(family) == "natural":
+                        enhanced_prompt = self._natural_style_prompt(request.prompt, request.style)
+                    elif request.style == "realistic":
                         light_real = "photorealistic, professional photography, natural lighting, sharp focus"
                         if light_real.lower() not in enhanced_prompt.lower():
                             enhanced_prompt = f"{enhanced_prompt}, {light_real}"
@@ -2145,11 +2490,11 @@ Negative Prompt: {negative_prompt}""",
 
                 generator = None
                 if request.seed is not None:
-                    generator = torch.Generator(device=self._device).manual_seed(request.seed)
+                    generator = self._seed_generator(request.seed)
                     result.seed_used = request.seed
                 else:
                     seed = torch.randint(0, 2**32, (1,)).item()
-                    generator = torch.Generator(device=self._device).manual_seed(seed)
+                    generator = self._seed_generator(seed)
                     result.seed_used = seed
 
                 logger.debug(
@@ -2189,6 +2534,28 @@ Negative Prompt: {negative_prompt}""",
                         "tiling, which is unavailable on this pipeline build. Refusing "
                         "the untiled decode (it exhausts GPU+system memory). Retry at "
                         "≤1024×1024 or update diffusers."
+                    )
+                    result.generation_time = time.time() - start_time
+                    return result
+
+                # Same shape of gate for the DENOISE side. The tiling gate above only
+                # covers the VAE decode; the 2026-08-24 OOM was on denoise step 0.
+                # A grouped-query DiT whose attention lands on the math kernel
+                # materializes [1, heads, S, S]: at 2048² that is 51GB, which no
+                # amount of VRAM reclaim can serve. Refuse honestly instead of
+                # burning a full model load per prompt to reach the same OOM.
+                if (
+                    request.width * request.height > 1024 * 1024
+                    and self._uses_grouped_query_attention()
+                    and not getattr(self, "_attention_backend_active", None)
+                ):
+                    result.error = (
+                        f"{request.width}x{request.height} with {family} needs a "
+                        "mask-capable memory-efficient attention backend "
+                        "(cuDNN/efficient/flash); none could be set on this build, so "
+                        "attention would fall back to the quadratic math kernel "
+                        "(~51GB at 2048²). Refusing rather than OOMing. Retry at "
+                        "≤1024×1024 or update torch/diffusers."
                     )
                     result.generation_time = time.time() - start_time
                     return result
@@ -2271,6 +2638,12 @@ Negative Prompt: {negative_prompt}""",
                     result.generation_time = time.time() - start_time
                     return result
                 except (AssertionError, RuntimeError, torch.cuda.OutOfMemoryError) as infer_err:
+                    if is_fatal_cuda_error(infer_err):
+                        # Dead context: no retry, no offload ladder, no unload —
+                        # every one of those is another CUDA call that fails.
+                        result.error = self._mark_gpu_fault(infer_err, "inference")
+                        result.generation_time = time.time() - start_time
+                        return result
                     # torch.compile recovery (SD/SDXL full-GPU path)
                     is_compile_failure = (
                         (isinstance(infer_err, AssertionError) and not str(infer_err))
@@ -2373,12 +2746,12 @@ Negative Prompt: {negative_prompt}""",
                                 try:
                                     # Rebuild generator after OOM (device state may be dirty)
                                     if request.seed is not None:
-                                        generator = torch.Generator(device=self._device).manual_seed(
+                                        generator = self._seed_generator(
                                             request.seed
                                         )
                                     else:
                                         seed = result.seed_used or torch.randint(0, 2**32, (1,)).item()
-                                        generator = torch.Generator(device=self._device).manual_seed(seed)
+                                        generator = self._seed_generator(seed)
                                         result.seed_used = seed
                                     output = _call_pipeline(enhanced_prompt, neg)
                                     logger.info(
@@ -2443,12 +2816,12 @@ Negative Prompt: {negative_prompt}""",
                                     f"OOM fallback model '{fb_key}' failed to load"
                                 ) from infer_err
                             if request.seed is not None:
-                                generator = torch.Generator(device=self._device).manual_seed(
+                                generator = self._seed_generator(
                                     request.seed
                                 )
                             else:
                                 seed = result.seed_used or torch.randint(0, 2**32, (1,)).item()
-                                generator = torch.Generator(device=self._device).manual_seed(seed)
+                                generator = self._seed_generator(seed)
                                 result.seed_used = seed
                             output = _call_pipeline(enhanced_prompt, neg)
                             logger.info(f"OOM fallback to '{fb_key}' succeeded")
@@ -2507,12 +2880,12 @@ Negative Prompt: {negative_prompt}""",
                 # clip-art, logos). Post-process pass; diffusion itself outputs opaque RGB.
                 if getattr(request, "remove_background", False):
                     try:
-                        from rembg import remove as _rembg_remove
-                        image = _rembg_remove(image)  # returns an RGBA PIL image
+                        from backend.services.background_removal import remove_background
+                        image = remove_background(image)  # RGBA; needs an installed pack
                         image.save(image_path, "PNG")  # PNG preserves the alpha channel
-                        logger.info("Transparent background applied (rembg)")
+                        logger.info("Transparent background applied")
                     except Exception as e:
-                        logger.error(f"Background removal failed (rembg): {e}")
+                        logger.error(f"Background removal failed: {e}")
 
                 result.success = True
                 result.image_path = str(image_path)
@@ -2562,8 +2935,11 @@ Negative Prompt: {negative_prompt}""",
 
             except Exception as e:
                 logger.error(f"Image generation failed: {type(e).__name__}: {e}", exc_info=True)
-                error_msg = str(e) or f"{type(e).__name__} (no message)"
-                result.error = f"Generation failed: {error_msg}"
+                if is_fatal_cuda_error(e):
+                    result.error = self._mark_gpu_fault(e, "generation")
+                else:
+                    error_msg = str(e) or f"{type(e).__name__} (no message)"
+                    result.error = f"Generation failed: {error_msg}"
                 result.generation_time = time.time() - start_time
             finally:
                 # Always drop character LoRAs so keep_pipeline_loaded cannot leak identity.
@@ -2881,14 +3257,24 @@ Negative Prompt: {negative_prompt}""",
         if not self.service_available:
             result.error = "Image generation service not available"
             return result
+        fault = self.gpu_fault_message()
+        if fault:
+            result.error = fault
+            return result
 
         with self._generation_lock:
             self._notify_vision_pipeline("start")
+            pipeline_pinned = False
             try:
                 if model in (None, "", "auto"):
                     model = self._auto_select_model(prompt, "realistic")
 
-                model_id = self.available_models.get(model, model)
+                if model not in self.available_models:
+                    # Same catalog rule as txt2img: never resolve an arbitrary
+                    # string into a Hugging Face repo download.
+                    result.error = f"Unknown image model: {model}"
+                    return result
+                model_id = self.available_models[model]
                 family = self._model_family(model_id)
 
                 if family == 'krea2':
@@ -2910,10 +3296,25 @@ Negative Prompt: {negative_prompt}""",
                 from backend.services.image_resolution_limits import clamp_image_dimensions
                 width, height, _ = clamp_image_dimensions(int(width), int(height), family)
 
+                # Priced admission, as for txt2img: book sd:pipeline against the
+                # real card before loading, so a too-large edit is refused as
+                # busy instead of thrashing CUDA.
+                try:
+                    self._ensure_vram_for_pipeline(model_id, width, height)
+                except RuntimeError as admit_err:
+                    result.error = f"GPU busy: {admit_err}"
+                    return result
+
                 # Ensure the base txt2img pipeline is loaded (downloads model if needed)
                 if not self._load_pipeline(model_id):
-                    result.error = f"Failed to load model {model} ({model_id})"
+                    result.error = self._load_failure_reason(model, model_id)
                     return result
+                try:
+                    from backend.services.gpu_memory_orchestrator import get_orchestrator
+                    get_orchestrator().begin_use("sd:pipeline")
+                    pipeline_pinned = True
+                except Exception:
+                    pipeline_pinned = False
 
                 if (
                     self._img2img_pipeline is None
@@ -2938,11 +3339,11 @@ Negative Prompt: {negative_prompt}""",
 
                 generator = None
                 if seed is not None:
-                    generator = torch.Generator(device=self._device).manual_seed(seed)
+                    generator = self._seed_generator(seed)
                     result.seed_used = seed
                 else:
                     seed = torch.randint(0, 2**32, (1,)).item()
-                    generator = torch.Generator(device=self._device).manual_seed(seed)
+                    generator = self._seed_generator(seed)
                     result.seed_used = seed
 
                 combined_negative = negative_prompt or "blurry, low quality, distorted"
@@ -2962,6 +3363,9 @@ Negative Prompt: {negative_prompt}""",
                     guidance_scale=guidance_scale,
                     generator=generator,
                 )
+                _watchdog = self._ram_watchdog_callback()
+                if _watchdog:
+                    call_kwargs["callback_on_step_end"] = _watchdog
 
                 if family == 'zimage':
                     # Z-Image is bf16 flow-matching — no autocast; CFG distilled out.
@@ -3010,6 +3414,12 @@ Negative Prompt: {negative_prompt}""",
                 result.generation_time = time.time() - start_time
             finally:
                 self._notify_vision_pipeline("stop")
+                if pipeline_pinned:
+                    try:
+                        from backend.services.gpu_memory_orchestrator import get_orchestrator
+                        get_orchestrator().end_use("sd:pipeline")
+                    except Exception:
+                        pass
                 if not keep_pipeline_loaded:
                     self._unload_pipeline()
 
@@ -3060,8 +3470,17 @@ Negative Prompt: {negative_prompt}""",
             if downloaded:
                 availability = "ready"
             elif self.is_comfy_only_model(model_key):
-                # Sentinel id — nothing to fetch from HF; assets are installed for Comfy.
-                availability = "unreachable"
+                user_entry = (getattr(self, "user_entries", None) or {}).get(model_key) or {}
+                if user_entry.get("engine") == "comfy" and user_entry.get("role") == "generation":
+                    availability = "downloadable"
+                else:
+                    try:
+                        from backend.services.video_model_registry import VIDEO_MODEL_REGISTRY
+                        availability = (
+                            "downloadable" if model_key in VIDEO_MODEL_REGISTRY else "unreachable"
+                        )
+                    except Exception:
+                        availability = "unreachable"
             elif not probe_remote:
                 availability = "downloadable"
             else:
@@ -3088,6 +3507,11 @@ Negative Prompt: {negative_prompt}""",
                 "engine": meta.get("engine") or (
                     "comfy" if model_key in getattr(self, "comfy_only_models", set()) else "offline"
                 ),
+                # User catalog rows carry their own family, kind and size.
+                "user": bool(meta.get("user")),
+                "family": meta.get("family") or self._model_family(model_key),
+                "kind": meta.get("kind"),
+                "size_gb": meta.get("size_gb"),
             }
 
         return models
@@ -3113,6 +3537,7 @@ Negative Prompt: {negative_prompt}""",
             "device": self._device,
             "cuda_available": torch.cuda.is_available() if diffusion_available else False,
             "current_model": self._current_model,
+            "gpu_fault": self._gpu_fault,
             "models_dir": str(self.models_dir),
             "cache_dir": str(self.cache_dir),
             "available_models": self.get_available_models(),

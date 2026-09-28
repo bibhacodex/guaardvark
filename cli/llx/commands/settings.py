@@ -22,6 +22,7 @@ def settings_list(
         KNOWN_KEYS = [
             "web_access", "advanced_debug", "llm_debug",
             "behavior_learning", "rag_debug", "music_directory",
+            "chat_thinking_default",
         ]
         settings = {}
         for key in KNOWN_KEYS:

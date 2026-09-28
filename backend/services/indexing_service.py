@@ -1,10 +1,14 @@
 
 import datetime
+import gc
 import json
+import hashlib
 import logging
+import re
 import os
 import time
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
@@ -12,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 from backend.utils.experiment_context import get_experiment_config, get_active_rag_params
 import backend.utils.llama_index_local_config
+from backend.utils.path_guard import PathEscapesRoot, contained, contained_path
 
 # Per edge-portability audit: remove unconditional CUDA_VISIBLE_DEVICES at
 # import time (causes "device 0 does not exist" on CPU/ARM boxes). Only set
@@ -114,7 +119,7 @@ def _lazy_load_llamaindex():
         logger.error(f"Failed to load LlamaIndex components: {e}")
         raise
 
-SimpleVectorStore = None  # Reality per RAG audit/lead: vector store is in-memory SimpleVectorStore (JSON persisted), NOT pgvector/LlamaIndex+pgvector (old docs/architecture claims stale; see backup_service comments and unified_index_manager).
+SimpleVectorStore = None  # Fallback store (JSON, in-memory) used when GUAARDVARK_VECTOR_STORE=simple. The default backend is pgvector — see _make_vector_store and docs/ARCHITECTURE.md.
 PDFReaderClass = None
 
 def _lazy_load_optional_components():
@@ -154,6 +159,81 @@ storage_context: Optional[StorageContext] = None
 
 _index_operation_lock = threading.RLock()
 
+# --- ingest phase timing --------------------------------------------------
+# Half of a measured 93-minute ingest could not be attributed to any phase: the
+# only timestamps available -- progress events and `indexed_at` -- do not bracket
+# parsing, and they miss the gap between documents entirely. Optimising against a
+# model that explains half the clock is guesswork, so the pipeline times itself.
+#
+# Timings are kept in module state rather than logged, because application logging
+# defaults to WARNING (BACKEND_LOG_LEVEL) and a routine measurement is not a
+# warning. A benchmark harness runs in-process and reads them directly.
+_LAST_PHASE_TIMINGS: Dict[str, Any] = {}
+
+
+
+# A full gc.collect() costs roughly 250 ms in this process: the heap holds
+# LlamaIndex, torch and a resident model, so the collector walks a very large
+# object graph. Two unconditional calls per document made that the single largest
+# fixed cost of ingesting a small file -- measured at 0.49 s of a 0.50 s document,
+# dwarfing parsing, chunking and the embedding itself.
+#
+# Python collects cycles on its own; these calls exist for the large transient
+# objects a big file leaves behind. So run them when that is actually the case,
+# and otherwise amortise across a batch.
+_GC_EVERY_N_DOCS = int(os.environ.get("GUAARDVARK_INDEX_GC_EVERY", "25"))
+_GC_LARGE_FILE_MB = float(os.environ.get("GUAARDVARK_INDEX_GC_LARGE_MB", "1.0"))
+_docs_since_gc = 0
+
+
+def _maybe_collect(file_size_mb: float = 0.0) -> None:
+    """Collect after a large file, or once every _GC_EVERY_N_DOCS documents."""
+    global _docs_since_gc
+    _docs_since_gc += 1
+    if file_size_mb > _GC_LARGE_FILE_MB or _docs_since_gc >= _GC_EVERY_N_DOCS:
+        _docs_since_gc = 0
+        gc.collect()
+
+
+@contextmanager
+def _phase(name: str, into: Dict[str, float]):
+    """Accumulate wall-clock milliseconds for one ingest phase."""
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        into[name] = into.get(name, 0.0) + (time.perf_counter() - t0) * 1000.0
+
+
+def get_last_phase_timings() -> Dict[str, Any]:
+    """Phase timings for the most recently indexed document."""
+    return dict(_LAST_PHASE_TIMINGS)
+
+
+class _EmbedClock:
+    """Separates embedding time from vector-store time inside `insert_nodes`.
+
+    LlamaIndex emits embedding start/end events around the model call, so
+    subscribing is enough to split the two -- no monkeypatching, and it keeps
+    working if the insert path changes underneath.
+    """
+
+    def __init__(self):
+        self.ms = 0.0
+        self.calls = 0
+        self._starts = {}
+
+    def handle(self, event):
+        name = type(event).__name__
+        if name == "EmbeddingStartEvent":
+            self._starts[getattr(event, "span_id", None)] = time.perf_counter()
+        elif name == "EmbeddingEndEvent":
+            t0 = self._starts.pop(getattr(event, "span_id", None), None)
+            if t0 is not None:
+                self.ms += (time.perf_counter() - t0) * 1000.0
+                self.calls += 1
+
+
 # BM25 retriever cache. BM25Retriever.from_defaults() re-tokenizes the ENTIRE docstore, so
 # rebuilding it on every query is expensive. Cache keyed on (id(docstore), doc_count):
 # id(docstore) changes on reindex/reload, doc_count changes on in-place insert_nodes() — so
@@ -162,12 +242,268 @@ _index_operation_lock = threading.RLock()
 _bm25_cache: dict = {}  # id(docstore) -> {"doc_count": int, "top_k": int, "retriever": BM25Retriever}
 
 
+
+
+
+# Set when an index load failed and we are serving an empty in-memory index to
+# keep chat alive. Every persist checks it: writing that empty state to disk is
+# how a transient read failure became permanent deletion, and an ingest arriving
+# afterwards would do exactly that on the failure path's behalf.
+_index_load_failed = False
+
+
+def _safe_persist(ctx, persist_dir: str) -> bool:
+    """Persist unless we are holding a placeholder index. Returns whether it wrote."""
+    if _index_load_failed:
+        logger.warning(
+            "Skipping persist to %s: the loaded index is an empty placeholder after a "
+            "failed load, and writing it would overwrite the real store.", persist_dir,
+        )
+        return False
+    ctx.persist(persist_dir=persist_dir)
+    return True
+
+
+def _needs_docstore_nodes(vstore) -> bool:
+    """Whether the docstore must hold node copies for retrieval to work.
+
+    `store_nodes_override=True` mirrors every node into a SimpleDocumentStore, and
+    that docstore is what `storage_context.persist()` rewrites -- in full, as JSON,
+    on every ingested document. On a file-backed store it is not optional: BM25
+    reads from it, and SimpleVectorStore does not keep text.
+
+    With pgvector it is pure cost. The rows already carry their text and a tsvector,
+    the keyword leg reads them straight from SQL, and the mirror only exists to be
+    serialised again. Returning False here is what stops the per-document rewrite
+    from growing with the corpus.
+    """
+    return type(vstore).__name__ != "PGVectorStore"
+
+
+class PostgresSparseRetriever:
+    """Keyword retrieval straight from Postgres, replacing BM25 over the docstore.
+
+    BM25Retriever reads a `SimpleDocumentStore`, which only holds nodes because
+    `store_nodes_override=True` keeps it populated -- and keeping it populated is
+    what forced a full rewrite of a JSON file on every ingested document. Postgres
+    already maintains a `tsvector` column and a GIN index over the same rows
+    (PGVectorStore is created with hybrid_search=True), so the keyword leg can be
+    served from there and the docstore can go.
+
+    Two deliberate choices about the SQL:
+
+    `websearch_to_tsquery` rather than llama-index's own sparse path, which
+    OR-joins every term and then ranks every match. On a large corpus an OR over
+    common words matches a large fraction of the table, and `ORDER BY rank LIMIT k`
+    has to score all of it. websearch_to_tsquery is AND-by-default and understands
+    quoted phrases, so the candidate set stays small.
+
+    `ts_rank_cd` with normalisation 34 -- that is 2 (divide by document length)
+    combined with 32 (rank / (rank + 1)). The length term is the important half and
+    was found the hard way: without it, a short chunk holding the answer ranks below
+    eight longer near-identical siblings that mention the same words more often, and
+    a planted fact inside a code block dropped out of the results entirely. Length
+    normalisation is one of the things BM25 does for free; bare cover-density
+    ranking does not. This is still not BM25 -- there is no IDF saturation and no
+    k1/b -- but fusion min-max normalises each leg independently, so only the
+    ordering matters, not the scale.
+
+    Unlike BM25Retriever this can filter, so project scoping happens in SQL rather
+    than by over-fetching and discarding afterwards.
+    """
+
+    def __init__(self, table: str, top_k: int = 10, filters: Optional[Dict[str, Any]] = None):
+        self.table = table
+        self.top_k = top_k
+        self.filters = filters or {}
+
+    # Terms too common to be worth OR-ing over a large corpus; an OR containing one
+    # of these matches most of the table and makes the ranking do all the work.
+    _STOPISH = frozenset("""a an and are as at be by for from has have how in is it
+        its of on or that the this to was what when where which who why with""".split())
+
+    def _terms(self, query: str) -> List[str]:
+        seen, out = set(), []
+        for t in re.findall(r"[A-Za-z0-9_]{2,}", query.lower()):
+            if t not in self._STOPISH and t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out[:12]
+
+    def _rarest(self, terms: List[str], keep: int = 4) -> List[str]:
+        """Order terms by how few chunks contain them, keeping the rarest.
+
+        `ts_rank_cd` has no IDF: a match on a word in 836 chunks scores like a
+        match on one in 14. Broadening a question to an OR therefore lets chunks
+        stuffed with common words outrank the single chunk holding the
+        distinctive term the user actually asked about -- measured on this corpus,
+        "Meridian Protocol" (14 chunks) lost to "date" (836).
+
+        Postgres cannot weight query terms, so rarity is applied by selection
+        instead: count each term once against the GIN index, then keep only the
+        most selective. Cheap -- a handful of index-only counts -- and it turns an
+        OR over everything into an OR over the words that carry the meaning.
+        """
+        if len(terms) <= keep:
+            return terms
+        try:
+            conn = _pg_connect()
+            try:
+                freqs = {}
+                from psycopg2 import sql as pgsql
+                count_stmt = pgsql.SQL(
+                    "SELECT count(*) FROM {} WHERE text_search_tsv @@ to_tsquery('english', %s)"
+                ).format(pgsql.Identifier(f"data_{self.table}"))
+                with conn.cursor() as cur:
+                    for t in terms:
+                        cur.execute(count_stmt, (t,))
+                        freqs[t] = cur.fetchone()[0]
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug("Term-rarity lookup failed (%s); using query order", e)
+            return terms[:keep]
+        # Terms nothing matches are useless too; rank present-but-rare first.
+        ranked = sorted((t for t in terms if freqs.get(t, 0) > 0), key=lambda t: freqs[t])
+        return ranked[:keep] or terms[:keep]
+
+    def _tsquery_or(self, query: str) -> Optional[str]:
+        """An OR over the most selective terms, or None if nothing is left."""
+        return " | ".join(self._rarest(self._terms(query))) or None
+
+    def _run(self, match_sql: str, match_arg: str):
+        where = [match_sql]
+        # Placeholder order must match the statement below: the rank expression in
+        # the SELECT, then the match in the WHERE, then any filters, then the limit.
+        params: List[Any] = [match_arg, match_arg]
+        for key, value in self.filters.items():
+            where.append("metadata_->>%s = %s")
+            params.extend([key, str(value)])
+        params.append(self.top_k)
+        rank_fn = match_sql.split(" @@ ")[1].replace("%s", "%s")
+        from psycopg2 import sql as pgsql
+        # The table name is the one non-parameter piece; it goes through
+        # Identifier so it is quoted as an identifier, never spliced as text.
+        stmt = pgsql.SQL(
+            "SELECT node_id, text, metadata_, "
+            f"ts_rank_cd(text_search_tsv, {rank_fn}, 34) AS rank "
+            "FROM {} WHERE " + " AND ".join(where) +
+            " ORDER BY rank DESC LIMIT %s"
+        ).format(pgsql.Identifier(f"data_{self.table}"))
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(stmt, params)
+                return cur.fetchall()
+        finally:
+            conn.close()
+
+    def _rows(self, query: str):
+        """Precise first; broaden only when nothing matched at all.
+
+        websearch_to_tsquery is AND-by-default, which is the right default at scale:
+        an OR over common words matches a large fraction of the table and forces the
+        ranker to score all of it.
+
+        Broadening to an OR looks like an obvious improvement -- it turns one hit into
+        eight -- and measurably makes retrieval worse. The vector leg already supplies
+        recall; what fusion needs from the keyword leg is precision. Eight loosely
+        matched chunks crowd out the one the vector leg ranked correctly, and on the
+        validation corpus that cost a planted fact that had been returned at rank 1
+        (a value inside a code block, whose near-identical sibling chunks all score
+        similarly on the broadened query).
+
+        So the OR is a fallback for "no keyword match at all", not a way to fill the
+        result list.
+        """
+        rows = self._run("text_search_tsv @@ websearch_to_tsquery('english', %s)", query)
+        if rows:
+            return rows
+        or_query = self._tsquery_or(query)
+        if not or_query:
+            return rows
+        try:
+            broadened = self._run("text_search_tsv @@ to_tsquery('english', %s)", or_query)
+        except Exception as e:
+            logger.debug("Sparse OR broadening failed (%s); keeping strict results", e)
+            return rows
+        # Prefer the broader set only if it genuinely found more.
+        return broadened if len(broadened) > len(rows) else rows
+
+    def retrieve(self, query) -> List[Any]:
+        from llama_index.core.schema import NodeWithScore, TextNode
+        text = query if isinstance(query, str) else getattr(query, "query_str", str(query))
+        if not (text or "").strip():
+            return []
+        try:
+            rows = self._rows(text)
+        except Exception as e:
+            logger.warning("Sparse (postgres) retrieval failed: %s", e)
+            return []
+        out = []
+        for node_id, node_text, meta, rank in rows:
+            meta = meta if isinstance(meta, dict) else (json.loads(meta) if meta else {})
+            meta.pop("_node_content", None)
+            meta.pop("_node_type", None)
+            out.append(NodeWithScore(
+                node=TextNode(id_=node_id, text=node_text or "", metadata=meta),
+                score=float(rank or 0.0),
+            ))
+        return out
+
+    # QueryFusionRetriever calls both of these.
+    def _retrieve(self, query) -> List[Any]:
+        return self.retrieve(query)
+
+    async def _aretrieve(self, query) -> List[Any]:
+        return self.retrieve(query)
+
+    async def aretrieve(self, query) -> List[Any]:
+        return self.retrieve(query)
+
+
+
+def _get_sparse_retriever(storage_ctx, top_k: int, project_id=None, profile: Optional[str] = None):
+    """The keyword leg: Postgres full-text when available, BM25 as the fallback.
+
+    Returns None when neither can serve, which the caller treats as "vector only"
+    and records in the trace -- a silently missing leg would look like a relevance
+    regression rather than a missing retriever.
+    """
+    table = None
+    try:
+        table = resolve_existing_vector_table(project_id, profile)
+    except Exception:
+        table = None
+    if table:
+        # No project filter here on purpose. `resolve_existing_vector_table`
+        # already returns that project's own table -- scope is enforced by which
+        # table is read, not by a column -- so filtering again inside it adds no
+        # isolation and silently drops any node that does not carry the key.
+        # RAPTOR summaries are exactly such nodes, so the filter made corpus-level
+        # answers disappear from project-scoped questions.
+        return PostgresSparseRetriever(table, top_k=top_k)
+
+    # File-backed store: fall back to the docstore-driven BM25.
+    try:
+        return _get_cached_bm25_retriever(storage_ctx.docstore, top_k)
+    except Exception:
+        return None
+
+
 def _get_cached_bm25_retriever(docstore, similarity_top_k: int):
     """Return a cached BM25Retriever for this docstore, rebuilding only when the docstore
     object identity or its document count changes. Returns None if BM25 is unavailable."""
     try:
         from llama_index.retrievers.bm25 import BM25Retriever
-    except ImportError:
+    except Exception as e:
+        # Not just ImportError: bm25s imports jax at module scope and guards only
+        # (ImportError, RuntimeError), so a jax/numpy ABI mismatch surfaces here as
+        # AttributeError. Catching narrowly is how hybrid search died unnoticed.
+        logger.warning(
+            "BM25 unavailable (%s: %s) — hybrid search will degrade to vector-only",
+            e.__class__.__name__, str(e)[:160],
+        )
         return None
     try:
         doc_count = len(getattr(docstore, "docs", {}) or {})
@@ -207,8 +543,11 @@ def _adaptive_alpha(query: str, base_alpha: float) -> float:
 
 def _mmr_rerank(results: list, top_k: int = 8, lambda_: float = 0.7) -> list:
     """CPU-only MMR reranker over the already-retrieved top candidates. Balances relevance
-    (retrieval score) against diversity (token-Jaccard overlap) to demote near-redundant
-    chunks. Zero VRAM, no model — safe on CPU/Pi. On any failure returns `results` as-is."""
+    against diversity (token-Jaccard overlap) to demote near-redundant chunks. Zero VRAM,
+    no model — safe on CPU/Pi. On any failure returns `results` as-is.
+
+    Relevance is the cross-encoder score when one is present, else the retrieval score:
+    ranking on the weaker signal would silently undo the reranker that just ran."""
     try:
         if not results or len(results) <= 2:
             return results
@@ -216,7 +555,15 @@ def _mmr_rerank(results: list, top_k: int = 8, lambda_: float = 0.7) -> list:
         working = results[:top_k]
         tail = results[top_k:]
 
-        scores = [float(r.get("score", 0.0) or 0.0) if isinstance(r, dict) else 0.0 for r in working]
+        def _rel_score(r):
+            if not isinstance(r, dict):
+                return 0.0
+            v = r.get("rerank_score")
+            if v is None:
+                v = r.get("score", 0.0)
+            return float(v or 0.0)
+
+        scores = [_rel_score(r) for r in working]
         lo, hi = min(scores), max(scores)
         span = (hi - lo) or 1.0
         rel = [(s - lo) / span for s in scores]  # normalize relevance to [0,1]
@@ -320,8 +667,541 @@ def _persist_dir_for(project_id=None) -> str:
     index_mode = os.getenv("GUAARDVARK_PROJECT_INDEX_MODE", PROJECT_INDEX_MODE)
     index_root = os.getenv("GUAARDVARK_INDEX_ROOT", INDEX_ROOT)
     if index_mode == "per_project" and project_id:
-        return os.path.join(index_root, str(project_id))
+        return contained_path(index_root, str(project_id))
     return index_root
+
+
+_embed_dim_cache: Dict[str, int] = {}
+_embed_sync_gave_up: Optional[str] = None
+
+
+def _sync_embed_model(model: Optional[str] = None) -> None:
+    """Rebuild the embedding client when Settings chose a different model.
+
+    A Celery worker keeps the client it built when it started. After a switch in
+    Settings it would go on embedding with the old model into the old width's
+    table while chat searched the new one. The web server swaps its own client
+    in the switch route, so there this is a no-op.
+    """
+    global index, storage_context, _embed_sync_gave_up
+    try:
+        if model is None:
+            from backend.config import get_active_embedding_model
+            model = get_active_embedding_model()
+        if not model or model == _embed_sync_gave_up:
+            return
+        from llama_index.core import Settings as _LISettings
+        current = getattr(getattr(_LISettings, "embed_model", None), "model_name", None)
+        if current == model:
+            return
+        from backend.utils.llm_service import get_default_embed_model
+        client = get_default_embed_model()
+        if getattr(client, "model_name", None) != model:
+            _embed_sync_gave_up = model
+            logger.warning(
+                "Embedding client for %s came back as %s; keeping %s",
+                model, getattr(client, "model_name", None), current,
+            )
+            return
+        _LISettings.embed_model = client
+        index = None
+        storage_context = None
+        try:
+            from flask import current_app, has_app_context
+            if has_app_context():
+                current_app.config.pop("INDEX_CACHE", None)
+                current_app.config["LLAMA_INDEX_EMBED_MODEL"] = client
+        except Exception:
+            pass
+        logger.info(
+            "Embedding model is %s (this process had %s): client rebuilt, index handle reset",
+            model, current,
+        )
+    except Exception as e:
+        logger.warning("Could not bring the embedding client in line with %s: %s", model, e)
+
+
+def _active_embed_dim() -> Optional[int]:
+    """Embedding width of the active model, probed once per model and cached.
+
+    pgvector bakes the dimension into the column type, so this has to be known
+    before the table exists. Probing beats a hardcoded map: the operator can point
+    the system at any Ollama embedding model.
+    """
+    override = os.environ.get("GUAARDVARK_EMBEDDING_DIM", "").strip()
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            logger.warning("GUAARDVARK_EMBEDDING_DIM=%r is not an integer; ignoring", override)
+    try:
+        from backend.config import get_active_embedding_model
+        model = get_active_embedding_model()
+    except Exception:
+        model = "unknown"
+    if model in _embed_dim_cache:
+        return _embed_dim_cache[model]
+    # Probe the client that will actually embed, and only once it is the chosen model;
+    # probing a stale client cached the old width under the new model's name.
+    if model != "unknown":
+        _sync_embed_model(model)
+    try:
+        from llama_index.core import Settings
+        embed_model = getattr(Settings, "embed_model", None)
+        if embed_model is None:
+            return None
+        dim = len(embed_model.get_query_embedding("dimension probe"))
+        if getattr(embed_model, "model_name", model) == model:
+            _embed_dim_cache[model] = dim
+        logger.info("Embedding dimension for %s: %d", model, dim)
+        return dim
+    except Exception as e:
+        logger.warning("Could not probe embedding dimension: %s", e)
+        return None
+
+
+def _vector_backend() -> str:
+    return os.environ.get("GUAARDVARK_VECTOR_STORE", "pgvector").lower()
+
+
+def _test_table_prefix() -> str:
+    """Scope prefix that keeps a test run out of the real vector tables.
+
+    Tests give the ORM its own database, so `Document.id` restarts at 1 while the
+    vector store still resolves `DATABASE_URL` from `backend.config` directly.
+    `add_file_to_index` purges by document id before inserting, so a test
+    indexing its first document deletes the real document 1's vectors. Scoping
+    the table name is the one place that closes every such path at once.
+    """
+    if os.environ.get("GUAARDVARK_MODE") == "test":
+        return "test_"
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return "test_"
+    return ""
+
+
+def _pg_table_name(project_id=None, profile: Optional[str] = None) -> Optional[str]:
+    """Per (profile, scope, dimension) table.
+
+    Putting the dimension in the name means switching embedding models lands in a
+    different table instead of contaminating an existing one -- the failure the
+    name-based dimension lock and _sanitize_vector_store_dimensions exist to paper
+    over on the JSON store. The profile makes each projection its own table, so
+    two profiles over the same corpus cannot read each other's vectors.
+
+    The default profile resolves to the bare scope, so an installation that never
+    touches profiles keeps the table name it already has.
+    """
+    dim = _active_embed_dim()
+    if not dim:
+        return None
+    try:
+        from backend.services.index_profiles import projection_key
+        scope = projection_key(profile, project_id)
+    except Exception:
+        scope = str(project_id) if project_id else "global"
+    scope = re.sub(r"[^A-Za-z0-9_]", "_", scope)[:60]
+    return f"guaardvark_{_test_table_prefix()}{scope}_{dim}"
+
+
+# Set when the configured vector store could not be built and an EMPTY in-memory
+# store was substituted. Retrieval still answers in that state, which is the whole
+# danger: every result looks normal while the real index is not being consulted.
+# Read by search_with_llamaindex so the trace says so.
+_vector_store_fallback_reason: Optional[str] = None
+# Latch so the warning below is emitted once per process, not per query.
+_fallback_warned = False
+
+
+def vector_store_fallback_reason() -> Optional[str]:
+    """Why the configured vector store is not in use, or None when it is."""
+    return _vector_store_fallback_reason
+
+
+def _fall_back_to_simple(reason: str):
+    global _vector_store_fallback_reason
+    _vector_store_fallback_reason = reason
+    logger.warning(
+        "pgvector requested but %s — using an EMPTY SimpleVectorStore; "
+        "the persisted index will NOT be consulted", reason,
+    )
+    return SimpleVectorStore() if SimpleVectorStore else None
+
+
+def _make_vector_store(project_id=None, profile: Optional[str] = None):
+    """Build the configured vector store. Returns None to mean 'use the default'."""
+    global _vector_store_fallback_reason
+    backend = _vector_backend()
+    if backend != "pgvector":
+        _vector_store_fallback_reason = None
+        return SimpleVectorStore() if SimpleVectorStore else None
+
+    table = _pg_table_name(project_id, profile)
+    dim = _active_embed_dim()
+    if not table or not dim:
+        return _fall_back_to_simple(
+            "the embedding dimension is unknown (embedding backend unreachable? "
+            "set GUAARDVARK_EMBEDDING_DIM to pin it)"
+        )
+
+    try:
+        from llama_index.vector_stores.postgres import PGVectorStore
+        from backend.config import DATABASE_URL
+        m = re.match(r"postgresql(?:\+\w+)?://([^:]+):([^@]+)@([^:/]+):(\d+)/(.+)", DATABASE_URL)
+        if not m:
+            raise ValueError("DATABASE_URL is not a parseable postgresql:// URL")
+        user, password, host, port, database = m.groups()
+        store = PGVectorStore.from_params(
+            host=host, port=port, database=database, user=user, password=password,
+            table_name=table,
+            embed_dim=dim,
+            hybrid_search=True,
+            text_search_config="english",
+            # pgvector's hnsw index rejects vector columns above 2000 dimensions.
+            # halfvec (16-bit) raises the ceiling to 4000 and indexes fine at 2560.
+            # The precision loss is immaterial for cosine ranking; being unindexed
+            # is not -- it would mean a sequential scan of every row per query.
+            use_halfvec=(dim > 2000),
+            hnsw_kwargs={
+                "hnsw_m": 16,
+                "hnsw_ef_construction": 64,
+                "hnsw_ef_search": 40,
+                # halfvec columns need the halfvec opclass; the vector one is rejected.
+                "hnsw_dist_method": "halfvec_cosine_ops" if dim > 2000 else "vector_cosine_ops",
+            },
+        )
+        logger.info("Vector store: pgvector table data_%s (dim=%d)", table, dim)
+        _ensure_document_id_index(table)
+        _vector_store_fallback_reason = None
+        return store
+    except Exception as e:
+        return _fall_back_to_simple(
+            f"it is unavailable ({e.__class__.__name__}: {str(e)[:180]})"
+        )
+
+
+
+def _ensure_document_id_index(table: str) -> None:
+    """Index the document_id prefix that re-indexing deletes by.
+
+    Re-indexing a document first removes its existing vectors, matching
+    `metadata_->>'document_id' LIKE 'doc\\_<id>\\_%'`. PGVectorStore builds an
+    HNSW index on the embedding and a GIN index on the text, but nothing on that
+    expression, so the delete was a sequential scan of the whole table -- and
+    because `metadata_` is large enough to be TOASTed, every row had to be
+    detoasted to evaluate it. Measured at 55,844 rows: 591 ms per document, and
+    growing linearly, so the cost of ingesting one document rose with the size of
+    the corpus already ingested.
+
+    `text_pattern_ops` is required: on a non-C collation the default operator
+    class cannot serve a prefix LIKE. Created here so a fresh install gets it
+    without a migration step; IF NOT EXISTS makes it idempotent.
+    """
+    from psycopg2 import sql as pgsql
+    ddl = pgsql.SQL(
+        "CREATE INDEX IF NOT EXISTS {} ON {} ((metadata_->>'document_id') text_pattern_ops)"
+    ).format(pgsql.Identifier(f"{table}_docid_prefix"), pgsql.Identifier(f"data_{table}"))
+    try:
+        conn = _pg_connect()
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(ddl)
+        finally:
+            conn.close()
+    except Exception as e:
+        # Not fatal: without it re-indexing is slower, not wrong.
+        logger.warning("Could not ensure document_id index on data_%s: %s", table, e)
+
+
+def _pg_connect():
+    from backend.config import DATABASE_URL
+    m = re.match(r"postgresql(?:\+\w+)?://([^:]+):([^@]+)@([^:/]+):(\d+)/(.+)", DATABASE_URL)
+    if not m:
+        raise ValueError("DATABASE_URL is not a parseable postgresql:// URL")
+    import psycopg2
+    user, password, host, port, database = m.groups()
+    return psycopg2.connect(host=host, port=port, dbname=database, user=user, password=password)
+
+
+class PurgeResult(int):
+    """Rows removed by `purge_document_vectors`, and why when that is zero.
+
+    Five conditions used to come back as a bare 0 -- no pgvector, no document id,
+    no table, a failed DELETE, and a genuine "nothing to purge" -- and the callers
+    that delete or re-index a document could not tell "already clean" from "the
+    old copy is still there". This is an int so the callers that sum or
+    truth-test the count keep working; `reason` is None when the DELETE ran (so a
+    zero means nothing was there) and names the condition when it did not.
+    """
+
+    reason: Optional[str]
+
+    def __new__(cls, removed: int = 0, reason: Optional[str] = None):
+        obj = int.__new__(cls, removed)
+        obj.reason = reason
+        return obj
+
+    @property
+    def ok(self) -> bool:
+        """Whether the purge actually ran, whatever it removed."""
+        return self.reason is None
+
+    def __repr__(self) -> str:
+        return f"PurgeResult({int(self)}, reason={self.reason!r})"
+
+
+def purge_document_vectors(document_id, project_id=None, profile: Optional[str] = None) -> PurgeResult:
+    """Remove a document's existing vectors before re-indexing it.
+
+    Returns a `PurgeResult`: the rows removed, with `reason` set when no DELETE
+    ran (`not_pgvector`, `no_document_id`, `no_table`, or `error: ...`). A plain
+    zero with no reason means the table was checked and held nothing for this id.
+
+    The JSON store kept embeddings in a dict keyed by node id, so re-indexing a file
+    overwrote its nodes in place. pgvector does not: `add()` INSERTs, so every
+    re-index appended a second full copy of the document. Measured before this
+    existed: 74,451 rows for 30,945 distinct nodes -- 58% of the index was
+    duplicates, one chunk stored 135 times -- which inflates storage, slows every
+    query, and lets one passage occupy several of the caller's result slots.
+
+    Deletes by the `document_id` metadata stamped on every node at ingest, which
+    covers all of a file's parsed documents at once (a PDF contributes one per page).
+    """
+    if _vector_backend() != "pgvector":
+        return PurgeResult(0, "not_pgvector")
+    if document_id is None:
+        return PurgeResult(0, "no_document_id")
+    table = _pg_table_name(project_id, profile)
+    if not table:
+        return PurgeResult(0, "no_table")
+    # The stored key is the LlamaIndex document id, `doc_<db_id>_<content_hash>` --
+    # NOT the bare database id. One file yields several of them (a PDF contributes
+    # one per page), and the hash changes whenever the file's content changes, which
+    # is exactly when a re-index happens. So match the `doc_<db_id>_` prefix rather
+    # than an exact id, or a re-index of edited content leaves the old copy behind.
+    #
+    # The underscores must be escaped: `_` is a LIKE wildcard, so an unescaped
+    # `doc_2216_%` would also match `doc_22160_...` and delete another document's
+    # vectors.
+    pattern = "doc\\_{}\\_%".format(str(document_id).replace("\\", "\\\\"))
+    try:
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f'DELETE FROM "data_{table}" '
+                    f'WHERE metadata_->>\'document_id\' LIKE %s ESCAPE \'\\\'',
+                    (pattern,),
+                )
+                removed = cur.rowcount or 0
+            conn.commit()
+        finally:
+            conn.close()
+        if removed:
+            logger.info("Re-index: removed %d existing vector(s) for document %s",
+                        removed, document_id)
+        return PurgeResult(removed)
+    except Exception as e:
+        logger.warning("Could not purge existing vectors for document %s: %s", document_id, e)
+        return PurgeResult(0, f"error: {e.__class__.__name__}: {str(e)[:200]}")
+
+
+def resolve_existing_vector_table(project_id=None, profile: Optional[str] = None) -> Optional[str]:
+    """Name of the vector table for a scope, WITHOUT needing an embedding model.
+
+    `_pg_table_name` derives the name from the active model's dimension, which
+    means probing the model. That is fine inside the app, but the MCP server runs
+    as a bare subprocess with no Flask context and no initialised index, so the
+    probe returns None and every read-only knowledge tool fails on an interface
+    built specifically for MCP.
+
+    The dimension is already encoded in the table name, so an existing table can
+    simply be looked up. Falls back to the derived name when nothing is found, so
+    a first-run caller still gets the table it is about to create.
+    """
+    try:
+        derived = _pg_table_name(project_id, profile)
+    except Exception:
+        derived = None
+    if derived:
+        return derived
+    if _vector_backend() != "pgvector":
+        return None
+
+    try:
+        from backend.services.index_profiles import projection_key
+        scope = projection_key(profile, project_id)
+    except Exception:
+        scope = str(project_id) if project_id else "global"
+    scope = re.sub(r"[^A-Za-z0-9_]", "_", scope)[:60]
+
+    try:
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                # Escaped: `_` is a LIKE wildcard and the scope contains them.
+                cur.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema='public' AND table_name LIKE %s ESCAPE '\\' "
+                    "ORDER BY table_name",
+                    ("data\\_guaardvark\\_" + scope.replace("_", "\\_") + "\\_%",),
+                )
+                rows = [r[0] for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.debug("vector table discovery failed: %s", e)
+        return None
+
+    if not rows:
+        return None
+    # Strip the "data_" prefix the store adds, to match _pg_table_name's contract.
+    return rows[0][len("data_"):] if rows[0].startswith("data_") else rows[0]
+
+
+def drop_vector_store(project_id=None, profile: Optional[str] = None) -> Dict[str, Any]:
+    """Drop the backing vector table for a scope.
+
+    Resetting the index used to mean deleting JSON files. With the vectors in
+    Postgres that would leave every embedding orphaned while the index looked
+    empty, so the reset path has to reach the database too.
+    """
+    if _vector_backend() != "pgvector":
+        return {"backend": "simple", "dropped": False}
+    table = _pg_table_name(project_id, profile)
+    if not table:
+        return {"backend": "pgvector", "dropped": False, "error": "dimension unknown"}
+    full = f"data_{table}"
+    try:
+        conn = _pg_connect()
+        try:
+            from psycopg2 import sql as pgsql
+            with conn.cursor() as cur:
+                cur.execute(pgsql.SQL("DROP TABLE IF EXISTS {}").format(pgsql.Identifier(full)))
+            conn.commit()
+        finally:
+            conn.close()
+        logger.info("Dropped vector table %s", full)
+        return {"backend": "pgvector", "dropped": True, "table": full}
+    except Exception as e:
+        logger.error("Failed dropping vector table %s: %s", full, e)
+        return {"backend": "pgvector", "dropped": False, "table": full, "error": str(e)[:200]}
+
+
+
+def drop_all_vector_stores() -> Dict[str, Any]:
+    """Drop every vector table this installation owns, whatever its scope or dimension.
+
+    `drop_vector_store` derives one table name from the *active* embedding
+    dimension, which is the wrong tool for a reset. Changing the embedding model
+    is the main reason to reset at all, and after that change the derived name
+    points at the NEW table -- so the old vectors, in the old dimension, would be
+    left behind untouched while the UI reported the index cleared. Same for any
+    per-project or per-profile table the scope in hand does not name.
+
+    Matches on the storage layer's own prefix rather than a guessed list, so a
+    table created by a scope this process has never seen is still removed.
+    """
+    if _vector_backend() != "pgvector":
+        return {"backend": "simple", "dropped": []}
+    dropped, failed = [], []
+    try:
+        conn = _pg_connect()
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT tablename FROM pg_tables "
+                    "WHERE schemaname = current_schema() AND tablename LIKE %s",
+                    ("data_guaardvark%",),
+                )
+                tables = [r[0] for r in cur.fetchall()]
+                for t in tables:
+                    try:
+                        cur.execute(f'DROP TABLE IF EXISTS "{t}" CASCADE')
+                        dropped.append(t)
+                    except Exception as e:  # noqa: BLE001
+                        failed.append({"table": t, "error": str(e)[:160]})
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("Could not enumerate vector tables to drop: %s", e)
+        return {"backend": "pgvector", "dropped": dropped, "error": str(e)[:200]}
+    logger.info("Dropped %d vector table(s): %s", len(dropped), ", ".join(dropped) or "none")
+    return {"backend": "pgvector", "dropped": dropped, "failed": failed}
+
+
+
+def find_orphaned_vectors(project_id=None, profile: Optional[str] = None,
+                          delete: bool = False) -> Dict[str, Any]:
+    """Vectors whose owning Document row is gone. Counts, or removes when asked.
+
+    Only file-derived nodes are candidates. Their ids are `doc_<document_id>_<hash>`,
+    so a row is an orphan when that embedded id no longer exists in `documents`.
+
+    Everything else is deliberately out of scope, because plenty of legitimate
+    content has no Document row at all: RAPTOR summaries, entity and repository
+    summaries, client and project metadata. An anti-join against `documents`
+    would call all of it orphaned and delete it, which is a far worse outcome
+    than leaving a stale vector behind.
+    """
+    table = resolve_existing_vector_table(project_id, profile)
+    if not table or _vector_backend() != "pgvector":
+        return {"backend": _vector_backend(), "orphans": 0, "removed": 0}
+
+    # Candidates only: the id must actually be shaped `doc_<digits>_...`.
+    where = (
+        "metadata_->>'document_id' ~ '^doc_[0-9]+_' "
+        "AND NOT EXISTS (SELECT 1 FROM documents d "
+        "                WHERE d.id = split_part(metadata_->>'document_id', '_', 2)::int)"
+    )
+    try:
+        conn = _pg_connect()
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(f'SELECT count(*) FROM "data_{table}" WHERE {where}')
+                n = cur.fetchone()[0]
+                removed = 0
+                if delete and n:
+                    cur.execute(f'DELETE FROM "data_{table}" WHERE {where}')
+                    removed = cur.rowcount or 0
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("Orphan scan failed on data_%s: %s", table, e)
+        return {"backend": "pgvector", "orphans": 0, "removed": 0, "error": str(e)[:200]}
+    return {"backend": "pgvector", "table": f"data_{table}", "orphans": n, "removed": removed}
+
+
+def vector_store_stats(project_id=None, profile: Optional[str] = None) -> Dict[str, Any]:
+    """Row count and on-disk size of the backing vector store."""
+    if _vector_backend() != "pgvector":
+        return {"backend": "simple"}
+    table = _pg_table_name(project_id, profile)
+    if not table:
+        return {"backend": "pgvector", "error": "dimension unknown"}
+    full = f"data_{table}"
+    try:
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass(%s)", (f"public.{full}",))
+                if cur.fetchone()[0] is None:
+                    return {"backend": "pgvector", "table": full, "exists": False,
+                            "rows": 0, "size_bytes": 0}
+                cur.execute(f'SELECT count(*) FROM "{full}"')
+                rows = cur.fetchone()[0]
+                cur.execute("SELECT pg_total_relation_size(%s)", (f"public.{full}",))
+                size = cur.fetchone()[0]
+            return {"backend": "pgvector", "table": full, "exists": True,
+                    "rows": rows, "size_bytes": int(size or 0),
+                    "embed_dim": _active_embed_dim()}
+        finally:
+            conn.close()
+    except Exception as e:
+        return {"backend": "pgvector", "table": full, "error": str(e)[:200]}
 
 
 def _index_embedding_meta_path(persist_dir: str) -> str:
@@ -397,6 +1277,12 @@ def _sanitize_vector_store_dimensions(storage_context_obj, persist_dir: Optional
     """
     removed = 0
     try:
+        # Only meaningful for SimpleVectorStore: it keeps a plain dict of embeddings and
+        # np.array() over mixed dimensions raises. A dimensioned backend (pgvector) makes
+        # the failure impossible -- the column has one width, and a model change lands in
+        # a differently-named table.
+        if _vector_backend() != "simple":
+            return 0
         from collections import Counter
         stores = []
         vs = getattr(storage_context_obj, "vector_store", None)
@@ -459,6 +1345,8 @@ def get_or_create_index(project_id: Optional[str] = None):
 
     from backend.config import INDEX_ROOT, PROJECT_INDEX_MODE
 
+    _sync_embed_model()
+
     index_mode = os.getenv("GUAARDVARK_PROJECT_INDEX_MODE", PROJECT_INDEX_MODE)
     index_root = os.getenv("GUAARDVARK_INDEX_ROOT", INDEX_ROOT)
 
@@ -467,7 +1355,7 @@ def get_or_create_index(project_id: Optional[str] = None):
     
     if index_mode == "per_project" and project_id:
         key = str(project_id)
-        persist_dir = os.path.join(index_root, str(project_id))
+        persist_dir = contained_path(index_root, str(project_id))
 
     # Get the global index manager for access_stats tracking
     try:
@@ -556,6 +1444,16 @@ def _initialize_index(storage_path: str):
     
     docstore_file_path = Path(abs_storage_path) / "docstore.json"
 
+    # The vector store is addressed by scope, not by directory. In global mode the
+    # persist dir IS the index root; in per_project mode it is a child named for the
+    # project, so the directory name is the scope.
+    from backend.config import INDEX_ROOT as _INDEX_ROOT
+    _project_scope_hint = (
+        None
+        if os.path.abspath(abs_storage_path) == os.path.abspath(_INDEX_ROOT)
+        else os.path.basename(abs_storage_path.rstrip("/\\"))
+    )
+
     should_create_new = False
     if not os.path.isdir(abs_storage_path):
         logger.warning(
@@ -614,24 +1512,16 @@ def _initialize_index(storage_path: str):
                     "persist_dir": abs_storage_path,
                 }
 
-                try:
-                    from inspect import signature
-
-                    sig_params = signature(StorageContext.from_defaults).parameters
-                    if SimpleVectorStore and "vector_store" in sig_params:
-                        storage_defaults["vector_store"] = SimpleVectorStore()
-                except Exception:
-                    if SimpleVectorStore:
-                        try:
-                            storage_defaults["vector_store"] = SimpleVectorStore()
-                        except Exception:
-                            pass
+                _vs = _make_vector_store(_project_scope_hint)
+                if _vs is not None:
+                    storage_defaults["vector_store"] = _vs
 
                 storage_context_instance = StorageContext.from_defaults(**storage_defaults)
 
                 index_instance = VectorStoreIndex.from_documents(
                     [],
                     storage_context=storage_context_instance,
+                    store_nodes_override=_needs_docstore_nodes(_vs),
                 )
                 storage_context_instance.persist(persist_dir=abs_storage_path)
 
@@ -650,13 +1540,19 @@ def _initialize_index(storage_path: str):
     else:
         try:
             logger.info(f"Attempting to load existing index from: {abs_storage_path}")
-            storage_context_instance = StorageContext.from_defaults(
-                persist_dir=abs_storage_path
+            _load_kwargs = {"persist_dir": abs_storage_path}
+            _vs_load = _make_vector_store(_project_scope_hint)
+            if _vs_load is not None:
+                _load_kwargs["vector_store"] = _vs_load
+            storage_context_instance = StorageContext.from_defaults(**_load_kwargs)
+            index_instance = load_index_from_storage(
+                storage_context_instance,
+                store_nodes_override=_needs_docstore_nodes(_vs_load)
             )
-            index_instance = load_index_from_storage(storage_context_instance)
 
             index = index_instance
             storage_context = storage_context_instance
+            globals()["_index_load_failed"] = False
             # Self-heal mixed-dimension contamination from a past embedding-model switch
             # before any query hits np.array(embeddings) and crashes the vector leg.
             _sanitize_vector_store_dimensions(storage_context_instance, abs_storage_path)
@@ -687,31 +1583,61 @@ def _initialize_index(storage_path: str):
                         "persist_dir": abs_storage_path,
                     }
 
-                    try:
-                        from inspect import signature
-
-                        sig_params = signature(StorageContext.from_defaults).parameters
-                        if SimpleVectorStore and "vector_store" in sig_params:
-                            storage_defaults["vector_store"] = SimpleVectorStore()
-                    except Exception:
-                        if SimpleVectorStore:
-                            try:
-                                storage_defaults["vector_store"] = SimpleVectorStore()
-                            except Exception:
-                                pass
+                    _vs = _make_vector_store(_project_scope_hint)
+                    if _vs is not None:
+                        storage_defaults["vector_store"] = _vs
 
                     storage_context_instance = StorageContext.from_defaults(**storage_defaults)
                     index_instance = VectorStoreIndex.from_documents(
                         [],
                         storage_context=storage_context_instance,
+                        store_nodes_override=_needs_docstore_nodes(_vs),
                     )
-                    storage_context_instance.persist(persist_dir=abs_storage_path)
 
+                    # Deliberately NOT persisted. Keeping chat alive needs an index
+                    # object in memory; it does not need the empty one written over
+                    # the files that failed to load. Persisting here turned a
+                    # transient read failure into permanent deletion -- and the
+                    # likeliest cause of that read failure is a half-written file
+                    # from a previous persist, so the recovery destroyed exactly
+                    # what a retry would have recovered. On a file-backed store
+                    # that is the entire index.
+                    #
+                    # Left alone, a restart retries the load and an operator can
+                    # inspect what is actually on disk.
                     index = index_instance
                     storage_context = storage_context_instance
-                    logger.info(
-                        f"Rebuilt empty index at {abs_storage_path} after load failure."
-                    )
+
+                    # Only guard against overwriting a store that is actually
+                    # THERE. A first run, or a deliberately cleared store, also
+                    # fails to load -- and treating that as corruption would
+                    # suppress every persist for the life of the process and log an
+                    # error about data loss that has not happened.
+                    def _has_content(name: str) -> bool:
+                        # Existence first: getsize raises on a missing file, which is
+                        # precisely the case this is here to recognise. ">2" treats an
+                        # empty "{}" as absent, because that is what a cleared store
+                        # looks like.
+                        path = os.path.join(abs_storage_path, name)
+                        try:
+                            return os.path.exists(path) and os.path.getsize(path) > 2
+                        except OSError:
+                            return False
+
+                    _existing = [f for f in ("docstore.json", "index_store.json")
+                                 if _has_content(f)]
+                    globals()["_index_load_failed"] = bool(_existing)
+                    if not _existing:
+                        logger.info(
+                            "No index store at %s; starting a fresh one.", abs_storage_path
+                        )
+                    else:
+                        logger.error(
+                            "Index load failed at %s but a store IS present (%s); serving an "
+                            "EMPTY in-memory index so chat stays up. The on-disk store was NOT "
+                            "overwritten and NOT repaired. Inspect it and restart.",
+                            abs_storage_path, ", ".join(_existing),
+                        )
                 except Exception as rebuild_err:
                     logger.error(
                         f"Rebuild after load failure also failed at {abs_storage_path}: {rebuild_err}",
@@ -814,8 +1740,47 @@ def _expand_query(query: str) -> Optional[str]:
     return None
 
 
-def search_with_llamaindex(query: str, max_chunks: Optional[int] = None, project_id: Optional[int] = None) -> List[Dict[str, Any]]:
+def search_with_llamaindex(
+    query: str,
+    max_chunks: Optional[int] = None,
+    project_id: Optional[int] = None,
+    filters: Optional[Dict[str, Any]] = None,
+    with_trace: bool = False,
+    profile: Optional[str] = None,
+):
+    """Hybrid retrieval over the knowledge index.
+
+    Returns a list of {text, score, metadata, node_id} chunks. When `with_trace`
+    is set, returns {"results": [...], "trace": {...}} instead — the trace records
+    which retrieval legs actually ran, so a degraded answer is distinguishable
+    from a bad one. `filters` are metadata equality filters ANDed with the
+    project scope.
+    """
     global index
+
+    trace: Dict[str, Any] = {
+        "legs": [],
+        "fusion": None,
+        "degraded": False,
+        "degraded_reason": None,
+        "eff_alpha": None,
+        "base_alpha": None,
+        "top_k": None,
+        "embedding_model": None,
+        "embedding_dims": None,
+        "mmr_applied": False,
+        "rerank": None,
+        "dedup_removed": 0,
+        "profile": None,
+        "project_scope": "global" if project_id is None else str(project_id),
+        "filters": dict(filters) if filters else {},
+        "returned": 0,
+        "error": None,
+    }
+
+    def _out(results):
+        trace["returned"] = len(results)
+        return {"results": results, "trace": trace} if with_trace else results
 
     try:
         with _index_operation_lock:
@@ -827,16 +1792,46 @@ def search_with_llamaindex(query: str, max_chunks: Optional[int] = None, project
 
         if local_index is None:
             logger.error("search_with_llamaindex: Failed to load index")
-            return []
+            trace["error"] = "index_unavailable"
+            return _out([])
 
         if not query or not isinstance(query, str):
             logger.warning("search_with_llamaindex: Invalid query input")
-            return []
+            trace["error"] = "invalid_query"
+            return _out([])
 
         # Dimension-lock: refuse vector search if the index was built with a different
         # embedding model (proactive + actionable, vs. the old silent post-hoc empty return).
         if not _check_index_embedding_model(project_id):
-            return []
+            trace["error"] = "embedding_model_mismatch"
+            trace["degraded"] = True
+            trace["degraded_reason"] = (
+                "index built with a different embedding model; vector search refused"
+            )
+            return _out([])
+
+        # The configured store may have been swapped for an empty in-memory one at
+        # build time. Retrieval keeps working in that state and returns ordinary
+        # looking results from nothing, so it has to be said out loud here.
+        _vs_fallback = vector_store_fallback_reason()
+        if _vs_fallback:
+            trace["vector_store"] = "simple_fallback"
+            trace["degraded"] = True
+            trace["degraded_reason"] = (
+                f"persisted vector index NOT in use — {_vs_fallback}"
+            )
+            # The trace alone is not enough: with_trace=True is passed by exactly
+            # one caller in the tree, so chat, the generation pipeline and the
+            # eval harness all take the bare list and never see `degraded`. Log it
+            # once per process at WARNING so the condition is at least visible
+            # somewhere an operator looks.
+            global _fallback_warned
+            if not _fallback_warned:
+                _fallback_warned = True
+                logger.warning(
+                    "RAG degraded: answering from an EMPTY in-memory vector store "
+                    "— %s. The persisted index is NOT being consulted.", _vs_fallback,
+                )
 
         # Layered RAG params (autoresearch): experiment override > explicit
         # max_chunks argument > promoted active config > legacy default (5).
@@ -853,20 +1848,72 @@ def search_with_llamaindex(query: str, max_chunks: Optional[int] = None, project
         else:
             effective_top_k = 5
 
+        prof_params: Dict[str, Any] = {}
+        try:
+            from backend.services.index_profiles import resolve_retrieval_params
+            prof_params = resolve_retrieval_params(profile)
+            trace["profile"] = prof_params.get("profile")
+        except Exception as e:
+            logger.debug("index profile unavailable (%s); using global params", e)
+
+        # Precedence: experiment > explicit max_chunks > profile > overlay > default.
+        # A profile must not override an autoresearch experiment, or the experiment
+        # would be measuring the profile instead of the change under test.
+        if prof_params and max_chunks is None and not (exp_config and "top_k" in exp_config) \
+                and "top_k" not in overlay:
+            effective_top_k = int(prof_params.get("top_k") or effective_top_k)
+
+        trace["top_k"] = effective_top_k
+        try:
+            from backend.config import get_active_embedding_model
+            trace["embedding_model"] = get_active_embedding_model()
+        except Exception:
+            pass
+
+        # Metadata scope: project id (when scoped) ANDed with any caller-supplied
+        # equality filters. A filter the store cannot apply must not be silently
+        # dropped -- it is recorded in the trace so the caller can see it failed.
+        _filter_pairs = []
         if project_id is not None:
+            _filter_pairs.append(("project_id", str(project_id)))
+        for _k, _v in (filters or {}).items():
+            if _v is not None:
+                _filter_pairs.append((str(_k), str(_v)))
+
+        # Filtering happens after fusion (the sparse leg cannot filter), so retrieve a
+        # wider pool when a filter is set -- otherwise an unfiltered top_k can arrive
+        # entirely non-matching and the caller gets nothing for no good reason.
+        try:
+            from backend.utils.reranker import is_enabled as _rerank_enabled
+            _widen_for_rerank = _rerank_enabled()
+        except Exception:
+            _widen_for_rerank = False
+        # A reranker handed exactly top_k candidates cannot improve anything, and a
+        # post-fusion filter needs spare candidates to survive. Both want a wider pool.
+        _widened = bool(_filter_pairs or _widen_for_rerank)
+        candidate_top_k = min(50, effective_top_k * 4) if _widened else effective_top_k
+        trace["candidate_top_k"] = candidate_top_k
+
+        if _filter_pairs:
             try:
                 from llama_index.core.vector_stores.types import MetadataFilters, MetadataFilter, FilterOperator
                 metadata_filters = MetadataFilters(
                     filters=[
-                        MetadataFilter(key="project_id", value=str(project_id), operator=FilterOperator.EQ)
+                        MetadataFilter(key=_k, value=_v, operator=FilterOperator.EQ)
+                        for _k, _v in _filter_pairs
                     ]
                 )
-                base_retriever = local_index.as_retriever(similarity_top_k=effective_top_k, filters=metadata_filters)
+                base_retriever = local_index.as_retriever(similarity_top_k=candidate_top_k, filters=metadata_filters)
+                trace["filters_applied"] = True
             except Exception:
                 logger.debug("search_with_llamaindex: MetadataFilters not available, falling back to unfiltered")
-                base_retriever = local_index.as_retriever(similarity_top_k=effective_top_k)
+                base_retriever = local_index.as_retriever(similarity_top_k=candidate_top_k)
+                trace["filters_applied"] = False
+                trace["degraded"] = True
+                trace["degraded_reason"] = "metadata filters unavailable; results are UNFILTERED"
         else:
-            base_retriever = local_index.as_retriever(similarity_top_k=effective_top_k)
+            base_retriever = local_index.as_retriever(similarity_top_k=candidate_top_k)
+            trace["filters_applied"] = None
         # Hybrid search: add BM25 retrieval alongside vector search.
         # Promoted/experiment alpha wins; env var is the legacy default.
         hybrid_alpha = overlay.get(
@@ -875,14 +1922,19 @@ def search_with_llamaindex(query: str, max_chunks: Optional[int] = None, project
         )
         retriever = base_retriever  # Default to vector-only
         use_query_embedding = True  # False only when we fall back to BM25-only (no vector leg)
+        trace["base_alpha"] = hybrid_alpha
+        trace["legs"] = ["vector"]
+        trace["fusion"] = "vector_only"
 
         if hybrid_alpha > 0.0 and storage_context is not None:
             try:
                 from llama_index.core.retrievers import QueryFusionRetriever
 
-                bm25_retriever = _get_cached_bm25_retriever(storage_context.docstore, effective_top_k)
+                bm25_retriever = _get_sparse_retriever(
+                    storage_context, candidate_top_k, project_id=project_id, profile=profile
+                )
                 if bm25_retriever is None:
-                    raise ImportError("BM25Retriever unavailable")
+                    raise ImportError("no sparse retriever available")
 
                 # Resource-pressure fallback: under VRAM/RAM pressure, skip the vector leg
                 # entirely (no query embedding) and serve BM25-only rather than thrash.
@@ -892,6 +1944,13 @@ def search_with_llamaindex(query: str, max_chunks: Optional[int] = None, project
                     )
                     retriever = bm25_retriever
                     use_query_embedding = False  # don't embed the query under pressure
+                    trace["legs"] = ["bm25"]
+                    trace["fusion"] = "bm25_only"
+                    trace["degraded"] = True
+                    trace["degraded_reason"] = (
+                        "resource pressure (low free VRAM or high RAM): vector leg skipped, "
+                        "BM25-only results"
+                    )
                 else:
                     # Effective vector weight (alpha). Adaptive per-query unless disabled.
                     eff_alpha = hybrid_alpha
@@ -902,29 +1961,53 @@ def search_with_llamaindex(query: str, max_chunks: Optional[int] = None, project
                     try:
                         # relative_score is the only fusion mode that honors retriever_weights.
                         # Order matches retrievers=[vector, bm25] → [eff_alpha, 1-eff_alpha].
+                        # use_async=False: the default runs both legs through a
+                        # nested event loop, which inside a request thread failed
+                        # every chat retrieval ("Detected nested async") and then
+                        # left the vector store's asyncpg connection mid-operation
+                        # for every later call. The sync path uses the store's
+                        # psycopg2 engine; two legs in sequence cost milliseconds.
                         retriever = QueryFusionRetriever(
                             retrievers=[base_retriever, bm25_retriever],
-                            similarity_top_k=effective_top_k,
+                            similarity_top_k=candidate_top_k,
                             num_queries=1,
                             mode="relative_score",
                             retriever_weights=[eff_alpha, 1.0 - eff_alpha],
+                            use_async=False,
                         )
+                        trace["legs"] = ["vector", "bm25"]
+                        trace["fusion"] = "relative_score"
+                        trace["eff_alpha"] = eff_alpha
                     except (TypeError, ValueError) as weight_err:
                         # Older llama-index without relative_score/retriever_weights → plain RRF.
                         logger.debug(f"Weighted fusion unavailable ({weight_err}); using reciprocal_rerank")
                         retriever = QueryFusionRetriever(
                             retrievers=[base_retriever, bm25_retriever],
-                            similarity_top_k=effective_top_k,
+                            similarity_top_k=candidate_top_k,
                             num_queries=1,
                             mode="reciprocal_rerank",
+                            use_async=False,
                         )
+                        trace["legs"] = ["vector", "bm25"]
+                        trace["fusion"] = "reciprocal_rerank"
+                        trace["eff_alpha"] = None
                     logger.info(
                         f"Hybrid search (vector={eff_alpha:.2f}, bm25={1.0 - eff_alpha:.2f}, base_alpha={hybrid_alpha})"
                     )
             except ImportError:
-                logger.debug("BM25Retriever not available, using vector-only search")
+                logger.warning("BM25Retriever not available, using vector-only search")
+                trace["degraded"] = True
+                trace["degraded_reason"] = (
+                    "hybrid requested (alpha=%.2f) but BM25 is unavailable; vector-only results"
+                    % hybrid_alpha
+                )
             except Exception as e:
-                logger.debug(f"Hybrid search setup failed, using vector-only: {e}")
+                logger.warning(f"Hybrid search setup failed, using vector-only: {e}")
+                trace["degraded"] = True
+                trace["degraded_reason"] = (
+                    "hybrid requested (alpha=%.2f) but the sparse leg failed (%s); vector-only results"
+                    % (hybrid_alpha, str(e)[:120])
+                )
 
         from llama_index.core.schema import QueryBundle
 
@@ -936,6 +2019,10 @@ def search_with_llamaindex(query: str, max_chunks: Optional[int] = None, project
                 cached_vec = _get_cached_query_embedding(query)
                 if cached_vec is not None:
                     query_bundle.embedding = cached_vec
+                    try:
+                        trace["embedding_dims"] = len(cached_vec)
+                    except TypeError:
+                        pass
         else:
             query_bundle = query
 
@@ -950,6 +2037,21 @@ def search_with_llamaindex(query: str, max_chunks: Optional[int] = None, project
                     nodes.extend(retriever.retrieve(QueryBundle(query_str=expanded)))
                 except Exception as e:
                     logger.debug(f"Expanded-query retrieval failed: {e}")
+
+        # Metadata filters must hold for every returned node, not just the ones the
+        # vector store filtered. BM25Retriever has no filter support, so fusion
+        # re-admits nodes the vector leg excluded -- including nodes from other
+        # projects. Enforce the scope here, where both legs have already landed.
+        if _filter_pairs:
+            def _passes(nws):
+                n = nws.node if hasattr(nws, "node") else nws
+                md = getattr(n, "metadata", None) or {}
+                return all(str(md.get(k)) == v for k, v in _filter_pairs)
+
+            _pre_filter = len(nodes)
+            nodes = [n for n in nodes if _passes(n)]
+            trace["filtered_out"] = _pre_filter - len(nodes)
+            trace["filters_applied"] = True
 
         results = []
         for node_with_score in nodes:
@@ -974,7 +2076,29 @@ def search_with_llamaindex(query: str, max_chunks: Optional[int] = None, project
         )
 
         # Deduplicate near-identical chunks
+        _pre_dedup = len(results)
         results = deduplicate_chunks(results)
+        trace["dedup_removed"] = _pre_dedup - len(results)
+
+        # Cross-encoder rerank: re-score query+passage together, which the bi-encoder
+        # and BM25 legs cannot do. Runs before MMR on purpose -- this decides what is
+        # relevant, MMR then decides what is diverse. Never raises; if it did not run,
+        # the trace says why.
+        try:
+            from backend.utils.reranker import rerank as _ce_rerank
+            if prof_params.get("rerank") is False:
+                _ce_info = {"applied": False, "reason": f"disabled by profile '{prof_params.get('profile')}'"}
+            else:
+                results, _ce_info = _ce_rerank(query if isinstance(query, str) else "", results)
+            trace["rerank"] = _ce_info
+            if not _ce_info.get("applied") and _ce_info.get("reason") and len(results) >= 2:
+                reason = _ce_info["reason"]
+                # "disabled" and "too few candidates" are configuration, not failure.
+                if not reason.startswith("disabled") and not reason.startswith("fewer than"):
+                    trace["degraded"] = True
+                    trace["degraded_reason"] = f"cross-encoder rerank unavailable ({reason})"
+        except Exception as e:
+            trace["rerank"] = {"applied": False, "reason": f"import failed: {e}"}
 
         # CPU-only MMR rerank of the top candidates (relevance × diversity). Zero VRAM.
         # Env var is the operator's master allow; the tunable param decides per-query
@@ -982,11 +2106,14 @@ def search_with_llamaindex(query: str, max_chunks: Optional[int] = None, project
         if (os.environ.get("GUAARDVARK_RERANK_ENABLED", "true").lower() == "true"
                 and overlay.get("reranking_enabled", True)):
             results = _mmr_rerank(results)
+            trace["mmr_applied"] = True
 
         # Expand results with cross-file dependency context
         try:
             from backend.utils.context_expander import expand_with_dependencies
-            results = expand_with_dependencies(results)
+            # Same scope as the retrieval: the expander reads the Document table
+            # by path, which the metadata filters above never touch.
+            results = expand_with_dependencies(results, project_id=project_id)
         except Exception as e:
             logger.debug(f"Context expansion skipped: {e}")
 
@@ -995,15 +2122,42 @@ def search_with_llamaindex(query: str, max_chunks: Optional[int] = None, project
         # caller didn't pass an explicit max_chunks cap of its own. The default
         # of 3 preserves chat's pre-layer behavior (it used to pass max_chunks=3).
         if max_chunks is None:
-            cwc = overlay.get("context_window_chunks", 3)
+            cwc = overlay.get("context_window_chunks",
+                              prof_params.get("context_window_chunks", 3))
             results = results[:cwc]
+        elif _widened:
+            # The pool was widened for filtering/reranking; honour the requested count.
+            results = results[:effective_top_k]
 
-        # Fallback: if project-scoped search returned 0 results, retry with global scope
-        if not results and project_id is not None:
+        # Fallback: if project-scoped search returned 0 results, retry with global
+        # scope. OFF by default, because Project belongs to Client: widening a
+        # project-scoped question to the whole index answers it from another
+        # client's documents. "Some answer beats none" is the wrong trade when the
+        # answer is someone else's data, and nothing in the result marks it as
+        # out-of-scope. Set GUAARDVARK_RAG_GLOBAL_FALLBACK=true for a single-tenant
+        # install where the wider search is genuinely wanted.
+        _global_fallback = os.environ.get(
+            "GUAARDVARK_RAG_GLOBAL_FALLBACK", "false").lower() == "true"
+        if not results and project_id is not None and not _global_fallback:
+            trace["project_scope"] = "project_only"
+            trace["fallback_suppressed"] = True
+        if not results and project_id is not None and _global_fallback:
             logger.info(f"search_with_llamaindex: No project-scoped results, falling back to global search")
-            return search_with_llamaindex(query, max_chunks=max_chunks, project_id=None)
+            _fb = search_with_llamaindex(
+                query, max_chunks=max_chunks, project_id=None,
+                filters=filters, with_trace=True,
+            )
+            _fb_trace = _fb["trace"]
+            _fb_trace["project_scope"] = "global_fallback"
+            _fb_trace["fallback_from_project"] = str(project_id)
+            _fb_trace["degraded"] = True
+            _fb_trace["degraded_reason"] = (
+                f"no results in project {project_id}; these passages come from "
+                f"OUTSIDE that project and may belong to another client"
+            )
+            return {"results": _fb["results"], "trace": _fb_trace} if with_trace else _fb["results"]
 
-        return results
+        return _out(results)
 
     except Exception as e:
         err_msg = str(e)
@@ -1015,11 +2169,102 @@ def search_with_llamaindex(query: str, max_chunks: Optional[int] = None, project
             )
         else:
             logger.error(f"search_with_llamaindex failed: {e}", exc_info=True)
-        return []
+        trace["error"] = err_msg[:200]
+        trace["degraded"] = True
+        trace["degraded_reason"] = "retrieval raised; empty result set"
+        return _out([])
 
 
-def add_text_to_index(text: str, metadata: Dict[str, Any], project_id: Optional[str] = None) -> Optional[bool]:
+
+
+def purge_nodes_by_metadata(filters: Dict[str, Any], profile: Optional[str] = None,
+                            project_id=None) -> int:
+    """Remove nodes whose metadata matches every key/value in `filters`.
+
+    `purge_document_vectors` keys off a document id, which only exists for content
+    that came from a file. Text indexed directly -- a repository summary, a client
+    profile, an extracted relationship -- has no document row, so re-running its
+    producer used to leave the previous version in the index next to the new one.
+    That is worse than stale storage: the old summary is still retrievable, still
+    scores well, and now competes with the current one at query time.
+
+    Callers pass the metadata keys that identify their content (see
+    `add_text_to_index(replace_where=...)`), and this removes the previous copy.
+
+    `project_id` must name the same scope the caller is writing into. It was
+    hardcoded to None here, which is invisible while only the global table
+    exists and silently wrong the moment one does not: the delete would run
+    against the global table, match nothing, report 0, and the caller would
+    append a second copy into its own project table believing it had replaced
+    the first.
+    """
+    if not filters:
+        return 0
+    table = resolve_existing_vector_table(project_id, profile)
+    if not table:
+        return 0
+    clauses, params = [], []
+    for key, value in filters.items():
+        clauses.append("metadata_->>%s = %s")
+        params.extend([str(key), str(value)])
+    sql = f'DELETE FROM "data_{table}" WHERE ' + " AND ".join(clauses)
+    try:
+        conn = _pg_connect()
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return cur.rowcount or 0
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("Could not purge nodes by metadata %s: %s", filters, e)
+        return 0
+
+
+def add_file_to_index_by_id(file_path: str, document_id) -> bool:
+    """Run the full ingest pipeline for a file, given only a document id.
+
+    The Celery ingest path is written to avoid Flask, so it cannot hold the ORM
+    object `add_file_to_index` needs. Rather than skip the pipeline it called
+    `add_text_to_index` with the file read as UTF-8 -- which means a PDF or DOCX
+    arrived as mojibake, markdown was never sectioned, and nothing purged the
+    previous vectors, so re-indexing appended a second copy instead of replacing
+    it. The UI dispatches to that path, so every improvement made to
+    `add_file_to_index` was invisible to the people actually using the product.
+
+    This bridges the two: open a context, load the row, run the real pipeline.
+    """
+    try:
+        from backend.app import get_or_create_app
+        app = get_or_create_app()
+    except Exception as e:
+        logger.warning("Cannot reach an app context to index document %s: %s", document_id, e)
+        return False
+
+    with app.app_context():
+        from backend.models import db, Document as DBDocument
+        try:
+            doc = db.session.get(DBDocument, int(document_id))
+        except Exception as e:
+            logger.warning("Could not load document %s: %s", document_id, e)
+            return False
+        if doc is None:
+            logger.warning("No document row %s to index", document_id)
+            return False
+        return bool(add_file_to_index(file_path, doc))
+
+
+def add_text_to_index(text: str, metadata: Dict[str, Any], project_id: Optional[str] = None,
+                      replace_where: Optional[List[str]] = None) -> Optional[bool]:
     """Add text to the vector index.
+
+    `replace_where` names the metadata keys that identify this content, e.g.
+    ["source", "folder_id"]. Nodes matching those values are removed first, so
+    re-running a producer replaces its previous output instead of leaving a rival
+    copy behind. Without it, re-analysing a repository left the old architectural
+    summary in the index, still retrievable and still competing with the new one.
+    Omitted, behaviour is unchanged and the text is simply appended.
 
     Returns: True = indexed; False = a real failure (no index / exception);
     None = nothing to index (content produced no chunkable text — a benign skip,
@@ -1029,6 +2274,22 @@ def add_text_to_index(text: str, metadata: Dict[str, Any], project_id: Optional[
     global index, storage_context
 
     try:
+        if replace_where:
+            # Not every caller passes a plain dict -- metadata_indexing_service builds a
+            # small object with attributes -- so read defensively rather than assume.
+            def _meta_get(key):
+                if isinstance(metadata, dict):
+                    return metadata.get(key)
+                return getattr(metadata, key, None)
+
+            _identity = {k: _meta_get(k) for k in replace_where if _meta_get(k) is not None}
+            if _identity:
+                # Same scope this call is about to write into, or the purge and
+                # the insert address different tables.
+                _removed = purge_nodes_by_metadata(_identity, project_id=project_id)
+                if _removed:
+                    logger.info("Replaced %d previously indexed node(s) for %s",
+                                _removed, _identity)
         # Ensure project_id is stored in document metadata for retrieval filtering
         if project_id and 'project_id' not in metadata:
             metadata['project_id'] = str(project_id)
@@ -1047,8 +2308,8 @@ def add_text_to_index(text: str, metadata: Dict[str, Any], project_id: Optional[
 
         document = LlamaDocument(text=text, metadata=metadata)
         
-        from backend.utils.enhanced_rag_chunking import EnhancedRAGChunker
-        rag_chunker = EnhancedRAGChunker()
+        from backend.utils.enhanced_rag_chunking import get_shared_chunker
+        rag_chunker = get_shared_chunker()
 
         nodes = rag_chunker.chunk_documents([document], strategy_name='auto')
         
@@ -1080,13 +2341,13 @@ def add_text_to_index(text: str, metadata: Dict[str, Any], project_id: Optional[
                     from backend.config import INDEX_ROOT
                     persist_dir = INDEX_ROOT
                     logger.warning(f"Prevented use of legacy storage folder, using {persist_dir} instead")
-                storage_context.persist(persist_dir=persist_dir)
+                _safe_persist(storage_context, persist_dir)
 
         logger.info(f"add_text_to_index: Successfully added text with {len(nodes)} nodes")
 
         # Notify autoresearch that corpus has changed
         try:
-            from backend.celery_app import celery_app as _celery
+            from backend.celery_app import celery as _celery
             _celery.send_task("autoresearch.on_index_complete")
         except Exception:
             pass  # autoresearch is optional
@@ -1104,8 +2365,42 @@ def add_text_to_index(text: str, metadata: Dict[str, Any], project_id: Optional[
             del valid_nodes
         if 'document' in locals():
             del document
-        import gc
-        gc.collect()
+        _maybe_collect()
+
+
+
+def _md_supports(file_extension: str) -> bool:
+    try:
+        from backend.utils.markdown_sections import supports
+        return supports(file_extension)
+    except Exception:
+        return False
+
+
+def _md_load(file_path: str, filename: str, doc_cls):
+    try:
+        from backend.utils.markdown_sections import load_documents
+        return load_documents(file_path, filename, doc_cls)
+    except Exception as e:
+        logger.warning("Markdown loader unavailable for %s: %s", filename, e)
+        return None
+
+
+def _docling_supports(file_extension: str) -> bool:
+    try:
+        from backend.utils.docling_loader import supports
+        return supports(file_extension)
+    except Exception:
+        return False
+
+
+def _docling_load(file_path: str, filename: str, doc_cls):
+    try:
+        from backend.utils.docling_loader import load_documents
+        return load_documents(file_path, filename, doc_cls)
+    except Exception as e:
+        logger.warning("Docling loader unavailable for %s: %s", filename, e)
+        return None
 
 
 def get_documents_from_file(file_path: str, client: Optional[str] = None, upload_date: Optional[str] = None) -> List[LlamaDocument]:
@@ -1122,6 +2417,30 @@ def get_documents_from_file(file_path: str, client: Optional[str] = None, upload
         if not path_obj.is_file():
             logger.error(f"Path is not a file: {file_path}")
             return []
+
+        # Docling runs ahead of EnhancedFileProcessor for the layout-bearing formats.
+        # The adapter also claims .pdf/.docx, but it returns flat text; Docling returns
+        # reading order, section headers and page provenance, which is what makes a
+        # retrieved chunk citable. It returns None when it cannot help, so the adapter
+        # and the legacy readers below remain the fallback chain.
+        if _docling_supports(file_extension):
+            _dl_docs = _docling_load(str(path_obj), filename, LlamaDocument)
+            if _dl_docs:
+                for _d in _dl_docs:
+                    _d.metadata.setdefault("client", client)
+                    _d.metadata.setdefault("upload_date", upload_date)
+                logger.info("Docling handled %s (%d page docs)", filename, len(_dl_docs))
+                return _dl_docs
+
+        # Markdown: split on headings so each section carries a breadcrumb. Previously
+        # .md fell all the way through to SimpleDirectoryReader as one flat blob.
+        if _md_supports(file_extension):
+            _md_docs = _md_load(str(path_obj), filename, LlamaDocument)
+            if _md_docs:
+                for _d in _md_docs:
+                    _d.metadata.setdefault("client", client)
+                    _d.metadata.setdefault("upload_date", upload_date)
+                return _md_docs
 
         try:
             from backend.utils.file_processor_adapter import (
@@ -1405,6 +2724,33 @@ def get_documents_from_file(file_path: str, client: Optional[str] = None, upload
             documents = parse_csv_rows(str(path_obj), client=client, upload_date=upload_date)
         elif file_extension == ".xml" and parse_sitemap:
             documents = parse_sitemap(str(path_obj))
+        elif file_extension == ".pdf" and _docling_supports(file_extension):
+            # Docling first: recovers reading order, section headers and per-item page
+            # provenance. Returns None (not an exception) when it cannot help, so the
+            # PDFReader path below still runs rather than dropping the file.
+            _dl = _docling_load(str(path_obj), filename, LlamaDocument)
+            if _dl:
+                documents.extend(_dl)
+            elif PDFReaderClass:
+                try:
+                    logger.debug(f"Docling unavailable for {filename}; using PDFReader")
+                    pdf_reader = PDFReaderClass()
+                    loaded_docs = pdf_reader.load_data(file=path_obj)
+                    for doc in loaded_docs:
+                        doc.metadata = doc.metadata or {}
+                        doc.metadata["source_filename"] = filename
+                        doc.metadata["file_path"] = str(path_obj)
+                        doc.metadata["parsed_by"] = "PDFReader"
+                    documents.extend(loaded_docs)
+                except Exception as e:
+                    logger.error(f"Failed to parse PDF {filename}: {e}", exc_info=True)
+                    return []
+
+        elif file_extension in (".docx", ".pptx") and _docling_supports(file_extension):
+            _dl = _docling_load(str(path_obj), filename, LlamaDocument)
+            if _dl:
+                documents.extend(_dl)
+
         elif file_extension == ".pdf" and PDFReaderClass:
             try:
                 logger.debug(f"Using PydfReader for: {filename}")
@@ -1493,10 +2839,14 @@ def add_file_to_index(file_path: str, db_document: DBDocument, progress_callback
 
     global index, storage_context
 
+    timings: Dict[str, float] = {}
+    _embed_clock = _EmbedClock()
+
     _lazy_load_llamaindex()
     _lazy_load_optional_components()
 
-    get_or_create_index(db_document.project_id if db_document else None)
+    with _phase("index_init_ms", timings):
+        get_or_create_index(db_document.project_id if db_document else None)
 
     if index is None or storage_context is None:
         logger.error(
@@ -1546,11 +2896,12 @@ def add_file_to_index(file_path: str, db_document: DBDocument, progress_callback
             progress_callback(30, f"Loading document: {db_document.filename}")
         
         try:
-            documents = get_documents_from_file(
-                file_path=file_path,
-                client=db_document.project.client.name if db_document.project and db_document.project.client else None,
-                upload_date=db_document.uploaded_at.isoformat() if db_document.uploaded_at else None
-            )
+            with _phase("parse_ms", timings):
+                documents = get_documents_from_file(
+                    file_path=file_path,
+                    client=db_document.project.client.name if db_document.project and db_document.project.client else None,
+                    upload_date=db_document.uploaded_at.isoformat() if db_document.uploaded_at else None
+                )
             
             if not documents:
                 logger.error(f"No documents loaded from {file_path}")
@@ -1592,7 +2943,7 @@ def add_file_to_index(file_path: str, db_document: DBDocument, progress_callback
             if db_document.notes:
                 doc.metadata["notes"] = db_document.notes
 
-            doc.id_ = f"doc_{db_document.id}_{hash(doc.text)}"
+            doc.id_ = f"doc_{db_document.id}_{hashlib.sha256((doc.text or '').encode('utf-8')).hexdigest()[:16]}"
         
         logger.info(f"Adding documents to index for {db_document.filename}")
         progress_system.update_process(process_id, 70, f"Adding to vector index: {db_document.filename}")
@@ -1661,10 +3012,22 @@ def add_file_to_index(file_path: str, db_document: DBDocument, progress_callback
                 logger.info(f"AST code chunking produced {len(nodes)} nodes from {db_document.filename}")
             else:
                 # Standard chunking for non-code files
-                from backend.utils.enhanced_rag_chunking import EnhancedRAGChunker
-                rag_chunker = EnhancedRAGChunker()
-                nodes = rag_chunker.chunk_documents(documents, strategy_name='auto')
+                from backend.utils.enhanced_rag_chunking import get_shared_chunker
+                rag_chunker = get_shared_chunker()
+                with _phase("chunk_ms", timings):
+                    nodes = rag_chunker.chunk_documents(documents, strategy_name='auto')
                 logger.info(f"Enhanced RAG chunking produced {len(nodes)} nodes from {len(documents)} documents")
+
+                # Contextual Retrieval for prose, mirroring the code branch above: the
+                # embedded text names its document, section and page, so a chunk lifted
+                # out of the middle of a file still says where it came from. Raw text is
+                # preserved in metadata["original_text"].
+                try:
+                    from backend.utils.contextual_prepender import prepend_context_to_document_nodes
+                    _ctx_n = prepend_context_to_document_nodes(nodes)
+                    logger.info(f"Contextual prefix applied to {_ctx_n}/{len(nodes)} prose nodes")
+                except Exception as e:
+                    logger.warning(f"Document context prepending skipped: {e}")
 
                 try:
                     stats = rag_chunker.get_chunking_stats()
@@ -1674,8 +3037,62 @@ def add_file_to_index(file_path: str, db_document: DBDocument, progress_callback
 
             logger.info(f"Generated {len(nodes)} nodes from {len(documents)} documents")
             
+            # Replace, don't append: pgvector INSERTs rather than upserting by node id,
+            # so without this a re-index leaves the previous copy in place alongside
+            # the new one.
+            try:
+                with _phase("purge_ms", timings):
+                    _purged = purge_document_vectors(getattr(db_document, "id", None),
+                                                     getattr(db_document, "project_id", None))
+                # A file-backed store overwrites nodes in place, so there is nothing
+                # to purge there. Anywhere else, a purge that did not run means the
+                # insert below may leave the previous copy beside the new one.
+                if not _purged.ok and _purged.reason != "not_pgvector":
+                    logger.warning(
+                        "Pre-insert purge did not run for document %s (%s); a previous "
+                        "copy may remain in the index",
+                        getattr(db_document, "id", None), _purged.reason,
+                    )
+            except Exception as _pe:
+                logger.warning("Pre-insert purge skipped: %s", _pe)
+
+            # Collapse duplicate node ids before inserting. Node ids are derived from
+            # (document, section, chunk text), so a document that genuinely repeats
+            # content -- a code inventory full of ``` fences, say -- yields several
+            # chunks with the SAME id. The vector store has no upsert, so each becomes
+            # its own row, and one passage then occupies several of the caller's
+            # result slots. Observed: one file at 1,638 rows for 796 distinct ids,
+            # with a single id stored 11 times.
+            _seen_ids, _deduped = set(), []
+            for _n in nodes:
+                _nid = getattr(_n, "node_id", None)
+                if _nid is not None and _nid in _seen_ids:
+                    continue
+                if _nid is not None:
+                    _seen_ids.add(_nid)
+                _deduped.append(_n)
+            if len(_deduped) != len(nodes):
+                logger.info("Collapsed %d duplicate node id(s) before insert",
+                            len(nodes) - len(_deduped))
+                nodes = _deduped
+
             with _index_operation_lock:
-                index.insert_nodes(nodes)
+                _dispatcher = None
+                try:
+                    from llama_index.core.instrumentation import get_dispatcher
+                    _dispatcher = get_dispatcher()
+                    _dispatcher.add_event_handler(_embed_clock)
+                except Exception:
+                    pass
+                try:
+                    with _phase("insert_ms", timings):
+                        index.insert_nodes(nodes)
+                finally:
+                    if _dispatcher is not None:
+                        try:
+                            _dispatcher.event_handlers.remove(_embed_clock)
+                        except Exception:
+                            pass
                 _record_index_embedding_model(getattr(db_document, "project_id", None))  # stamp model
 
                 logger.info(f"Persisting index for {db_document.filename}")
@@ -1692,8 +3109,19 @@ def add_file_to_index(file_path: str, db_document: DBDocument, progress_callback
                         from backend.config import INDEX_ROOT
                         persist_dir = INDEX_ROOT
                         logger.warning(f"Prevented use of legacy storage folder, using {persist_dir} instead")
-                    storage_context.persist(persist_dir=persist_dir)
+                    with _phase("persist_ms", timings):
+                        _safe_persist(storage_context, persist_dir)
             
+            timings["embed_ms"] = round(_embed_clock.ms, 1)
+            timings["embed_calls"] = _embed_clock.calls
+            timings["vstore_ms"] = round(timings.get("insert_ms", 0.0) - _embed_clock.ms, 1)
+            timings["nodes"] = len(nodes)
+            timings["document_id"] = getattr(db_document, "id", None)
+            timings["filename"] = getattr(db_document, "filename", None)
+            _LAST_PHASE_TIMINGS.clear()
+            _LAST_PHASE_TIMINGS.update({k: (round(v, 1) if isinstance(v, float) else v)
+                                        for k, v in timings.items()})
+
             logger.info(f"Successfully indexed {file_path} with {len(nodes)} nodes")
             
         except Exception as e:
@@ -1738,13 +3166,11 @@ def add_file_to_index(file_path: str, db_document: DBDocument, progress_callback
             except Exception as e:
                 logger.warning(f"Failed to store symbol metadata: {e}")
 
-        gc.collect()
-
         logger.info(f"Successfully indexed {db_document.filename}")
 
         # Notify autoresearch that corpus has changed
         try:
-            from backend.celery_app import celery_app as _celery
+            from backend.celery_app import celery as _celery
             _celery.send_task("autoresearch.on_index_complete")
         except Exception:
             pass  # autoresearch is optional
@@ -1778,11 +3204,7 @@ def add_file_to_index(file_path: str, db_document: DBDocument, progress_callback
             if 'node_parser' in locals():
                 node_parser = None
             
-            if file_size_mb > 1.0:
-                collected = gc.collect()
-                logger.debug(f"Garbage collected {collected} objects for large file ({file_size_mb:.2f}MB)")
-            else:
-                gc.collect()
+            _maybe_collect(file_size_mb)
                 
             logger.debug("Memory cleanup completed")
         except Exception as cleanup_error:

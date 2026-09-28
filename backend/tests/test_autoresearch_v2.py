@@ -2,7 +2,10 @@
 and the research-run engine (Phases A+B of the 2026-08-10 rebuild)."""
 import hashlib
 import pytest
+from datetime import timedelta
 from unittest.mock import patch, MagicMock
+
+from backend.utils.clock import utcnow
 
 try:
     from flask import Flask
@@ -141,7 +144,7 @@ class TestHonestEval:
             harness = RAGEvalHarness()
             with patch.object(harness, "_call_llm", return_value="not json"):
                 score = harness.score_response("q", "a", "r", [])
-            assert score["composite"] == 1.0
+            assert score["composite"] is None
             assert score.get("judge_parse_failed") is True
 
 
@@ -272,4 +275,164 @@ class TestResearchRunEngine:
             ]
             report = svc_run._write_report(run, ledger)
             assert "single-model judging" in report
-            assert "100% LLM-proposed" in report
+            assert "100% LLM" in report
+
+    def test_confirmation_ignores_foreign_candidates(self, app):
+        with app.app_context():
+            svc_run = self._mk_service()
+            run = ResearchRun(run_tag="t-scope", mode="rag_tuning")
+            db.session.add(run)
+            ours = ResearchConfig(
+                params={"top_k": 9}, is_active=False,
+                status="candidate", composite_score=3.8, source="local",
+            )
+            foreign = ResearchConfig(
+                params={"top_k": 12}, is_active=False,
+                status="candidate", composite_score=4.9,
+                source="family_broadcast",
+            )
+            db.session.add_all([ours, foreign])
+            db.session.commit()
+            auto_svc = MagicMock()
+            auto_svc.eval_harness.run_full_eval.side_effect = [
+                {"composite_score": 3.8}, {"composite_score": 3.0},
+            ]
+            active = ResearchConfig(
+                params={"top_k": 5}, is_active=True,
+                status="promoted", composite_score=3.0,
+            )
+            db.session.add(active)
+            db.session.commit()
+            note = svc_run._confirm_and_activate(
+                auto_svc, run, candidate_ids=[ours.id],
+            )
+            assert "CONFIRMED" in note
+            db.session.refresh(ours)
+            db.session.refresh(foreign)
+            assert ours.is_active is True
+            assert foreign.is_active is False
+            assert foreign.status == "candidate"
+
+    def test_stale_running_row_recovered_on_kickoff(self, app):
+        with app.app_context():
+            stale = ResearchRun(
+                run_tag="old-dead", mode="rag_tuning", status="running",
+                started_at=utcnow() - timedelta(hours=3),
+            )
+            db.session.add(stale)
+            db.session.commit()
+            svc_run = self._mk_service()
+            with patch.object(svc_run, "_celery_has_live_execute_run",
+                              return_value=False), \
+                 patch.object(svc_run, "_enqueue_execute_run"):
+                result = svc_run.kickoff(budget_hours=1, trigger="manual")
+            db.session.refresh(stale)
+            assert stale.status == "halted"
+            assert stale.halt_reason == "worker_crashed"
+            assert result["status"] == "started"
+            assert result["run"]["run_tag"] != "old-dead"
+
+    def test_status_running_when_research_run_active(self, app):
+        with app.app_context():
+            db.session.add(ResearchRun(
+                run_tag="t-status", mode="rag_tuning", status="running",
+                started_at=utcnow(), wall_clock_budget_s=3600,
+            ))
+            db.session.commit()
+            svc = RAGAutoresearchService()
+            st = svc.get_status()
+            assert st["running"] is True
+            assert st["active_run"]["run_tag"] == "t-status"
+            assert st["active_run"]["budget_remaining_s"] is not None
+
+
+class TestDirector:
+    def test_allocate_plateaued_majority_code(self):
+        split = ResearchRunService()._allocate(
+            {"code_allowed": True, "rag_plateaued": True}, 1000)
+        assert split["code_s"] >= 500
+        assert split["code_s"] >= split["rag_s"]
+        assert split["code_skip"] is None
+
+    def test_allocate_skips_code_when_not_allowed(self):
+        split = ResearchRunService()._allocate(
+            {"code_allowed": False, "code_skip_reason": "codebase_locked",
+             "rag_plateaued": True}, 1000)
+        assert split["code_s"] == 0
+        assert split["rag_s"] == 1000
+        assert "codebase_locked" in split["code_skip"]
+
+    def test_kickoff_default_mode_is_unified(self):
+        import inspect
+        assert inspect.signature(ResearchRunService.kickoff).parameters["mode"].default == "unified"
+
+    def test_beat_kicks_unified(self):
+        import inspect
+        from backend.tasks import rag_autoresearch_tasks as tasks
+        src = inspect.getsource(tasks.create_autoresearch_tasks)
+        assert 'mode="unified"' in src
+
+    def test_unified_skips_code_when_swarm_down(self, app):
+        with app.app_context():
+            run = ResearchRun(
+                run_tag="t-unified-skip", mode="unified",
+                wall_clock_budget_s=0, status="pending",
+            )
+            db.session.add(run)
+            db.session.commit()
+            svc_run = ResearchRunService()
+            with patch.object(svc_run, "_check_preconditions", return_value=(True, "")), \
+                 patch.object(svc_run, "_diagnose", return_value={
+                     "code_allowed": False, "code_skip_reason": "swarm_unreachable",
+                     "rag_plateaued": False, "tests_red": False,
+                 }), \
+                 patch.object(svc_run, "_run_code_slice") as mock_code, \
+                 patch.object(svc_run, "_confirm_and_activate",
+                              return_value="no candidate configs produced"), \
+                 patch("backend.services.rag_autoresearch_service.get_autoresearch_service"):
+                svc_run.execute_run(run.id)
+            mock_code.assert_not_called()
+            db.session.refresh(run)
+            assert run.status == "completed"
+            assert "code half skipped" in (run.report_md or "")
+            assert "swarm_unreachable" in (run.report_md or "")
+
+    def test_code_keep_rejected_when_rag_drops(self, app):
+        from backend.api.rag_autoresearch_api import autoresearch_bp
+        if "autoresearch" not in app.blueprints:
+            app.register_blueprint(autoresearch_bp)
+        with app.test_client() as client:
+            res = client.post("/api/autoresearch/experiments", json={
+                "parameter": "chunker",
+                "new_value": "smarter dedup",
+                "status": "keep",
+                "source": "code_arm",
+                "composite_score": 2.0,
+                "baseline_score": 3.0,
+                "pytest_passed": True,
+                "run_tag": "t-pne",
+            })
+            assert res.status_code == 201
+            body = res.get_json()
+            assert body["recorded_status"] == "discard"
+
+    def test_snapshot_pytest_does_not_dispatch_fixes(self, app):
+        with app.app_context():
+            from backend.services.self_improvement_service import (
+                get_self_improvement_service,
+            )
+            si = get_self_improvement_service()
+            si._running = False
+            with patch("backend.services.self_improvement_service._is_codebase_locked",
+                       return_value=False), \
+                 patch("backend.services.self_improvement_service._is_self_improvement_enabled",
+                       return_value=True), \
+                 patch("backend.services.self_improvement_service.subprocess.run") as mock_run, \
+                 patch.object(si, "_attempt_fix") as mock_fix, \
+                 patch.object(si, "run_self_check") as mock_check:
+                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+                out = si.snapshot_pytest()
+            mock_fix.assert_not_called()
+            mock_check.assert_not_called()
+            assert out.get("ok") is True
+            assert out.get("red") is False

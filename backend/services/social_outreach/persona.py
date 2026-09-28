@@ -306,6 +306,7 @@ def _ollama_json_chat(system: str, user: str, model: Optional[str] = None) -> Di
         from backend.config import get_default_llm
         model = get_default_llm()
 
+    from backend.utils.ollama_resource_manager import think_payload
     try:
         response = ollama.chat(
             model=model,
@@ -315,6 +316,7 @@ def _ollama_json_chat(system: str, user: str, model: Optional[str] = None) -> Di
             ],
             format="json",
             options={"temperature": 0.6},
+            **think_payload(model),
         )
     except Exception as e:
         logger.error("ollama.chat failed: %s", e)

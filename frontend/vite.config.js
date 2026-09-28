@@ -1,14 +1,40 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createLogger, defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
-import { NodeGlobalsPolyfillPlugin } from "@esbuild-plugins/node-globals-polyfill";
-import { NodeModulesPolyfillPlugin } from "@esbuild-plugins/node-modules-polyfill";
 import rollupNodePolyFill from "rollup-plugin-polyfill-node";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
+const EXTENSIONS_ROOT = path.join(REPO_ROOT, "extensions");
+// Real paths of extension folders (they may be symlinks into private checkouts),
+// so the dev server is allowed to read them.
+const extensionRealPaths = () => {
+  try {
+    return fs.readdirSync(EXTENSIONS_ROOT)
+      .filter((name) => !name.startsWith("_") && !name.startsWith("."))
+      .map((name) => fs.realpathSync(path.join(EXTENSIONS_ROOT, name)));
+  } catch { return []; }
+};
+
+// Extension frontends live in ../extensions/<id>/frontend, outside this
+// package, so a bare import like "@mui/material" from one of them has no
+// node_modules above it. Re-resolve such imports as if they came from src/,
+// so an extension uses core's dependencies without a copy of node_modules.
+const extensionsNodeModules = () => ({
+  name: "extensions-node-modules",
+  enforce: "pre",
+  async resolveId(source, importer, options) {
+    // Extension folders may be symlinks; Vite hands us the real path, so key
+    // on "outside this package and not a dependency" rather than the folder.
+    if (!importer || importer.startsWith(__dirname) || importer.includes("/node_modules/")) return null;
+    if (source.startsWith(".") || source.startsWith("/") || source.startsWith("@/") || source.startsWith("\0")) return null;
+    const asIfFromCore = path.join(__dirname, "src", "__extension_import__.js");
+    return this.resolve(source, asIfFromCore, { ...options, skipSelf: true });
+  },
+});
 
 // Socket.IO disconnects (page refresh, backend restart, transport retry) reset the
 // proxied TCP socket; Vite logs that as "ws proxy error: ECONNRESET" even though
@@ -103,6 +129,16 @@ function resolveAllowedHosts(rootEnv) {
   ];
 }
 
+// Package -> output chunk. Everything else under node_modules stays in the
+// default vendor split.
+const VENDOR_CHUNKS = Object.fromEntries([
+  ...['react', 'react-dom'].map((n) => [n, 'vendor']),
+  ...['@mui/material', '@mui/icons-material', '@emotion/react', '@emotion/styled'].map((n) => [n, 'mui']),
+  ['react-router-dom', 'routing'],
+  ...['axios', 'socket.io-client'].map((n) => [n, 'api']),
+  ...['zustand', 'react-grid-layout', 'react-markdown', 'react-syntax-highlighter'].map((n) => [n, 'utils']),
+]);
+
 export default defineConfig(({ mode }) => {
   const rootEnv = loadEnv(mode, REPO_ROOT, "");
   const { flaskPort, vitePort } = resolvePorts(mode);
@@ -117,12 +153,27 @@ export default defineConfig(({ mode }) => {
 
   return {
   customLogger: viteLogger,
-  plugins: [react()],
+  plugins: [react(), extensionsNodeModules()],
+  resolve: {
+    // `@` is core: extensions import it as `@/api/apiClient` instead of
+    // counting `../` up to wherever core sits.
+    alias: [
+      { find: /^@\//, replacement: `${path.resolve(__dirname, "src")}/` },
+      // @mui/icons-material 5.x has no exports map, so `@mui/icons-material/Add`
+      // resolves to its CommonJS file. Vite 8's pre-bundler hands a default
+      // import of that file the module object, not the component ("Element type
+      // is invalid ... got: object"). Point every icon import at the ESM build.
+      { find: /^@mui\/icons-material(?!\/esm)(\/.*)?$/, replacement: "@mui/icons-material/esm$1" },
+    ],
+  },
   test: {
     globals: true,
     environment: 'jsdom',
     setupFiles: './src/test/setup.js',
-    include: ['src/**/*.{test,spec}.{js,jsx,ts,tsx}'],
+    include: [
+      'src/**/*.{test,spec}.{js,jsx,ts,tsx}',
+      '../extensions/*/frontend/**/*.{test,spec}.{js,jsx,ts,tsx}',
+    ],
     coverage: {
       reporter: ['text', 'json', 'html'],
       exclude: ['node_modules/', 'src/test/'],
@@ -141,32 +192,26 @@ export default defineConfig(({ mode }) => {
       'react-dom',
       'react/jsx-runtime'
     ],
-    esbuildOptions: {
-      define: {
-        global: "globalThis",
-      },
-      plugins: [
-        NodeGlobalsPolyfillPlugin({
-          buffer: true,
-          process: true,
-          global: true,
-        }),
-        NodeModulesPolyfillPlugin(),
-      ],
-    },
+    // Vite 8 pre-bundles with Rolldown, which takes no esbuild plugins: the
+    // esbuild-only Node polyfill plugins made every dependency scan fail and
+    // left the dev server with no pre-bundled deps at all. The build keeps its
+    // rollup polyfill below; `global` is defined once at the top level.
+  },
+  define: {
+    global: "globalThis",
   },
   build: {
     chunkSizeWarningLimit: 1000,
     rollupOptions: {
       plugins: [rollupNodePolyFill()],
       output: {
-        manualChunks: {
-          vendor: ['react', 'react-dom'],
-          mui: ['@mui/material', '@mui/icons-material', '@emotion/react', '@emotion/styled'],
-          routing: ['react-router-dom'],
-          api: ['axios', 'socket.io-client'],
-          utils: ['zustand', 'react-grid-layout', 'react-markdown', 'react-syntax-highlighter']
-        }
+        // Function form: Vite 8 bundles with Rolldown, which does not accept
+        // the object form ("manualChunks is not a function"). Same groups.
+        manualChunks: (id) => {
+          const m = id.match(/[\\/]node_modules[\\/]((?:@[^\\/]+[\\/])?[^\\/]+)/);
+          if (!m) return undefined;
+          return VENDOR_CHUNKS[m[1]];
+        },
       }
     },
     sourcemap: false,
@@ -185,6 +230,8 @@ export default defineConfig(({ mode }) => {
     strictPort: true,
     allowedHosts,
     proxy,
+    // Extension frontends live outside frontend/ (extensions/<id>/frontend).
+    fs: { allow: [REPO_ROOT, ...extensionRealPaths()] },
   },
   // `start.sh` serves the production build via `vite preview`, which does NOT
   // share the `server:` block above — so host allowlist + API/WS proxy must be

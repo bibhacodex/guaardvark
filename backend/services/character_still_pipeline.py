@@ -31,6 +31,18 @@ CharacterSource = Literal[
 ]
 
 
+def _offline_key_for(profile: dict) -> Optional[str]:
+    """Offline model key for a train-base profile; Z-Image is the only offline base.
+
+    A ComfyUI base (FLUX, SDXL) has none. Giving it Z-Image's key made FLUX
+    characters take Z-Image's strength setting and its 9 steps / guidance 0.
+    """
+    key = profile.get("offline_model_key")
+    if key:
+        return key
+    return "zimage-turbo" if (profile.get("family") or "zimage") == "zimage" else None
+
+
 def _subjects_from_ids(subject_ids: Sequence[int] | None) -> list:
     """Load Subjects by id. Safe from daemon threads / Celery (opens app_context)."""
     if not subject_ids:
@@ -104,6 +116,7 @@ def render_character_still(
     width: int | None = None,
     height: int | None = None,
     steps: int | None = None,
+    steps_explicit: bool = False,
     guidance: float | None = None,
     seed: int | None = None,
     negative_prompt: str = "",
@@ -201,7 +214,7 @@ def render_character_still(
                     route = {
                         "family": profile.get("family") or "zimage",
                         "inference_engine": profile.get("inference_engine") or "offline",
-                        "offline_model_key": profile.get("offline_model_key") or "zimage-turbo",
+                        "offline_model_key": _offline_key_for(profile),
                         "comfy_model_tag": profile.get("comfy_model_tag"),
                         "base_model_id": profile.get("id") or explicit,
                     }
@@ -211,7 +224,7 @@ def render_character_still(
                 route = {
                     "family": profile.get("family") or "zimage",
                     "inference_engine": profile.get("inference_engine") or "offline",
-                    "offline_model_key": profile.get("offline_model_key") or "zimage-turbo",
+                    "offline_model_key": _offline_key_for(profile),
                     "comfy_model_tag": profile.get("comfy_model_tag"),
                     "base_model_id": profile.get("id") or base_id,
                 }
@@ -231,16 +244,23 @@ def render_character_still(
     )
     strength = resolve_lora_strength(strength_model, lora_strength)
 
+    from backend.services.image_render_limits import resolve_canvas, strict_limits_enabled
+    strict = strict_limits_enabled()
+    defaults_model = route.get("offline_model_key") or route.get("comfy_model_tag") or "auto"
+    if engine == "comfy" and route.get("comfy_model_tag"):
+        # A ComfyUI base samples from its own row (FLUX-dev 28 steps / 3.5).
+        defaults_model = route["comfy_model_tag"]
     defaults = resolve_stills_defaults(
-        route.get("offline_model_key") or route.get("comfy_model_tag") or "auto",
+        defaults_model,
         width=width,
         height=height,
         steps=steps,
+        steps_explicit=steps_explicit,
         guidance=guidance,
     )
     w = int(width if width else defaults["width"])
     h = int(height if height else defaults["height"])
-    st = int(steps if steps is not None else defaults["steps"])
+    st = int(defaults["steps"])
     g = float(guidance if guidance is not None else defaults["guidance"])
 
     dest = Path(output_path) if output_path else Path(tempfile.gettempdir()) / (
@@ -251,6 +271,9 @@ def render_character_still(
 
     meta = {
         "source": source,
+        "steps": st,
+        "steps_requested": defaults["steps_requested"],
+        "steps_notice": defaults["steps_notice"],
         "family": family,
         "engine": engine,
         "base_model_id": route.get("base_model_id"),
@@ -272,7 +295,8 @@ def render_character_still(
                 negative_prompt=negative_prompt or "",
                 width=w,
                 height=h,
-                num_inference_steps=st if st > 0 else 8,
+                num_inference_steps=st,
+                steps_explicit=steps_explicit,
                 guidance_scale=g,
                 style=style,
                 seed=seed,
@@ -286,6 +310,8 @@ def render_character_still(
                 lora_scale=strength,
                 keep_pipeline_loaded=keep_pipeline,
             ))
+            st = (getattr(result, "metadata", None) or {}).get("steps", st)
+            meta["steps"] = st
             if not result.success or not result.image_path:
                 return StillResult(
                     success=False,
@@ -321,6 +347,11 @@ def render_character_still(
         # Comfy SDXL / FLUX — never for Z-Image LoRAs (guarded above).
         from backend.services.comfyui_image_generator import ComfyUIImageGenerator
         model_tag = route.get("comfy_model_tag") or ("flux-dev" if family == "flux" else "sdxl")
+        # The resolved guidance, not the graph's own default of 7.0 (FLUX-dev's
+        # FluxGuidance value is 3.5). Canvas limits stay behind strict mode.
+        extra = {"cfg": g}
+        if strict:
+            w, h, _ = resolve_canvas(w, h, model_tag)
         gen = ComfyUIImageGenerator(lora_strength=strength)
         path = gen.generate_image(
             prompt=final_prompt,
@@ -329,10 +360,14 @@ def render_character_still(
             width=w,
             height=h,
             seed=seed if seed is not None else 42,
-            steps=st if st > 0 else (20 if family == "flux" else 30),
+            steps=st,
+            steps_explicit=steps_explicit,
             model=model_tag,
             negative_prompt=negative_prompt or None,
+            **extra,
         )
+        st = getattr(gen, "last_steps", st)
+        meta["steps"] = st
         if not path or not Path(path).is_file():
             return StillResult(
                 success=False,

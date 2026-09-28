@@ -59,6 +59,20 @@ class TestClampPixelArea(unittest.TestCase):
         w, h = ComfyUIVideoGenerator._clamp_pixel_area(1920, 1920, "ltx25-distilled-int8")
         self.assertLessEqual(w * h, 1_050_000)
 
+    def test_minimax_budget_is_the_native_canvas(self):
+        # 864×480 (template default) and the native 1344×768 both pass; a
+        # 1920×1920 request is pulled under the 768×1344 canvas cap.
+        self.assertEqual(
+            ComfyUIVideoGenerator._clamp_pixel_area(864, 480, "minimax-h3-int8"),
+            (864, 480),
+        )
+        self.assertEqual(
+            ComfyUIVideoGenerator._clamp_pixel_area(1344, 768, "minimax-h3-int8"),
+            (1344, 768),
+        )
+        w, h = ComfyUIVideoGenerator._clamp_pixel_area(1920, 1920, "minimax-h3-int8")
+        self.assertLessEqual(w * h, 768 * 1344)
+
     def test_unbudgeted_family_is_untouched(self):
         self.assertEqual(
             ComfyUIVideoGenerator._clamp_pixel_area(1920, 1920, "cogvideox-5b"),
@@ -76,3 +90,13 @@ class TestClampPixelArea(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_h3_longer_clips_are_capped_at_their_measured_tier():
+    from backend.services.comfyui_video_generator import ComfyUIVideoGenerator as G
+    # 5 s keeps the native canvas; 10 s and 15 s tiers were measured at 480p.
+    assert G._clamp_pixel_area(1344, 768, "minimax-h3-int8", 124) == (1344, 768)
+    w, h = G._clamp_pixel_area(1344, 768, "minimax-h3-int8", 243)
+    assert w * h <= 864 * 480 and abs(w / h - 1344 / 768) < 0.02
+    assert G._clamp_pixel_area(864, 480, "minimax-h3-int8", 362) == (864, 480)
+    assert G._clamp_pixel_area(1344, 768, "minimax-h3-int8") == (1344, 768)

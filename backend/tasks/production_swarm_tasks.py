@@ -78,15 +78,22 @@ def _agent_run(prod_id: int, *, agent_name: str, expected_stage: str, next_agent
 
 def _default_ollama_llm(*, system: str, user: str, model: str = "gemma4:e4b") -> str:
     from backend.services.plugin_bridge import ensure_plugins_for_stage
+    from backend.services.ollama_chat_model import resolve_chat_model
     ensure_plugins_for_stage("film-crew", "screenwriting")  # or cinematography etc.; uses phased non-persist
     ensure_plugins_for_stage("film-crew", "cinematography")
     import ollama
+    # `model` is the agent's preference; the installer may have pulled a
+    # different tag of the family (gemma4:e2b on most machines), so resolve
+    # against what is actually installed rather than 404 on a clean box.
+    model = resolve_chat_model(model)
+    from backend.utils.ollama_resource_manager import think_payload
     response = ollama.chat(
         model=model,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
+        **think_payload(model),
     )
     return response["message"]["content"]
 
@@ -516,19 +523,55 @@ def run_editor(prod_id: int, i2v=None, audio_foundry=None, ffmpeg=None):
         if ctx is None:
             return
 
+        # A production may name the video model that renders its shots
+        # (settings_json.video_model, chosen in the create dialog). A model that
+        # declares audio_out renders each scene as one window with its own
+        # soundtrack instead of per-shot silent clips plus TTS.
+        settings = dict(getattr(ctx.production, "settings_json", None) or {})
+        video_model = str(settings.get("video_model") or "").strip() or None
+        scene_renderer = None
+        vram_estimate_mb = 14000
+        from backend.services.video_model_registry import (
+            resolve_active_video_model, model_capabilities, vram_mb_for_model,
+        )
+        resolved, resolve_err = resolve_active_video_model(
+            "i2v", video_model, surface="film-crew",
+        )
+        from backend.services.plugin_bridge import job_service_start_enabled
+        if job_service_start_enabled() and (video_model or resolved):
+            # Start ComfyUI when the model renders there and it is down, the
+            # way a Video Gen batch does, then resolve again against it.
+            from backend.services.video_model_registry import prepare_video_model
+            ready, prep_err = prepare_video_model(video_model or resolved)
+            if ready and resolve_err:
+                resolved, resolve_err = resolve_active_video_model(
+                    "i2v", video_model, surface="film-crew",
+                )
+            elif not ready and not resolve_err:
+                resolve_err = prep_err
+        if resolve_err:
+            ctx.fail(resolve_err)
+            return
+        caps = model_capabilities(resolved)
+        vram_estimate_mb = vram_mb_for_model(resolved, default=14000)
+        if caps.get("audio_out") and (caps.get("supports_i2v") or "ref2v" in caps.get("modes", [])):
+            from backend.services.comfyui_video_generator import MiniMaxH3SceneGenerator
+            scene_renderer = MiniMaxH3SceneGenerator(model=resolved)
+
         if i2v is None:
             # Animate each LoRA-consistent storyboard frame into a clip. Identity
-            # rides in the frame either way. Default = Wan 2.2 (chosen over the
-            # CogVideoX output); GUAARDVARK_FILM_I2V=cogvideox reverts
-            # to the CogVideoX-backed adapter. Wan additionally re-applies the LoRA
-            # + prompt to steady identity through motion.
-            engine = os.environ.get("GUAARDVARK_FILM_I2V", "wan").strip().lower()
+            # rides in the frame either way. GUAARDVARK_FILM_I2V=cogvideox reverts
+            # to the CogVideoX-backed adapter. Otherwise the resolved registry id.
+            engine = os.environ.get("GUAARDVARK_FILM_I2V", "").strip().lower()
             if engine in ("cogvideox", "cog", "svd"):
                 from backend.services.comfyui_video_generator import SvdI2VGenerator
                 i2v = SvdI2VGenerator()
             else:
                 from backend.services.comfyui_video_generator import Wan22I2VGenerator
-                i2v = Wan22I2VGenerator()
+                i2v = Wan22I2VGenerator(
+                    model=resolved,
+                    fps=int(caps.get("native_fps") or 24),
+                )
 
         # Real service clients with graceful degradation: ffmpeg always present
         # (system binary), audio only when the plugin is up, timeline compose
@@ -556,6 +599,7 @@ def run_editor(prod_id: int, i2v=None, audio_foundry=None, ffmpeg=None):
             audio_foundry=audio_foundry,
             ffmpeg=ffmpeg,
             video_editor=ve_client,
+            scene_renderer=scene_renderer,
         )
 
         from backend.services.swarm.agents.editor import ShotInput
@@ -593,7 +637,10 @@ def run_editor(prod_id: int, i2v=None, audio_foundry=None, ffmpeg=None):
                 lora_paths=lora_paths,
                 voice_id=voice_id,
                 scene_number=s.scene_number,
-                scene_mood=s.scene_mood
+                scene_mood=s.scene_mood,
+                character_name=(speaker.name if speaker else s.character_name),
+                ref_image_paths=list((speaker.ref_image_paths if speaker else None) or []),
+                character_description=(speaker.description if speaker else None),
             ))
             
         import tempfile
@@ -631,7 +678,7 @@ def run_editor(prod_id: int, i2v=None, audio_foundry=None, ffmpeg=None):
                 render_id,
                 evict_ollama=True,
                 free_comfyui=True,
-                vram_estimate_mb=14000,
+                vram_estimate_mb=vram_estimate_mb,
                 require_fit=True,
                 cross_process=True,
             ):

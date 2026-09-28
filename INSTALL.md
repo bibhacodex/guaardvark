@@ -16,6 +16,8 @@ curl -fsSL https://guaardvark.com/install.sh | bash
 
 Clones to `~/guaardvark` (override with `GUAARDVARK_HOME=/path`) and hands off to `./start.sh`. Re-running updates an existing install; `GUAARDVARK_NO_START=1` clones without launching.
 
+**Not sure what your machine can run?** See [docs/HARDWARE.md](docs/HARDWARE.md) — a tier-by-tier guide to what works CPU-only, on 8–12 GB cards, on the 16 GB design target, and beyond.
+
 **Or from a release zip:**
 
 1. **Extract:**
@@ -37,8 +39,8 @@ The startup script handles everything: Python 3.12 (auto-installed if needed), d
 | Service | URL |
 |---------|-----|
 | Web UI | http://localhost:5173 |
-| API | http://localhost:5000 |
-| Health Check | http://localhost:5000/api/health |
+| API | http://localhost:5000 (macOS: 5055) |
+| Health Check | http://localhost:5000/api/health (macOS: 5055) |
 
 First run may ask for your password once (PostgreSQL, Node.js, or Python packages via apt).
 
@@ -65,6 +67,32 @@ sudo systemctl restart earlyoom
 swapon --show   # if under 16G, grow it
 echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/99-guaardvark.conf && sudo sysctl --system
 ```
+
+## Install (macOS, Apple Silicon)
+
+The same `./start.sh` works on macOS. Known differences, and what to expect:
+
+- **Port 5000 is taken by AirPlay Receiver** on Monterey and later, so on macOS the backend
+  defaults to **5055** (`start.sh` writes `FLASK_PORT=5055` to `.env` on first start; the web UI,
+  Vite proxy and CLI follow it). Set `FLASK_PORT` yourself to use another port; if you force 5000
+  with AirPlay on, `start.sh` detects the clash and says so.
+- **GPU work runs on Metal (MPS) where the feature supports it.** Verified on Apple Silicon:
+  offline image generation for the Z-Image and Krea 2 families (#183) and LoRA training (#182;
+  slow, with timeouts raised to match). Not verified by this project: video generation through
+  ComfyUI on Metal (no render on a Mac is on file). ACE-Step song generation and FX Lab (Stable
+  Audio Open) each have an experimental Metal path: ACE-Step tries MPS on its own; FX Lab tries
+  it when `AUDIO_FOUNDRY_SAO_MPS=1` is set for the audio service. Results from real Macs are
+  welcome in #41; the full list is in `docs/HARDWARE.md`, "Apple Silicon".
+- **The screen agent is Linux-only.** It is an X11 virtual display (Xvfb); on macOS the agent
+  tools report that plainly and the rest of the app is unaffected.
+- **Already running ComfyUI Desktop?** Point Guaardvark at it with the port override under
+  "Custom plugin ports" below; every page follows the effective port.
+- **Fonts** for the video text overlay are found automatically; set
+  `GUAARDVARK_OVERLAY_FONT=/path/to/font.ttf` to choose one.
+
+A fresh Apple Silicon runner installs and imports the backend in CI on every push, so a
+regression in the above shows up before a person hits it. Report anything else under the
+`mac` label — the install thread is issue #41.
 
 ## Alternative: Docker (Linux, core stack only)
 
@@ -95,6 +123,31 @@ The file is gitignored and merged over the manifest at load, so the override sur
 - Health diagnostics: `./start.sh --test`
 - Wrong Python venv (e.g. after upgrade): `rm -rf backend/venv && ./start.sh`
 - Check logs in `logs/`
+- **`extension "vector" is not available`** when indexing: PostgreSQL is installed but pgvector is not. `./start.sh` installs it and enables the extension (needs sudo once); to do it by hand, `sudo apt-get install -y postgresql-<major>-pgvector` then `sudo -u postgres psql -d guaardvark -c "CREATE EXTENSION IF NOT EXISTS vector;"`. If apt cannot find the package on your release, add the [PostgreSQL apt repository](https://www.postgresql.org/download/linux/ubuntu/) first.
+- **You run Ollama yourself and do not want the scripts touching it**: `./start.sh --external-ollama` (persists `GUAARDVARK_OLLAMA_EXTERNAL=1` in `.env`). `start.sh` then only checks that `127.0.0.1:11434` answers, and `stop.sh` leaves it alone. Without that flag, `stop.sh` stops only the Ollama `start.sh` itself launched; `./stop.sh --keep-ollama` (or `GUAARDVARK_OLLAMA_KEEP_RUNNING=1`) keeps even that one, and `./stop.sh --all` restores the full sweep (your own `ollama serve`, the systemd service, a dead port holder). Both switches are also in Settings → Product Profile → Ollama.
+- **Ollama says a model is missing that `ollama list` shows** (WSL2 especially): a hand-started `ollama serve` runs as your user and reads `~/.ollama/models`, while the systemd service runs as `ollama` and reads `/usr/share/ollama/.ollama/models`. Stop the hand-started one and use the service: `sudo systemctl restart ollama`.
+- **`start.sh` says it is "not re-provisioning" PostgreSQL**: your `DATABASE_URL` names a role or database other than the stock `guaardvark`, and the connection failed. The script never resets a role it did not create. Fix the password in `.env`, create the role and database yourself, or run `./start.sh --skip-postgres` for an externally managed database.
+- **Film Crew fails with `model 'gemma4:e4b' not found`**: fixed in 2.8.0 — agents now use whichever Gemma4 tag the installer pulled. On older versions, `ollama pull gemma4:e4b`.
+- **Faster attention for video models.** ComfyUI runs PyTorch attention by
+  default.   Set `GUAARDVARK_COMFYUI_ATTENTION=ck` in `.env` to use the Comfy
+  Kitchen int8 kernel that ships in the backend venv, or `sage` if you have
+  installed the `sageattention` package into `backend/venv` yourself (Guaardvark
+  never installs it for you; SageAttention 2 needs a CUDA 12.4+ toolchain the
+  default cu121 wheels do not carry). `auto` picks whichever is available. The
+  setting applies to every ComfyUI-routed model, so compare a render before and
+  after; the ComfyUI plugin's start log prints the backend it chose. Measured on
+  MiniMax H3 (16 GB RTX 40-series, 864x480, 20 steps): `ck` took 339 s against
+  390 s with frames indistinguishable at the same seed.
+- **Video clips from chat or MCP look washed out or over-cooked**: a request that names no
+  guidance renders with the model's own template value (LTX 1, Wan 14B 3.5, Wan 5B 5). Set
+  `GUAARDVARK_VIDEO_REFERENCE_DEFAULTS=1` in `.env` (off by default) and restart the backend to
+  also send Wan's template negative prompt when none is given. `scripts/video_prompt_ab.py`
+  compares the variants on your card.
+- **A 20 GB-class video model runs out of memory at the first step** (MiniMax H3 on a 16 GB
+  card): ComfyUI left too little room for its activations. Each model declares the
+  `--reserve-vram` it needs (H3 5.0, Wan 2.2 14B 1.0) and Guaardvark relaunches ComfyUI when the
+  running value differs. Remove `GUAARDVARK_COMFYUI_RESERVE_VRAM` from `.env` if it is set: an
+  explicit value overrides every model's own, and H3 runs out of memory at 1.0.
 
 ## Data
 

@@ -25,6 +25,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import time
+from dataclasses import dataclass
 from typing import Iterator, Optional
 
 log = logging.getLogger(__name__)
@@ -92,19 +94,182 @@ def evict_ollama_models() -> bool:
         return False
 
 
-def reclaim_gpu(*, evict_ollama: bool = False, free_comfyui: bool = False) -> None:
+_AUDIO_FOUNDRY_URL = "http://127.0.0.1:8206"
+
+
+def evict_audio_foundry_backends() -> list:
+    """Ask the Audio Foundry sidecar to unload every backend it holds. Never raises.
+
+    Its voice, effects and music models are never what a render is asking for,
+    and the sidecar owns their CUDA memory: the orchestrator only tracks its
+    slots, and a backend restart forgets even that while the model stays on the
+    card (an idle 3.9GB voice model once held an image batch at "need ~12024MB,
+    only 11960MB usable"). The sidecar's /evict refuses a backend that is
+    generating, so a live request is never cut off. Returns the intents it
+    reported unloaded.
+    """
+    try:
+        import requests
+
+        try:
+            from backend.api.audio_foundry_api import AUDIO_FOUNDRY_URL as base
+        except Exception:  # noqa: BLE001
+            base = _AUDIO_FOUNDRY_URL
+        try:
+            status = requests.get(f"{base}/status", timeout=(1.0, 5.0)).json()
+        except requests.RequestException:
+            return []  # sidecar not running
+        unloaded = []
+        for intent, info in (status.get("backends") or {}).items():
+            if not (info or {}).get("loaded"):
+                continue
+            try:
+                resp = requests.post(f"{base}/evict/{intent}", timeout=(1.0, 30.0))
+                if resp.ok and resp.json().get("unloaded"):
+                    unloaded.append(intent)
+            except (requests.RequestException, ValueError) as e:
+                log.warning("audio_foundry evict %s failed (non-fatal): %s", intent, e)
+        if unloaded:
+            log.info("Reclaim: audio_foundry unloaded %s", ", ".join(unloaded))
+        return unloaded
+    except Exception as e:  # noqa: BLE001
+        log.warning("audio_foundry eviction failed (non-fatal): %s", e)
+        return []
+
+
+def reclaim_in_process_vram(needed_mb: int = 0) -> int:
+    """Release CUDA memory this process is holding. Returns MB freed. Never raises.
+
+    The third resident. ``evict_ollama_models`` and ``free_comfyui_vram`` both talk
+    to *other* processes over HTTP; models this backend loaded into its own CUDA
+    context — a resident diffusers pipeline, the retrieval cross-encoder — answer to
+    neither. Before this existed the admission path could ask two of the three
+    residents to leave and then refuse the job because of the third: a 1.1GB
+    cross-encoder against ~1.4GB of slack refused image batches by ~130MB, and the
+    orchestrator's own reclaim (which does know how to unload it) sits behind the
+    fit check that had already raised.
+    """
+    try:
+        from backend.services.gpu_memory_orchestrator import get_orchestrator_if_created
+        orch = get_orchestrator_if_created()
+        if orch is not None:
+            return int(orch.reclaim_auxiliary_models() or 0)
+        # No orchestrator in this process. These models load themselves without
+        # asking one, so they can be resident even here; release them directly
+        # rather than starting a sync thread to ask about them.
+        freed = 0
+        for module_path in (
+            "backend.utils.reranker",
+            "backend.utils.docling_loader",
+            "backend.utils.faster_whisper_utils",
+        ):
+            try:
+                import importlib
+                unload = getattr(importlib.import_module(module_path), "unload", None)
+                if unload is None:
+                    continue
+                result = unload()
+                if isinstance(result, dict):
+                    freed += int(result.get("freed_mb") or 0)
+            except ImportError:
+                continue
+            except Exception as e:  # noqa: BLE001
+                log.warning("in-process reclaim of %s failed: %s", module_path, e)
+        return freed
+    except Exception as e:  # noqa: BLE001
+        log.warning("in-process GPU reclaim failed (non-fatal): %s", e)
+        return 0
+
+
+_RECLAIM_POLL_S = 0.5
+_RECLAIM_POLLS = 34  # with the 3 s settle: up to 20 s for a freed model to leave the card
+
+
+def vram_holders_text(*, limit: int = 6) -> str:
+    """Processes holding VRAM right now, largest first, as one readable line.
+
+    A refusal that says only "another model/render may be resident" cannot be
+    acted on; the desktop, a screen recorder's encoder and stray sidecars are
+    as likely as a model. Never raises — diagnostics must not fail a render.
+    """
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        rows = []
+        for line in (out.stdout or "").splitlines():
+            parts = [c.strip() for c in line.split(",")]
+            if len(parts) != 3:
+                continue
+            rows.append((int(parts[2] or 0), os.path.basename(parts[1]), parts[0]))
+        if not rows:
+            return "no compute processes listed"
+        rows.sort(reverse=True)
+        return ", ".join(f"{name}[{pid}] {mb}MB" for mb, name, pid in rows[:limit])
+    except Exception:  # noqa: BLE001
+        return "unavailable"
+
+
+def _wait_until_fits(vram_estimate_mb: int, reserve_mb: int, op_id: str) -> None:
+    """ComfyUI answers /free before the memory is actually back. After the
+    fixed settle, poll the fit up to _RECLAIM_POLLS times instead of trusting
+    the settle alone: a 12 GB FLUX unload took longer than 3 s, so a chat edit
+    that followed an identity render was refused with "try again shortly"
+    every time. Returns as soon as the job fits; the caller re-checks anyway."""
+    time.sleep(_RECLAIM_SETTLE_S)
+    for _ in range(_RECLAIM_POLLS):
+        try:
+            if fit_verdict(vram_estimate_mb, reserve_mb=reserve_mb).ok:
+                return
+        except Exception:  # noqa: BLE001 — the real check follows
+            return
+        time.sleep(_RECLAIM_POLL_S)
+    waited = _RECLAIM_SETTLE_S + _RECLAIM_POLLS * _RECLAIM_POLL_S
+    fit = None
+    try:
+        fit = fit_verdict(vram_estimate_mb, reserve_mb=reserve_mb)
+    except Exception:  # noqa: BLE001 — diagnostics only
+        pass
+    log.warning(
+        "gpu_session(%s): freed VRAM did not settle within %.0fs — need %sMB, "
+        "free %sMB. Holding the card: %s",
+        op_id, waited,
+        getattr(fit, "need_mb", vram_estimate_mb), getattr(fit, "free_mb", "?"),
+        vram_holders_text(),
+    )
+
+
+def reclaim_gpu(
+    *,
+    evict_ollama: bool = False,
+    free_comfyui: bool = False,
+    in_process: bool = False,
+    needed_mb: int = 0,
+) -> None:
     """Run the requested VRAM reclaims before a render uses the card. Best-effort."""
     if evict_ollama:
         evict_ollama_models()
     if free_comfyui:
         free_comfyui_vram()
+    if in_process:
+        evict_audio_foundry_backends()
+        reclaim_in_process_vram(needed_mb)
 
 
 # --- Orchestrator budget hooks (opt-in) --------------------------------------
 
 def _orchestrator_request(
-    slot_id: str, vram_estimate_mb: int, *, hard_fit: bool = True, vram_reserve_mb: int = 0
+    slot_id: str, vram_estimate_mb: int, *, hard_fit: bool = False, vram_reserve_mb: int = 0
 ) -> None:
+    """Book ``vram_estimate_mb`` for ``slot_id`` in the orchestrator ledger.
+
+    The session has already decided fit, so the booking is not a second fit
+    check (``hard_fit`` defaults to False). An orchestrator refusal surfaces as
+    ``GpuBusyError``; any other failure is non-fatal.
+    """
     try:
         from backend.services.gpu_memory_orchestrator import get_orchestrator
         get_orchestrator().request_model(
@@ -112,7 +277,6 @@ def _orchestrator_request(
             vram_reserve_mb=vram_reserve_mb,
         )
     except RuntimeError as e:
-        # Hard-fit refuse → surface as GpuBusyError so callers can retry cleanly
         from backend.services.job_operation_gate import GpuBusyError
         log.warning("orchestrator refused %s: %s", slot_id, e)
         raise GpuBusyError(str(e)) from e
@@ -121,98 +285,130 @@ def _orchestrator_request(
 
 
 def _orchestrator_release(slot_id: str) -> None:
+    """Release the booking. Session slots (image batches, and any slot naming
+    video) are dropped outright: they account for VRAM the caller held, so once
+    its gpu_session exits the booking is stale and would otherwise sit in the
+    registry as tracked VRAM. Model slots such as sd:pipeline and ollama:* keep
+    the normal release, which only starts their eviction timer."""
     try:
         from backend.services.gpu_memory_orchestrator import get_orchestrator
-        get_orchestrator().release_model(slot_id)
+        orch = get_orchestrator()
+        orch.release_model(slot_id)
+        if slot_id.startswith("image_batch:") or "video" in slot_id.lower():
+            orch.drop_booking(slot_id)
     except Exception as e:  # noqa: BLE001
         log.warning("orchestrator release_model(%s) failed (non-fatal): %s", slot_id, e)
 
 
-def _ensure_fits_or_busy(
-    estimate_mb: int, slot: str, *, margin_mb: int = 1024, reserve_mb: int = 0
-) -> None:
-    """After eviction, re-probe PHYSICAL free VRAM and fail fast if it still won't fit.
+@dataclass(frozen=True)
+class Fit:
+    """Outcome of one VRAM fit check (see ``fit_verdict``).
 
-    The physical probe (pynvml/nvidia-smi via the coordinator) already includes ComfyUI +
-    plugin-sidecar allocations that the in-process registry can't see — so admitting
-    against it inherently accounts for every consumer. If estimate + headroom won't fit,
-    raise GpuBusyError so the caller gets a clean 'busy, retry' instead of a CUDA OOM or a
-    hung allocation. Probe-unavailable (CPU-only host / no driver) admits — never blocks.
-
-    Message distinguishes two cases:
-      * estimate alone > total card VRAM → estimate exceeds GPU capacity
-      * card has free space but still short → another consumer may be resident
-
-    Margin must not invent capacity overflow: when the estimate itself fits the card
-    (`estimate_mb <= total`) but `estimate + margin` spills over total, and the GPU is
-    mostly free (≥85%), admit. That unblocks near-full-card models (LTX/Cog @ ~16GB
-    estimate on a ~16376MB card) that already render successfully via ComfyUI.
+    ``capacity`` marks a refusal no eviction can fix: the estimate, or the
+    estimate plus headroom, exceeds the card. ``headroom`` is True when free
+    VRAM minus the reserve already covers the estimate plus margin, so there is
+    nothing to reclaim; it is False when the probe is unavailable. ``reason``
+    holds the refusal text with a ``{slot}`` placeholder.
     """
+
+    ok: bool
+    capacity: bool
+    free_mb: int
+    total_mb: int
+    need_mb: int
+    headroom: bool = False
+    reason: str = ""
+
+
+def fit_verdict(estimate_mb: int, *, reserve_mb: int = 0, margin_mb: int = 1024) -> Fit:
+    """Decide whether ``estimate_mb`` fits the card right now — the one fit check.
+
+    Probes physical free VRAM through the coordinator, which already counts
+    ComfyUI and sidecar allocations the in-process registry cannot see. A
+    failed or absent probe admits (advisory; never blocks). ``reserve_mb`` is
+    treated as not free. A mostly idle card (at least 85% free) admits an
+    estimate that fits the card minus the reserve even when the margin alone
+    spills past the total — near-full-card video models depend on this.
+    """
+    estimate_mb = int(estimate_mb)
+    margin_mb = int(margin_mb)
+    reserve_mb = max(0, int(reserve_mb))
+    need = estimate_mb + margin_mb
     try:
         from backend.services.gpu_resource_coordinator import get_gpu_coordinator
         info = get_gpu_coordinator().get_available_vram()
     except Exception as e:  # noqa: BLE001
         log.warning("VRAM fit-check probe failed (%s); admitting (advisory)", e)
-        return
+        return Fit(ok=True, capacity=False, free_mb=0, total_mb=0, need_mb=need)
     if not info.get("success"):
-        return  # no usable GPU probe — do not block
+        return Fit(ok=True, capacity=False, free_mb=0, total_mb=0, need_mb=need)
     free = int(info.get("available_mb") or 0)
     total = int(info.get("total_mb") or 0)
-    estimate_mb = int(estimate_mb)
-    margin_mb = int(margin_mb)
-    # Compositor reserve (opt-in, 2026-08-04): treat reserved MB as not free —
-    # the desktop's share of the card must survive the job. mostly_free stays
-    # computed on RAW free (it detects "card is idle", which reserve can't change).
-    reserve_mb = max(0, int(reserve_mb))
     free_eff = max(0, free - reserve_mb)
-    need = estimate_mb + margin_mb
+    # mostly_free is judged on raw free: it detects an idle card, which the
+    # reserve cannot change.
     mostly_free = total > 0 and free >= int(total * 0.85)
     if free_eff >= need:
-        return
-    # Honest capacity refuse: the estimate itself does not fit the card.
-    if total > 0 and estimate_mb > total:
-        from backend.services.job_operation_gate import GpuBusyError
-        raise GpuBusyError(
-            f"Not enough free VRAM for {slot}: estimate exceeds GPU capacity "
-            f"(~{need}MB needed = est {estimate_mb} + {margin_mb} headroom, "
-            f"card total ~{total}MB, free ~{free}MB). Pick a lighter model "
-            f"(e.g. Wan 2.2 5B on 16GB cards) or lower the estimate."
+        return Fit(
+            ok=True, capacity=False, free_mb=free, total_mb=total, need_mb=need,
+            headroom=True,
         )
-    # Margin / headroom must not invent a refuse when the estimate fits the card
-    # and the GPU is mostly free (≥85%). Covers:
-    #   * estimate+margin > total (false "capacity overflow" on ~16GB cards)
-    #   * estimate+margin <= total but free is a few GB short (ComfyUI base ~2GB
-    #     resident) — proven renderable via the direct generator path.
+    capacity_reason = (
+        f"Not enough free VRAM for {{slot}}: estimate exceeds GPU capacity "
+        f"(~{need}MB needed = est {estimate_mb} + {margin_mb} headroom, "
+        f"card total ~{total}MB, free ~{free}MB). Pick a lighter model "
+        f"(e.g. Wan 2.2 5B on 16GB cards) or lower the estimate."
+    )
+    if total > 0 and estimate_mb > total:
+        return Fit(
+            ok=False, capacity=True, free_mb=free, total_mb=total, need_mb=need,
+            reason=capacity_reason,
+        )
     if mostly_free and estimate_mb <= total - reserve_mb:
         log.info(
-            "VRAM fit-check: admitting %s (est %s fits card total %s minus "
-            "%s reserve; need %s with margin; free %s mostly idle — not "
-            "inventing a refuse)",
-            slot, estimate_mb, total, reserve_mb, need, free,
+            "VRAM fit-check: admitting est %s (fits card total %s minus %s "
+            "reserve; need %s with margin; free %s mostly idle)",
+            estimate_mb, total, reserve_mb, need, free,
         )
-        return
-    from backend.services.job_operation_gate import GpuBusyError
-    if total > 0 and need > total:
-        raise GpuBusyError(
-            f"Not enough free VRAM for {slot}: estimate exceeds GPU capacity "
-            f"(~{need}MB needed = est {estimate_mb} + {margin_mb} headroom, "
-            f"card total ~{total}MB, free ~{free}MB). Pick a lighter model "
-            f"(e.g. Wan 2.2 5B on 16GB cards) or lower the estimate."
-        )
-    # Free short and card is NOT mostly idle → something else is resident.
+        return Fit(ok=True, capacity=False, free_mb=free, total_mb=total, need_mb=need)
+    # NOT capacity. Reaching here means the estimate itself fits the card, the
+    # card is not mostly idle, and only estimate+margin overflows — which is a
+    # statement about who is resident right now, not about the card. Once they
+    # leave, `mostly_free` above admits the identical job. Marking it capacity
+    # made it terminal, and callers discard their whole retry deadline on a
+    # capacity refusal: a 16000MB video model on a 16376MB card hit this on every
+    # attempt and was told to "pick a lighter model" while merely waiting would
+    # have worked. `_reclaim_needed` already draws the line in the right place
+    # (only estimate-alone overflow is final); this is the other call site
+    # agreeing with it.
     _reserve_note = f" − {reserve_mb} compositor reserve" if reserve_mb else ""
-    raise GpuBusyError(
-        f"Not enough free VRAM for {slot}: need ~{need}MB (est {estimate_mb} + "
+    resident_reason = (
+        f"Not enough free VRAM for {{slot}}: need ~{need}MB (est {estimate_mb} + "
         f"{margin_mb} headroom), only {free_eff}MB usable ({free}MB free"
         f"{_reserve_note}) after eviction — another model/render may be "
         f"resident. Try again shortly."
     )
+    return Fit(
+        ok=False, capacity=False, free_mb=free, total_mb=total, need_mb=need,
+        reason=resident_reason,
+    )
 
 
-def is_capacity_overflow_error(exc: BaseException) -> bool:
-    """True when GpuBusyError means the estimate can never fit this card."""
-    msg = str(exc) or ""
-    return "estimate exceeds GPU capacity" in msg
+def _raise_unless_fits(fit: Fit, slot: str) -> None:
+    """Raise the typed refusal for ``fit``: ``GpuCapacityError`` when no eviction
+    can help, ``GpuBusyError`` when another resident may leave."""
+    if fit.ok:
+        return
+    from backend.services.job_operation_gate import GpuBusyError, GpuCapacityError
+    text = fit.reason.format(slot=slot)
+    raise (GpuCapacityError if fit.capacity else GpuBusyError)(text)
+
+
+def _ensure_fits_or_busy(
+    estimate_mb: int, slot: str, *, margin_mb: int = 1024, reserve_mb: int = 0
+) -> None:
+    """Raise unless ``estimate_mb`` fits the card (``fit_verdict`` + ``_raise_unless_fits``)."""
+    _raise_unless_fits(fit_verdict(estimate_mb, reserve_mb=reserve_mb, margin_mb=margin_mb), slot)
 
 
 def vram_probe_snapshot(*, margin_mb: int = 1024, reserve_mb: int = 0) -> dict:
@@ -240,14 +436,9 @@ def vram_probe_snapshot(*, margin_mb: int = 1024, reserve_mb: int = 0) -> dict:
     return out
 
 
-def reclaim_and_settle(*, evict_ollama: bool = True, free_comfyui: bool = True, settle_s: float = 3.0) -> dict:
-    """Unload residents, then sleep so the driver reports freed VRAM before re-admit."""
-    reclaim_gpu(evict_ollama=evict_ollama, free_comfyui=free_comfyui)
-    settle = max(0.0, float(settle_s))
-    if settle:
-        import time as _t
-        _t.sleep(settle)
-    return vram_probe_snapshot()
+# ComfyUI's /free is asynchronous; the fit probe waits this long after a reclaim
+# so the driver reports the freed VRAM.
+_RECLAIM_SETTLE_S = 3.0
 
 
 import threading as _threading
@@ -294,6 +485,64 @@ def _acquire_cross_process_lease(slot: str, *, lease_seconds: Optional[int] = No
         return True
     from backend.services.job_operation_gate import GpuBusyError
     raise GpuBusyError(f"GPU is held by another process ({res.get('error', 'busy')}).")
+
+
+def _default_lease_seconds(kind) -> int:
+    """Lease length by job kind; the heartbeat renews it, so this only bounds a
+    holder that dies without releasing."""
+    name = str(getattr(kind, "value", kind)).lower()
+    if "train" in name:
+        return 4 * 3600
+    if "video" in name:
+        return 3600
+    return 900
+
+
+def _start_lease_heartbeat(slot: str, lease_seconds: int) -> "threading.Event":
+    """Renew the cross-process lease every lease/3 until the returned event is set."""
+    import threading
+    stop = threading.Event()
+    interval = max(60.0, lease_seconds / 3.0)
+
+    def _beat():
+        try:
+            from backend.services.gpu_resource_coordinator import get_gpu_coordinator
+            coord = get_gpu_coordinator()
+        except Exception:  # noqa: BLE001
+            return
+        while not stop.wait(interval):
+            try:
+                if not coord.renew_generic(slot, lease_seconds=lease_seconds):
+                    log.warning("gpu lease heartbeat for %s: lock no longer ours; stopping", slot)
+                    return
+            except Exception as e:  # noqa: BLE001
+                log.warning("gpu lease heartbeat for %s failed: %s", slot, e)
+
+    threading.Thread(target=_beat, name=f"gpu-lease-heartbeat:{slot}", daemon=True).start()
+    return stop
+
+
+def _reclaim_needed(estimate_mb: int, *, reserve_mb: int = 0, margin_mb: int = 1024) -> bool:
+    """Decide whether evicting residents can help before doing it.
+
+    Returns False when the estimate already fits with headroom (nothing to
+    reclaim) and raises ``GpuCapacityError`` when the estimate alone exceeds
+    the card — in both cases the resident chat model survives. An unavailable
+    probe returns True.
+
+    Note what this does NOT cover: a job admitted by ``fit_verdict``'s mostly-idle
+    escape hatch still reclaims, because there `free_eff < need` and freeing the
+    remaining residents is what keeps it from OOMing. `headroom` is deliberately
+    not set on that path. For any model whose estimate+margin exceeds the card
+    (the 14000/16000MB video models) `headroom` is arithmetically unreachable, so
+    those callers always reclaim — that is intended, not an oversight.
+    """
+    fit = fit_verdict(estimate_mb, reserve_mb=reserve_mb, margin_mb=margin_mb)
+    # Only the estimate-alone overflow is final before eviction; a margin
+    # overflow may still clear once residents leave and the card is mostly idle.
+    if fit.capacity and fit.total_mb > 0 and int(estimate_mb) > fit.total_mb:
+        _raise_unless_fits(fit, "preflight")
+    return not fit.headroom
 
 
 def _release_cross_process_lease(slot: str) -> None:
@@ -356,102 +605,163 @@ def gpu_session(
     slot_id: Optional[str] = None,
     lease_seconds: Optional[int] = None,
     vram_reserve_mb: int = 0,
+    cancel_event=None,
 ) -> Iterator[bool]:
     """Claim the GPU for a unit of work — exclusivity + VRAM reclaim/budget in one place.
 
     Wraps ``JobOperationGate.gpu_exclusive(kind, op_id, on_busy)`` — preserving its
-    fail-fast ``GpuBusyError`` and 8s post-release cooldown EXACTLY — and additionally,
-    once the slot is actually held:
-      * runs ``reclaim_gpu(evict_ollama, free_comfyui)`` (evict only after we win), and
-      * optionally debits the GPUMemoryOrchestrator budget when ``vram_estimate_mb`` is
-        given (makes 'exclusive' and 'VRAM-budgeted' the same fact), releasing on exit.
+    fail-fast ``GpuBusyError`` — and additionally, once the slot is actually held:
+      * acquires the cross-process lease (opt-in), then
+      * runs ``reclaim_gpu(evict_ollama, free_comfyui)`` (evict only after we win), then
+      * refuses with a typed ``GpuBusyError``/``GpuCapacityError`` when ``require_fit``
+        and the estimate still does not fit, then
+      * admits against system load and books the GPUMemoryOrchestrator budget when
+        ``vram_estimate_mb`` is given, releasing everything on exit.
+
+    ``cancel_event`` ends an ``on_busy='wait'`` gate wait with ``GpuBusyError``
+    once it is set, so a cancelled job does not hold up the queue behind it.
+
+    A refusal raised after the claim releases the gate without its post-release
+    cooldown: nothing touched the card. Teardown runs in reverse order and before
+    the gate release, so ComfyUI's /free and the lease release precede it.
 
     With all defaults this is a pure pass-through to the gate (no eviction, no budget),
     so adopting it in one caller never changes another's behavior. Yields the gate's
     acquired bool (False only in the degraded ``on_busy='register'`` path).
     """
     # Reentrancy: a same-thread nested gpu_session is a pass-through — the outer call owns
-    # the gate, the cross-process lease, the eviction and the 8s cooldown. Prevents self-
+    # the gate, the cross-process lease, the eviction and the cooldown. Prevents self-
     # deadlock if enforcement ever lives inside a generator a wrapped caller also wraps.
     if getattr(_session_tls, "held", False):
         log.debug("gpu_session(%s) reentrant pass-through", op_id)
         yield True
         return
 
-    from backend.services.job_operation_gate import get_gate
+    from backend.services.job_operation_gate import GpuBusyError, get_gate
 
     gate = get_gate()
     _slot = slot_id or f"{getattr(kind, 'value', kind)}:{op_id}"
     acquired = False
     lease_held = False
+    heartbeat_stop = None
     load_weight = None
-    try:
-        with gate.gpu_exclusive(
-            kind, op_id, on_busy=on_busy, wait_timeout=wait_timeout
-        ) as acq:
-            acquired = acq
-            if acquired:
-                _session_tls.held = True
-                # Cross-process lease (opt-in): acquire AFTER the in-PID gate (lock
-                # ordering), BEFORE eviction — only evict once we own both locks.
+    booked = False
+
+    def _teardown() -> None:
+        # Reverse of the acquisition order, with two deviations that exist because
+        # a BaseException — Ctrl-C, SystemExit, a Celery revoke, gevent's
+        # GreenletExit — can arrive between any two statements here, and every
+        # inner guard below only catches Exception.
+        #
+        #   1. The heartbeat is stopped FIRST. It renews the cross-process lease
+        #      every lease/3 seconds, so a heartbeat that outlives its teardown
+        #      does not merely delay the release, it holds the lease for the life
+        #      of the process: acquire_generic's stale-PID and expired-lease
+        #      sweeps both decline while the PID is alive and the lease keeps
+        #      moving. Nothing recovers it.
+        #   2. The lease release is in a finally. It was last, behind an
+        #      orchestrator release and a ComfyUI /free with a 15s timeout — a
+        #      wide window in which an interrupt would strand the on-disk lock for
+        #      its full term (3600s video, 14400s training), refusing every other
+        #      process with "GPU is held by another process".
+        nonlocal load_weight, heartbeat_stop, lease_held, booked
+        if heartbeat_stop is not None:
+            heartbeat_stop.set()
+            heartbeat_stop = None
+        try:
+            _load_release(load_weight)
+            load_weight = None
+            if booked:
+                _orchestrator_release(_slot)
+                if "video" in _slot.lower():
+                    try:
+                        free_comfyui_vram()
+                    except Exception:  # noqa: BLE001
+                        pass
+                booked = False
+        finally:
+            if lease_held:
+                _release_cross_process_lease(_slot)
+                lease_held = False
+
+    with gate.gpu_exclusive(
+        kind, op_id, on_busy=on_busy, wait_timeout=wait_timeout, cancel_event=cancel_event
+    ) as acq:
+        acquired = acq
+        if acquired:
+            _session_tls.held = True
+            try:
+                # Cross-process lease: after the in-PID gate (lock ordering) and
+                # before any eviction — only evict once both locks are ours.
                 if cross_process:
+                    lease_len = int(lease_seconds or _default_lease_seconds(kind))
                     lease_held = _acquire_cross_process_lease(
-                        _slot, lease_seconds=lease_seconds
+                        _slot, lease_seconds=lease_len
                     )
-                reclaim_gpu(evict_ollama=evict_ollama, free_comfyui=free_comfyui)
-                # Strict admission (opt-in): after eviction, refuse with a clean "busy" if
-                # the estimate still won't physically fit — turns a CUDA OOM/hang into retry.
+                    if lease_held:
+                        heartbeat_stop = _start_lease_heartbeat(_slot, lease_len)
+                # Evict residents only when the estimate does not already fit and
+                # the card could hold it at all; otherwise the refusal would have
+                # cost the user their chat model for nothing.
+                # In-process reclaim is NOT gated on the evict_ollama/free_comfyui
+                # flags: those name other processes, and a caller that asked for
+                # neither still cannot afford to be refused over memory this very
+                # process is sitting on. It runs only behind _reclaim_needed, so a
+                # job that already fits never costs anyone their resident model.
                 if require_fit and vram_estimate_mb:
-                    _ensure_fits_or_busy(
-                        vram_estimate_mb, _slot, reserve_mb=vram_reserve_mb
+                    if _reclaim_needed(vram_estimate_mb, reserve_mb=vram_reserve_mb):
+                        reclaim_gpu(
+                            evict_ollama=evict_ollama,
+                            free_comfyui=free_comfyui,
+                            in_process=True,
+                            needed_mb=vram_estimate_mb,
+                        )
+                        # Every resident answers its eviction before the memory
+                        # is actually back: ComfyUI acks /free early, and Ollama's
+                        # keep_alive=0 returns before the runner drops its CUDA
+                        # context. Waiting only for ComfyUI left the Ollama-only
+                        # callers measuring mid-unload and refusing a job that fits.
+                        _wait_until_fits(vram_estimate_mb, vram_reserve_mb, op_id)
+                    else:
+                        log.info("gpu_session(%s): %d MB already fits; skipping eviction", op_id, vram_estimate_mb)
+                elif evict_ollama or free_comfyui:
+                    reclaim_gpu(evict_ollama=evict_ollama, free_comfyui=free_comfyui)
+                if require_fit and vram_estimate_mb:
+                    _raise_unless_fits(
+                        fit_verdict(vram_estimate_mb, reserve_mb=vram_reserve_mb), _slot
                     )
+                # RAM/swap/loadavg admission for heavy/budgeted jobs only, so
+                # estimate-less callers stay a pure gate pass-through.
                 admit_ram_gb = ram_estimate_gb if ram_estimate_gb is not None else (
                     2.0 if vram_estimate_mb else None
                 )
                 if admit_ram_gb is not None:
-                    # RAM/swap/loadavg admission (GlobalLoadGate) — heavy/budgeted jobs
-                    # only, so default (estimate-less) callers stay a pure gate pass-
-                    # through. Fail-fast (won't hang), fail-open (won't block on a probe
-                    # error). Serialize-don't-thrash WITHOUT touching output quality.
                     load_weight = _load_admit_or_busy(_slot, ram_gb=admit_ram_gb)
                 if vram_estimate_mb:
                     _orchestrator_request(
                         _slot, vram_estimate_mb, vram_reserve_mb=vram_reserve_mb
                     )
+                    booked = True
+            except GpuBusyError:
+                _session_tls.held = False
+                _teardown()
+                gate.release_gpu_exclusive(kind, op_id, cooldown=False)
+                raise
+            except BaseException:
+                _session_tls.held = False
+                _teardown()
+                raise
+        try:
             yield acquired
-            # Success path for the unit of work: transition LOADING -> LOADED so
-            # the orchestrator's tracked_vram and eviction scoring are accurate.
-            # Particularly important for high-estimate VIDEO_RENDER slots used by
-            # music-video / film-crew (the main ~14GB consumers). Without this,
-            # slots linger as LOADING and inflate tracked / prevent proper idle
-            # eviction (vram specialist rec).
+            # Clean exit: LOADING -> LOADED so the orchestrator's tracked VRAM
+            # and eviction scoring stay accurate.
             if acquired and vram_estimate_mb:
                 try:
                     from backend.services.gpu_memory_orchestrator import get_orchestrator
                     get_orchestrator().mark_model_loaded(_slot)
-                except Exception:
-                    pass  # best-effort; release below will still run
-    finally:
-        if acquired:
-            _session_tls.held = False
-        _load_release(load_weight)
-        if lease_held:
-            _release_cross_process_lease(_slot)
-        if acquired and vram_estimate_mb:
-            _orchestrator_release(_slot)
-
-            # Proactive cleanup for VIDEO slots on gpu_session release (vram specialist rec):
-            # If this was a high-VRAM video_render (music-video, film-crew, etc.), free
-            # ComfyUI resident models and force-evict the slot from the orchestrator
-            # registry so tracked_vram drops immediately (instead of waiting for idle
-            # timeout or next exclusive route). Prevents lingering LOADED/LOADING bookings
-            # after a ~14GB render finishes. Best-effort, non-fatal.
-            slot_lower = _slot.lower()
-            if "video" in slot_lower or "video_render" in slot_lower:
-                try:
-                    free_comfyui_vram()
-                    from backend.services.gpu_memory_orchestrator import get_orchestrator
-                    get_orchestrator().force_evict(_slot)
-                    log.info(f"Proactive free_comfyui + force_evict for video slot {_slot} on release")
-                except Exception:
+                except Exception:  # noqa: BLE001
                     pass
+        finally:
+            if acquired:
+                _session_tls.held = False
+                _teardown()

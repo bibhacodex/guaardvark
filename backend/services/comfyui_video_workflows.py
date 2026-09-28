@@ -7,8 +7,11 @@ Methods are unchanged — ComfyUIVideoGenerator inherits ComfyUIVideoWorkflowMix
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Optional
+
+from backend.services.video_render_limits import UNKNOWN_PROFILE
 
 logger = logging.getLogger(__name__)
 
@@ -208,10 +211,13 @@ class ComfyUIVideoWorkflowMixin:
                 "inputs": {
                     "model": model_name,
                     "precision": "bf16",
-                    "fp8_transformer": "disabled",
-                    "compile": False,
+                    "quantization": "disabled",
                     "attention_mode": "sdpa",
-                    "device": "main_device",
+                    # As in the I2V graph: the sampler moves the transformer to the
+                    # GPU when sampling starts. On main_device it lands on the card
+                    # whenever ComfyUI runs this loader before the text encode, and
+                    # CogVideoTextEncode then forces T5 onto the GPU beside it.
+                    "load_device": "offload_device",
                 }
             },
             "5": {
@@ -291,7 +297,8 @@ class ComfyUIVideoWorkflowMixin:
         image_filename: str,
         prompt: str,
         negative_prompt: str = "",
-        model_name: str = "kijai/CogVideoX-5b-1.5-I2V",
+        model_file: str = "CogVideoX_1_5_5b_I2V_bf16.safetensors",
+        vae_file: str = "cogvideox_vae_bf16.safetensors",
         num_frames: int = 49,
         num_inference_steps: int = 50,
         guidance_scale: float = 6.0,
@@ -301,6 +308,16 @@ class ComfyUIVideoWorkflowMixin:
         fps: int = 8,
         interpolation_multiplier: int = 2,
     ) -> dict:
+        """CogVideoX 1.5 5B I2V from the registry's local files — never a hub id.
+
+        CogVideoXModelLoader reads models/diffusion_models, CogVideoXVAELoader
+        reads models/vae; both names come from VIDEO_MODEL_REGISTRY via
+        cogvideox_comfyui_map(). The transformer is loaded to the offload
+        device: the wrapper's sampler moves it to the GPU only when sampling
+        starts, by which time the T5 encoder and the image VAE have been
+        offloaded again. Loading it to main_device up front is what put 14.4GB
+        on a 16GB card before T5 had even been encoded (OOM, 2026-08-28).
+        """
         if seed is None:
             seed = int(time.time() * 1000) % (2**31)
 
@@ -334,14 +351,21 @@ class ComfyUIVideoWorkflowMixin:
                 }
             },
             "4": {
-                "class_type": "DownloadAndLoadCogVideoModel",
+                "class_type": "CogVideoXModelLoader",
                 "inputs": {
-                    "model": model_name,
-                    "precision": "bf16",
-                    "fp8_transformer": "disabled",
-                    "compile": False,
+                    "model": model_file,
+                    "base_precision": "bf16",
+                    "quantization": "disabled",
+                    "load_device": "offload_device",
+                    "enable_sequential_cpu_offload": False,
                     "attention_mode": "sdpa",
-                    "device": "main_device",
+                }
+            },
+            "4v": {
+                "class_type": "CogVideoXVAELoader",
+                "inputs": {
+                    "model_name": vae_file,
+                    "precision": "bf16",
                 }
             },
             "5": {
@@ -368,7 +392,7 @@ class ComfyUIVideoWorkflowMixin:
             "9": {
                 "class_type": "CogVideoImageEncode",
                 "inputs": {
-                    "vae": ["4", 1],
+                    "vae": ["4v", 0],
                     "start_image": ["10", 0],
                 }
             },
@@ -391,7 +415,7 @@ class ComfyUIVideoWorkflowMixin:
             "7": {
                 "class_type": "CogVideoDecode",
                 "inputs": {
-                    "vae": ["4", 1],
+                    "vae": ["4v", 0],
                     "samples": ["6", 0],
                     "enable_vae_tiling": True,
                     "tile_sample_min_height": 240,
@@ -449,6 +473,13 @@ class ComfyUIVideoWorkflowMixin:
         seed: Optional[int] = None,
         fps: int = 16,
         interpolation_multiplier: int = 2,
+        lora_high: Optional[str] = None,
+        lora_low: Optional[str] = None,
+        lora_strength: float = 1.0,
+        shift_override: Optional[float] = None,
+        extra_loras: Optional[list] = None,
+        text_encoder: Optional[str] = None,
+        speed_profile: Optional[str] = UNKNOWN_PROFILE,
     ) -> dict:
         """Build a ComfyUI API-format workflow for Wan 2.2 MoE text-to-video.
 
@@ -459,8 +490,10 @@ class ComfyUIVideoWorkflowMixin:
         if seed is None:
             seed = int(time.time() * 1000) % (2**31)
 
-        model_files = self.WAN22_MODELS.get(model_key, self.WAN22_MODELS["wan22-14b"])
-        clip_device = self._wan_clip_device()
+        model_files = dict(self.WAN22_MODELS.get(model_key, self.WAN22_MODELS["wan22-14b"]))
+        if text_encoder:
+            model_files["clip"] = text_encoder
+        clip_device = self._text_encoder_device(model_key)
 
         # Default negative prompt for anatomy quality
         if not negative_prompt:
@@ -477,7 +510,7 @@ class ComfyUIVideoWorkflowMixin:
             clip_device,
         )
 
-        shift = self._wan_dynamic_shift(width, height)
+        shift = float(shift_override) if shift_override is not None else self._wan_dynamic_shift(width, height)
 
         workflow = {
             # ── Model Loading ──────────────────────────────────────────────
@@ -634,6 +667,34 @@ class ComfyUIVideoWorkflowMixin:
         }
 
         # Add RIFE frame interpolation if multiplier > 1
+        if lora_high or lora_low:
+            # A speed profile's distilled LoRA pair, one per expert. Model-only
+            # loaders so the text encoder is untouched; the two ModelSamplingSD3
+            # nodes read the patched experts. ComfyUI-GGUF applies LoRAs to the
+            # GGUF experts through the built-in loader (its README: experimental).
+            if lora_high:
+                workflow["17"] = {
+                    "class_type": "LoraLoaderModelOnly",
+                    "inputs": {"model": ["1", 0], "lora_name": lora_high, "strength_model": float(lora_strength)},
+                }
+                workflow["8"]["inputs"]["model"] = ["17", 0]
+            if lora_low:
+                workflow["18"] = {
+                    "class_type": "LoraLoaderModelOnly",
+                    "inputs": {"model": ["2", 0], "lora_name": lora_low, "strength_model": float(lora_strength)},
+                }
+                workflow["9"]["inputs"]["model"] = ["18", 0]
+
+        high_ref = ["17", 0] if lora_high else ["1", 0]
+        low_ref = ["18", 0] if lora_low else ["2", 0]
+        high_ref, next_id = self._chain_model_only_loras(workflow, high_ref, extra_loras, 40)
+        low_ref, next_id = self._chain_model_only_loras(workflow, low_ref, extra_loras, next_id)
+        high_ref, low_ref = self._apply_declared_attention(
+            workflow, model_key, [high_ref, low_ref], next_id, speed_profile
+        )
+        workflow["8"]["inputs"]["model"] = high_ref
+        workflow["9"]["inputs"]["model"] = low_ref
+
         if interpolation_multiplier > 1:
             self._add_rife_interpolation(
                 workflow,
@@ -660,6 +721,14 @@ class ComfyUIVideoWorkflowMixin:
         seed: Optional[int] = None,
         fps: int = 16,
         interpolation_multiplier: int = 2,
+        sampler_profile: Optional[str] = None,
+        lora_high: Optional[str] = None,
+        lora_low: Optional[str] = None,
+        lora_strength: float = 1.0,
+        shift_override: Optional[float] = None,
+        extra_loras: Optional[list] = None,
+        text_encoder: Optional[str] = None,
+        speed_profile: Optional[str] = UNKNOWN_PROFILE,
     ) -> dict:
         # Same MoE two-pass dance as Wan T2V, but the empty latent gets swapped
         # for WanImageToVideo — that node bakes the start frame into the
@@ -667,8 +736,10 @@ class ComfyUIVideoWorkflowMixin:
         if seed is None:
             seed = int(time.time() * 1000) % (2**31)
 
-        model_files = self.WAN22_MODELS.get(model_key, self.WAN22_MODELS["wan22-14b-i2v"])
-        clip_device = self._wan_clip_device()
+        model_files = dict(self.WAN22_MODELS.get(model_key, self.WAN22_MODELS["wan22-14b-i2v"]))
+        if text_encoder:
+            model_files["clip"] = text_encoder
+        clip_device = self._text_encoder_device(model_key)
 
         if not negative_prompt:
             negative_prompt = (
@@ -679,11 +750,27 @@ class ComfyUIVideoWorkflowMixin:
             )
 
         midpoint = num_inference_steps // 2
-        shift = self._wan_dynamic_shift(width, height)
+
+        # The 14B experts are trained at shift 8.0. `3497c52` replaced that with a
+        # curve scaled by pixel area, on the theory that a fixed 8.0 over-shifts at
+        # lower resolutions; three weeks later `a4301f8` found the opposite -- that
+        # the curve starves sampling at high noise and produces the warping and
+        # colour bleed reported as "the character goes crazy and rainbow morphs" --
+        # and restored a fixed 8.0 for the 5B. The 14B was left on the curve that had
+        # just been shown to be the cause, which is why it renders cleanly at native
+        # 1280x704 (where the curve happens to return 8.0) and badly everywhere else.
+        #
+        # Same profile mechanism as the 5B, so the two models behave alike and the
+        # scaled curve stays available for whoever wants to re-test it.
+        profile_key = self._wan5b_sampler_profile(sampler_profile)
+        profile = self.WAN5B_SAMPLER_PROFILES[profile_key]
+        shift = float(shift_override) if shift_override is not None else (
+            profile["shift"] if profile["shift"] is not None else self._wan_dynamic_shift(width, height)
+        )
         logger.info(
-            "Wan I2V MoE workflow clip_device=%s, dynamic_shift=%.1f (TE off-GPU frees UNet residency on 16GB)",
-            clip_device,
-            shift,
+            "Wan I2V MoE workflow clip_device=%s profile=%s shift=%.1f "
+            "(TE off-GPU frees UNet residency on 16GB)",
+            clip_device, profile_key, shift,
         )
 
         workflow = {
@@ -768,6 +855,34 @@ class ComfyUIVideoWorkflowMixin:
             },
         }
 
+        if lora_high or lora_low:
+            # A speed profile's distilled LoRA pair, one per expert. Model-only
+            # loaders so the text encoder is untouched; the two ModelSamplingSD3
+            # nodes read the patched experts. ComfyUI-GGUF applies LoRAs to the
+            # GGUF experts through the built-in loader (its README: experimental).
+            if lora_high:
+                workflow["17"] = {
+                    "class_type": "LoraLoaderModelOnly",
+                    "inputs": {"model": ["1", 0], "lora_name": lora_high, "strength_model": float(lora_strength)},
+                }
+                workflow["8"]["inputs"]["model"] = ["17", 0]
+            if lora_low:
+                workflow["18"] = {
+                    "class_type": "LoraLoaderModelOnly",
+                    "inputs": {"model": ["2", 0], "lora_name": lora_low, "strength_model": float(lora_strength)},
+                }
+                workflow["9"]["inputs"]["model"] = ["18", 0]
+
+        high_ref = ["17", 0] if lora_high else ["1", 0]
+        low_ref = ["18", 0] if lora_low else ["2", 0]
+        high_ref, next_id = self._chain_model_only_loras(workflow, high_ref, extra_loras, 40)
+        low_ref, next_id = self._chain_model_only_loras(workflow, low_ref, extra_loras, next_id)
+        high_ref, low_ref = self._apply_declared_attention(
+            workflow, model_key, [high_ref, low_ref], next_id, speed_profile
+        )
+        workflow["8"]["inputs"]["model"] = high_ref
+        workflow["9"]["inputs"]["model"] = low_ref
+
         if interpolation_multiplier > 1:
             self._add_rife_interpolation(
                 workflow,
@@ -794,6 +909,10 @@ class ComfyUIVideoWorkflowMixin:
         seed: Optional[int] = None,
         fps: int = 24,
         interpolation_multiplier: int = 1,
+        sampler_profile: Optional[str] = None,
+        extra_loras: Optional[list] = None,
+        text_encoder: Optional[str] = None,
+        speed_profile: Optional[str] = UNKNOWN_PROFILE,
     ) -> dict:
         """Wan 2.2 TI2V-5B — single-model text+image-to-video that FITS 16GB (no MoE
         two-pass, no CPU offload → none of the 38-min-per-clip A14B pain). Graph mirrors
@@ -807,9 +926,9 @@ class ComfyUIVideoWorkflowMixin:
 
         cfg = self.WAN22_MODELS.get(model_key, {})
         unet = cfg.get("unet") or "wan2.2_ti2v_5B_fp16.safetensors"
-        clip = cfg.get("clip") or "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+        clip = text_encoder or cfg.get("clip") or "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
         vae = cfg.get("vae") or "wan2.2_vae.safetensors"
-        clip_device = self._wan_clip_device()
+        clip_device = self._text_encoder_device(model_key)
 
         if not negative_prompt:
             negative_prompt = (
@@ -828,9 +947,14 @@ class ComfyUIVideoWorkflowMixin:
             "batch_size": 1,
         }
         
-        shift = self._wan_dynamic_shift(width, height)
+        profile_key = self._wan5b_sampler_profile(sampler_profile)
+        profile = self.WAN5B_SAMPLER_PROFILES[profile_key]
+        shift = profile["shift"] if profile["shift"] is not None else self._wan_dynamic_shift(width, height)
 
-        logger.info("Wan TI2V-5B workflow clip_device=%s, dynamic_shift=%.1f", clip_device, shift)
+        logger.info(
+            "Wan TI2V-5B workflow clip_device=%s profile=%s sampler=%s shift=%.1f",
+            clip_device, profile_key, profile["sampler"], shift,
+        )
 
         workflow = {
             "1": {"class_type": "UNETLoader", "inputs": {"unet_name": unet, "weight_dtype": "default"}},
@@ -851,7 +975,7 @@ class ComfyUIVideoWorkflowMixin:
                     "seed": seed,
                     "steps": num_inference_steps,
                     "cfg": guidance_scale,
-                    "sampler_name": "euler",
+                    "sampler_name": profile["sampler"],
                     "scheduler": "simple",
                     "denoise": 1.0,
                 },
@@ -875,6 +999,9 @@ class ComfyUIVideoWorkflowMixin:
             },
         }
 
+        model_ref, _ = self._chain_model_only_loras(workflow, ["1", 0], extra_loras, 20)
+        workflow["8"]["inputs"]["model"] = model_ref
+
         # Image-to-video: bake the start frame into the latent node.
         if image_filename:
             workflow["14"] = {"class_type": "LoadImage", "inputs": {"image": image_filename}}
@@ -889,6 +1016,7 @@ class ComfyUIVideoWorkflowMixin:
                 multiplier=interpolation_multiplier,
             )
 
+        self._pin_model_attention(workflow, model_key, speed_profile)
         return workflow
 
 
@@ -905,6 +1033,10 @@ class ComfyUIVideoWorkflowMixin:
         seed: Optional[int] = None,
         fps: float = 16.0,
         interpolation_multiplier: int = 1,
+        audio_out: bool = False,
+        extra_loras: Optional[list] = None,
+        text_encoder: Optional[str] = None,
+        speed_profile: Optional[str] = UNKNOWN_PROFILE,
     ) -> dict:
         """LTX-2.3 distilled T2V — AV-aware core ComfyUI graph.
 
@@ -923,7 +1055,7 @@ class ComfyUIVideoWorkflowMixin:
         self._ensure_ltx_models()
         cfg = self.LTX_MODELS.get(model_key, {})
         unet = cfg.get("unet") or "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors"
-        clip = cfg.get("clip") or "gemma_3_12B_it_fp4_mixed.safetensors"
+        clip = text_encoder or cfg.get("clip") or "gemma_3_12B_it_fp4_mixed.safetensors"
         text_proj = cfg.get("text_projection") or "ltx-2.3_text_projection_bf16.safetensors"
         vae = cfg.get("vae") or "LTX23_video_vae_bf16.safetensors"
         audio_vae = cfg.get("audio_vae") or "LTX23_audio_vae_bf16.safetensors"
@@ -935,7 +1067,7 @@ class ComfyUIVideoWorkflowMixin:
                 "bad proportions, extra limbs, static, jitter, morphing, watermark"
             )
 
-        clip_device = self._wan_clip_device()
+        clip_device = self._text_encoder_device(model_key)
 
         workflow = {
             "1": {
@@ -1032,6 +1164,9 @@ class ComfyUIVideoWorkflowMixin:
             },
         }
 
+        if audio_out:
+            self._add_av_audio_decode(workflow, "13", "4", "15")
+
         if interpolation_multiplier > 1:
             self._add_rife_interpolation(
                 workflow,
@@ -1040,6 +1175,8 @@ class ComfyUIVideoWorkflowMixin:
                 base_fps=fps,
                 multiplier=interpolation_multiplier,
             )
+        self._stack_user_loras(workflow, extra_loras)
+        self._pin_model_attention(workflow, model_key, speed_profile)
         return workflow
 
 
@@ -1058,6 +1195,10 @@ class ComfyUIVideoWorkflowMixin:
         fps: float = 16.0,
         interpolation_multiplier: int = 1,
         strength: float = 1.0,
+        audio_out: bool = False,
+        extra_loras: Optional[list] = None,
+        text_encoder: Optional[str] = None,
+        speed_profile: Optional[str] = UNKNOWN_PROFILE,
     ) -> dict:
         """LTX-2.3 distilled I2V — AV concat path with LTXVImgToVideo start frame."""
         if seed is None:
@@ -1066,12 +1207,12 @@ class ComfyUIVideoWorkflowMixin:
         self._ensure_ltx_models()
         cfg = self.LTX_MODELS.get(model_key, {})
         unet = cfg.get("unet") or "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors"
-        clip = cfg.get("clip") or "gemma_3_12B_it_fp4_mixed.safetensors"
+        clip = text_encoder or cfg.get("clip") or "gemma_3_12B_it_fp4_mixed.safetensors"
         text_proj = cfg.get("text_projection") or "ltx-2.3_text_projection_bf16.safetensors"
         vae = cfg.get("vae") or "LTX23_video_vae_bf16.safetensors"
         audio_vae = cfg.get("audio_vae") or "LTX23_audio_vae_bf16.safetensors"
         length = self._ltx_frame_count(num_frames)
-        clip_device = self._wan_clip_device()
+        clip_device = self._text_encoder_device(model_key)
 
         if not negative_prompt:
             negative_prompt = (
@@ -1184,6 +1325,9 @@ class ComfyUIVideoWorkflowMixin:
             },
         }
 
+        if audio_out:
+            self._add_av_audio_decode(workflow, "15", "4", "17")
+
         if interpolation_multiplier > 1:
             self._add_rife_interpolation(
                 workflow,
@@ -1192,6 +1336,8 @@ class ComfyUIVideoWorkflowMixin:
                 base_fps=fps,
                 multiplier=interpolation_multiplier,
             )
+        self._stack_user_loras(workflow, extra_loras)
+        self._pin_model_attention(workflow, model_key, speed_profile)
         return workflow
 
 
@@ -1239,6 +1385,10 @@ class ComfyUIVideoWorkflowMixin:
         seed: Optional[int] = None,
         fps: float = 16.0,
         interpolation_multiplier: int = 1,
+        audio_out: bool = False,
+        extra_loras: Optional[list] = None,
+        text_encoder: Optional[str] = None,
+        speed_profile: Optional[str] = UNKNOWN_PROFILE,
     ) -> dict:
         """LTX-2.5 distilled T2V — official two-stage ComfyUI graph, video-only decode.
 
@@ -1247,7 +1397,7 @@ class ComfyUIVideoWorkflowMixin:
 
         Graph: UNETLoader + CLIPLoader(ltxv) + DiffVAE + audio VAE →
         CLIPTextEncode ×2 → EmptyLTXVLatentVideo (half) + LTXVEmptyLatentAudio →
-        concat → DualCFG + ManualSigmas stage-1 → upsample → DualCFG stage-2 →
+        concat → CFGGuider + ManualSigmas stage-1 → upsample → CFGGuider stage-2 →
         separate → VAEDecode → VHS_VideoCombine.
 
         Audio is sampled (required by rotary PE) then discarded — same contract as 2.3.
@@ -1255,10 +1405,12 @@ class ComfyUIVideoWorkflowMixin:
         if seed is None:
             seed = int(time.time() * 1000) % (2**31)
 
-        files = self._ltx25_loader_cfg(model_key)
+        files = dict(self._ltx25_loader_cfg(model_key))
+        if text_encoder:
+            files["clip"] = text_encoder
         length = self._ltx_frame_count(num_frames)
         stage_w, stage_h = self._ltx25_stage1_size(width, height)
-        clip_device = self._wan_clip_device()
+        clip_device = self._text_encoder_device(model_key)
         negative_prompt = self._ltx25_default_negative(negative_prompt)
         cfg = float(guidance_scale if guidance_scale is not None else 1.0)
         # Distilled schedule is fixed; keep the arg for API symmetry / logging.
@@ -1401,6 +1553,9 @@ class ComfyUIVideoWorkflowMixin:
             },
         }
 
+        if audio_out:
+            self._add_av_audio_decode(workflow, "22", "4", "24")
+
         if interpolation_multiplier > 1:
             self._add_rife_interpolation(
                 workflow,
@@ -1409,6 +1564,8 @@ class ComfyUIVideoWorkflowMixin:
                 base_fps=fps,
                 multiplier=interpolation_multiplier,
             )
+        self._stack_user_loras(workflow, extra_loras)
+        self._pin_model_attention(workflow, model_key, speed_profile)
         return workflow
 
     def _create_ltx25_i2v_workflow(
@@ -1426,15 +1583,21 @@ class ComfyUIVideoWorkflowMixin:
         fps: float = 16.0,
         interpolation_multiplier: int = 1,
         strength: float = 1.0,
+        audio_out: bool = False,
+        extra_loras: Optional[list] = None,
+        text_encoder: Optional[str] = None,
+        speed_profile: Optional[str] = UNKNOWN_PROFILE,
     ) -> dict:
         """LTX-2.5 distilled I2V — two-stage stack with LTXVImgToVideo start frame."""
         if seed is None:
             seed = int(time.time() * 1000) % (2**31)
 
-        files = self._ltx25_loader_cfg(model_key)
+        files = dict(self._ltx25_loader_cfg(model_key))
+        if text_encoder:
+            files["clip"] = text_encoder
         length = self._ltx_frame_count(num_frames)
         stage_w, stage_h = self._ltx25_stage1_size(width, height)
-        clip_device = self._wan_clip_device()
+        clip_device = self._text_encoder_device(model_key)
         negative_prompt = self._ltx25_default_negative(negative_prompt)
         cfg = float(guidance_scale if guidance_scale is not None else 1.0)
         _ = num_inference_steps
@@ -1599,6 +1762,9 @@ class ComfyUIVideoWorkflowMixin:
             },
         }
 
+        if audio_out:
+            self._add_av_audio_decode(workflow, "24", "4", "26")
+
         if interpolation_multiplier > 1:
             self._add_rife_interpolation(
                 workflow,
@@ -1607,8 +1773,635 @@ class ComfyUIVideoWorkflowMixin:
                 base_fps=fps,
                 multiplier=interpolation_multiplier,
             )
+        self._stack_user_loras(workflow, extra_loras)
+        self._pin_model_attention(workflow, model_key, speed_profile)
         return workflow
 
+
+    # ── HunyuanVideo (Tencent, 13B) ────────────────────────────────────────
+    # Guidance-distilled flow model: no negative prompt; the guidance scale rides
+    # in FluxGuidance. Values mirror ComfyUI's bundled hunyuan_video template.
+    HUNYUAN_SHIFT = 7.0
+    HUNYUAN_VAE_TILE = {"tile_size": 256, "overlap": 64, "temporal_size": 64, "temporal_overlap": 8}
+    # I2V v2 ("replace") weights. Higher = more weight on the text prompt vs the image.
+    HUNYUAN_I2V_IMAGE_INTERLEAVE = 4
+
+    def _hunyuan_cfg(self, model_key: str, fallback_key: str) -> dict:
+        cfg = self.HUNYUAN_MODELS.get(model_key) or self.HUNYUAN_MODELS.get(fallback_key) or {}
+        return {
+            "unet": cfg.get("unet") or f"hunyuan-video-{'i2v' if 'i2v' in fallback_key else 't2v'}-720p-Q5_K_M.gguf",
+            "clip_l": cfg.get("clip_l") or "clip_l.safetensors",
+            "clip_llava": cfg.get("clip_llava") or "llava_llama3_fp8_scaled.safetensors",
+            "vae": cfg.get("vae") or "hunyuan_video_vae_bf16.safetensors",
+            "clip_vision": cfg.get("clip_vision") or "llava_llama3_vision.safetensors",
+        }
+
+    def _hunyuan_loader_nodes(self, cfg: dict) -> dict:
+        """Nodes 1-3: GGUF UNet, DualCLIPLoader (clip_l + LLaVA-3), VAE."""
+        from backend.services.video_render_limits import text_encoder_device
+        clip_device = text_encoder_device("", family="hunyuan")
+        logger.info("HunyuanVideo workflow unet=%s clip_device=%s", cfg["unet"], clip_device)
+        return {
+            "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": cfg["unet"]}},
+            "2": {
+                "class_type": "DualCLIPLoader",
+                "inputs": {
+                    "clip_name1": cfg["clip_l"],
+                    "clip_name2": cfg["clip_llava"],
+                    "type": "hunyuan_video",
+                    "device": clip_device,
+                },
+            },
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": cfg["vae"]}},
+        }
+
+    def _hunyuan_tail_nodes(
+        self,
+        *,
+        guidance_node: str,
+        latent: list,
+        num_inference_steps: int,
+        seed: int,
+        fps: int,
+        filename_prefix: str,
+    ) -> dict:
+        """Nodes 20-27: shift → guider/scheduler/sampler → tiled decode → mp4 mux."""
+        return {
+            "20": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["1", 0], "shift": self.HUNYUAN_SHIFT}},
+            "21": {"class_type": "BasicGuider", "inputs": {"model": ["20", 0], "conditioning": [guidance_node, 0]}},
+            "22": {
+                "class_type": "BasicScheduler",
+                "inputs": {"model": ["20", 0], "scheduler": "simple", "steps": num_inference_steps, "denoise": 1.0},
+            },
+            "23": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+            "24": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+            "25": {
+                "class_type": "SamplerCustomAdvanced",
+                "inputs": {
+                    "noise": ["24", 0],
+                    "guider": ["21", 0],
+                    "sampler": ["23", 0],
+                    "sigmas": ["22", 0],
+                    "latent_image": latent,
+                },
+            },
+            "26": {
+                "class_type": "VAEDecodeTiled",
+                "inputs": {"samples": ["25", 0], "vae": ["3", 0], **self.HUNYUAN_VAE_TILE},
+            },
+            "27": {
+                "class_type": "VHS_VideoCombine",
+                "inputs": {
+                    "images": ["26", 0],
+                    "frame_rate": fps,
+                    "loop_count": 0,
+                    "filename_prefix": filename_prefix,
+                    "format": "video/h264-mp4",
+                    "pix_fmt": "yuv420p",
+                    "crf": 19,
+                    "save_metadata": True,
+                    "pingpong": False,
+                    "save_output": True,
+                    "videopreview": {"hidden": False, "paused": False, "params": {}},
+                },
+            },
+        }
+
+    def _create_hunyuan_t2v_workflow(
+        self,
+        prompt: str,
+        model_key: str = "hunyuan-t2v",
+        num_frames: int = 73,
+        num_inference_steps: int = 20,
+        guidance_scale: float = 6.0,
+        width: int = 848,
+        height: int = 480,
+        seed: Optional[int] = None,
+        fps: int = 24,
+        interpolation_multiplier: int = 1,
+        extra_loras: Optional[list] = None,
+        text_encoder: Optional[str] = None,
+        speed_profile: Optional[str] = UNKNOWN_PROFILE,
+    ) -> dict:
+        """HunyuanVideo text-to-video on ComfyUI's native nodes with a GGUF UNet.
+
+        Graph: DualCLIPLoader(clip_l + LLaVA-3, hunyuan_video) → CLIPTextEncode →
+        FluxGuidance → BasicGuider → SamplerCustomAdvanced (euler/simple, shift 7)
+        → VAEDecodeTiled → VHS mp4. ``num_frames`` must already be 4n+1.
+        """
+        if seed is None:
+            seed = int(time.time() * 1000) % (2**31)
+        cfg = self._hunyuan_cfg(model_key, "hunyuan-t2v")
+        if text_encoder:
+            cfg["clip_llava"] = text_encoder
+        workflow = self._hunyuan_loader_nodes(cfg)
+        workflow.update({
+            "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": prompt}},
+            "5": {"class_type": "FluxGuidance", "inputs": {"conditioning": ["4", 0], "guidance": guidance_scale}},
+            "6": {
+                "class_type": "EmptyHunyuanLatentVideo",
+                "inputs": {"width": width, "height": height, "length": num_frames, "batch_size": 1},
+            },
+        })
+        workflow.update(self._hunyuan_tail_nodes(
+            guidance_node="5",
+            latent=["6", 0],
+            num_inference_steps=num_inference_steps,
+            seed=seed,
+            fps=fps,
+            filename_prefix="hunyuan_t2v",
+        ))
+        if interpolation_multiplier > 1:
+            self._add_rife_interpolation(
+                workflow,
+                source_node_id="26",
+                video_combine_node_id="27",
+                base_fps=fps,
+                multiplier=interpolation_multiplier,
+            )
+        self._stack_user_loras(workflow, extra_loras)
+        self._pin_model_attention(workflow, model_key, speed_profile)
+        return workflow
+
+    def _create_hunyuan_i2v_workflow(
+        self,
+        image_filename: str,
+        prompt: str,
+        model_key: str = "hunyuan-i2v",
+        num_frames: int = 73,
+        num_inference_steps: int = 20,
+        guidance_scale: float = 6.0,
+        width: int = 848,
+        height: int = 480,
+        seed: Optional[int] = None,
+        fps: int = 24,
+        interpolation_multiplier: int = 1,
+        extra_loras: Optional[list] = None,
+        text_encoder: Optional[str] = None,
+        speed_profile: Optional[str] = UNKNOWN_PROFILE,
+    ) -> dict:
+        """HunyuanVideo image-to-video (v2 "replace" conditioning).
+
+        The start frame goes through the LLaVA vision tower into
+        TextEncodeHunyuanVideo_ImageToVideo and is also written into the first
+        latent frame by HunyuanImageToVideo; sampling/decoding matches the T2V graph.
+        """
+        if seed is None:
+            seed = int(time.time() * 1000) % (2**31)
+        cfg = self._hunyuan_cfg(model_key, "hunyuan-i2v")
+        if text_encoder:
+            cfg["clip_llava"] = text_encoder
+        workflow = self._hunyuan_loader_nodes(cfg)
+        workflow.update({
+            "4": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": cfg["clip_vision"]}},
+            "5": {"class_type": "LoadImage", "inputs": {"image": image_filename}},
+            "6": {"class_type": "CLIPVisionEncode", "inputs": {"clip_vision": ["4", 0], "image": ["5", 0], "crop": "center"}},
+            "7": {
+                "class_type": "TextEncodeHunyuanVideo_ImageToVideo",
+                "inputs": {
+                    "clip": ["2", 0],
+                    "clip_vision_output": ["6", 0],
+                    "prompt": prompt,
+                    "image_interleave": self.HUNYUAN_I2V_IMAGE_INTERLEAVE,
+                },
+            },
+            "8": {
+                "class_type": "HunyuanImageToVideo",
+                "inputs": {
+                    "positive": ["7", 0],
+                    "vae": ["3", 0],
+                    "width": width,
+                    "height": height,
+                    "length": num_frames,
+                    "batch_size": 1,
+                    "guidance_type": "v2 (replace)",
+                    "start_image": ["5", 0],
+                },
+            },
+            "9": {"class_type": "FluxGuidance", "inputs": {"conditioning": ["8", 0], "guidance": guidance_scale}},
+        })
+        workflow.update(self._hunyuan_tail_nodes(
+            guidance_node="9",
+            latent=["8", 1],
+            num_inference_steps=num_inference_steps,
+            seed=seed,
+            fps=fps,
+            filename_prefix="hunyuan_i2v",
+        ))
+        if interpolation_multiplier > 1:
+            self._add_rife_interpolation(
+                workflow,
+                source_node_id="26",
+                video_combine_node_id="27",
+                base_fps=fps,
+                multiplier=interpolation_multiplier,
+            )
+        self._stack_user_loras(workflow, extra_loras)
+        self._pin_model_attention(workflow, model_key, speed_profile)
+        return workflow
+
+    # ── MiniMax H3 ────────────────────────────────────────────────────────────
+
+    def _minimax_loader_cfg(self, model_key: str) -> dict:
+        self._ensure_minimax_models()
+        cfg = self.MINIMAX_MODELS.get(model_key, {})
+        return {
+            "unet": cfg.get("unet") or "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "clip": cfg.get("clip") or "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            "vae": cfg.get("vae") or "minimax_h3_video_vae_fp16.safetensors",
+            "audio_vae": cfg.get("audio_vae") or "minimax_h3_audio_vae_fp32.safetensors",
+        }
+
+    @staticmethod
+    def _minimax_clip_device() -> str:
+        """Where the Qwen3-VL 32B encoder loads. Unlike Wan/LTX this is not
+        pinned to CPU on 16GB cards: the encoder ships as NVFP4, which ComfyUI
+        runs as emulated ops on pre-Blackwell GPUs, and emulating a 32B model on
+        the CPU is the slowest possible way to run it. Let ComfyUI partial-load
+        it on the GPU (the official template does the same). The Wan override
+        is honoured for anyone who wants to force it."""
+        from backend.services.video_render_limits import text_encoder_device
+        return text_encoder_device("", family="minimax")
+
+    def _create_minimax_ref_workflow(
+        self,
+        prompt: str,
+        model_key: str = "minimax-h3-ref2va-int8",
+        num_frames: int = 124,
+        num_inference_steps: int = 20,
+        width: int = 864,
+        height: int = 480,
+        seed: Optional[int] = None,
+        fps: float = 24.0,
+        interpolation_multiplier: int = 1,
+        ref_images: Optional[list] = None,
+        ref_videos: Optional[list] = None,
+        ref_audios: Optional[list] = None,
+        ref_image_size: str = "match",
+        lora_name: Optional[str] = None,
+        lora_strength: float = 1.0,
+        extra_loras: Optional[list] = None,
+        text_encoder: Optional[str] = None,
+        speed_profile: Optional[str] = UNKNOWN_PROFILE,
+    ) -> dict:
+        """MiniMax H3 ref2va graph — the official video_minimax_h3_r2v template.
+
+        Same spine as the fl2va graph (ids 1-4 loaders, 7-14 sampler and
+        decode, 15 LoRA) with MiniMaxH3ReferenceToVideo at 6. Its grown inputs
+        are addressed the way the API JSON of the template does: dotted and
+        zero-based (``ref_images.ref_image_0``). Prompt tags stay one-based
+        (``<Picture 1>``) and follow wiring order: images, then each video's
+        soundtrack right before the video, then standalone audio.
+
+        ``ref_images``: filenames in ComfyUI's input/. ``ref_videos``: dicts
+        ``{"filename": str, "audio": True | False | "<audio filename>"}`` —
+        True wires the clip's own soundtrack from VHS_LoadVideo, a filename
+        loads a separate track. Videos are resampled to 24 fps and capped at
+        the model's longest clip; the node crops to its valid lengths.
+        Reference loaders sit at 20+ (images), 30+ (videos), 33+ (their
+        separate soundtracks) and 36+ (standalone audio).
+        """
+        if seed is None:
+            seed = int(time.time() * 1000) % (2**31)
+
+        files = self._minimax_loader_cfg(model_key)
+        if text_encoder:
+            files["clip"] = text_encoder
+        length = self._minimax_frame_count(num_frames)
+        steps = int(num_inference_steps or 20)
+        max_ref_frames = 362  # 15 s at 24 fps on the 17k+5 grid
+
+        ref_inputs: dict = {}
+        workflow = {
+            "1": {
+                "class_type": "UNETLoader",
+                "inputs": {"unet_name": files["unet"], "weight_dtype": "default"},
+            },
+            "2": {
+                "class_type": "CLIPLoader",
+                "inputs": {
+                    "clip_name": files["clip"],
+                    "type": "minimax",
+                    "device": self._minimax_clip_device(),
+                },
+            },
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": files["vae"]}},
+            "4": {"class_type": "VAELoader", "inputs": {"vae_name": files["audio_vae"]}},
+        }
+        for i, filename in enumerate(ref_images or []):
+            nid = str(20 + i)
+            workflow[nid] = {"class_type": "LoadImage", "inputs": {"image": filename}}
+            ref_inputs[f"ref_images.ref_image_{i}"] = [nid, 0]
+        for k, video in enumerate(ref_videos or []):
+            vid_id = str(30 + k)
+            workflow[vid_id] = {
+                "class_type": "VHS_LoadVideo",
+                "inputs": {
+                    "video": video["filename"],
+                    "force_rate": 24,
+                    "custom_width": 0,
+                    "custom_height": 0,
+                    "frame_load_cap": max_ref_frames,
+                    "skip_first_frames": 0,
+                    "select_every_nth": 1,
+                },
+            }
+            ref_inputs[f"ref_videos.ref_video_{k}"] = [vid_id, 0]
+            audio = video.get("audio", True)
+            if audio is True:
+                ref_inputs[f"ref_video_audios.ref_video_audio_{k}"] = [vid_id, 2]
+            elif audio:
+                aud_id = str(33 + k)
+                workflow[aud_id] = {"class_type": "LoadAudio", "inputs": {"audio": audio}}
+                ref_inputs[f"ref_video_audios.ref_video_audio_{k}"] = [aud_id, 0]
+        for j, filename in enumerate(ref_audios or []):
+            nid = str(36 + j)
+            workflow[nid] = {"class_type": "LoadAudio", "inputs": {"audio": filename}}
+            ref_inputs[f"ref_audios.ref_audio_{j}"] = [nid, 0]
+
+        workflow["6"] = {
+            "class_type": "MiniMaxH3ReferenceToVideo",
+            "inputs": {
+                "clip": ["2", 0],
+                "vae": ["3", 0],
+                "audio_vae": ["4", 0],
+                "prompt": prompt,
+                "width": int(width),
+                "height": int(height),
+                "length": length,
+                "ref_image_size": ref_image_size if ref_image_size in ("match", "max") else "match",
+                **ref_inputs,
+            },
+        }
+        workflow.update({
+            "7": {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": ["6", 0]}},
+            "8": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
+            "9": {
+                "class_type": "BasicScheduler",
+                "inputs": {"model": ["1", 0], "scheduler": "simple", "steps": steps, "denoise": 1.0},
+            },
+            "10": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+            "11": {
+                "class_type": "SamplerCustomAdvanced",
+                "inputs": {
+                    "noise": ["10", 0],
+                    "guider": ["7", 0],
+                    "sampler": ["8", 0],
+                    "sigmas": ["9", 0],
+                    "latent_image": ["6", 1],
+                },
+            },
+            "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
+            "13": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["11", 0], "vae": ["4", 0]}},
+            "14": {
+                "class_type": "VHS_VideoCombine",
+                "inputs": {
+                    "images": ["12", 0],
+                    "audio": ["13", 0],
+                    "frame_rate": float(fps),
+                    "loop_count": 0,
+                    "filename_prefix": "minimax_h3_r2v",
+                    "format": "video/h264-mp4",
+                    "pix_fmt": "yuv420p",
+                    "crf": 19,
+                    "save_metadata": True,
+                    "pingpong": False,
+                    "save_output": True,
+                    "videopreview": {"hidden": False, "paused": False, "params": {}},
+                },
+            },
+        })
+        if lora_name:
+            workflow["15"] = {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {"model": ["1", 0], "lora_name": lora_name, "strength_model": float(lora_strength)},
+            }
+            workflow["7"]["inputs"]["model"] = ["15", 0]
+            workflow["9"]["inputs"]["model"] = ["15", 0]
+        model_ref = ["15", 0] if lora_name else ["1", 0]
+        model_ref, _ = self._chain_model_only_loras(workflow, model_ref, extra_loras, 40)
+        workflow["7"]["inputs"]["model"] = model_ref
+        workflow["9"]["inputs"]["model"] = model_ref
+        if interpolation_multiplier > 1:
+            self._add_rife_interpolation(
+                workflow, source_node_id="12", video_combine_node_id="14",
+                base_fps=fps, multiplier=interpolation_multiplier,
+            )
+        self._pin_model_attention(workflow, model_key, speed_profile)
+        return workflow
+
+    def _create_minimax_workflow(
+        self,
+        prompt: str,
+        model_key: str = "minimax-h3-int8",
+        num_frames: int = 124,
+        num_inference_steps: int = 20,
+        width: int = 864,
+        height: int = 480,
+        seed: Optional[int] = None,
+        fps: float = 24.0,
+        interpolation_multiplier: int = 1,
+        image_filename: Optional[str] = None,
+        last_frame_filename: Optional[str] = None,
+        lora_name: Optional[str] = None,
+        lora_strength: float = 1.0,
+        extra_loras: Optional[list] = None,
+        text_encoder: Optional[str] = None,
+        guides: Optional[list] = None,
+        speed_profile: Optional[str] = UNKNOWN_PROFILE,
+    ) -> dict:
+        """MiniMax H3 fl2va graph — the official ComfyUI template plus its optional inputs.
+
+        UNETLoader (+ LoraLoaderModelOnly for a turbo speed profile) + CLIPLoader
+        (minimax) + video VAE + audio VAE → MiniMaxH3ImageToVideo (prompt, optional
+        first and last frame → conditioning and an empty joint video+audio latent)
+        → zero or more MiniMaxH3AddGuide nodes (an image or an audio clip anchored
+        at a frame index; the audio anchor is a condition, not a copied track,
+        but the model reproduces it almost verbatim: a 4 s narration anchored at
+        frame 0 came back with a 0.91 waveform correlation and a 0.99 envelope
+        correlation, measured 2026-09-01) → BasicGuider (the template runs
+        no CFG, so there is no negative prompt and guidance_scale is not a knob)
+        → SamplerCustomAdvanced (res_multistep / simple) → VAEDecode +
+        VAEDecodeAudio → VHS_VideoCombine with the audio track muxed in.
+
+        Node ids 1-14 are the template and stay stable for the tests; 15 is the
+        LoRA, 16 the last frame, 17+ the guide pairs (loader, AddGuide).
+
+        ``guides`` entries are ``{"kind": "audio"|"image", "filename": <name in
+        ComfyUI's input/>, "frame_idx": int}``; a frame index outside the clip is
+        rejected here with a plain message rather than as ComfyUI's validation
+        dump. Negative indices count from the end, as the node does.
+
+        The model's whole point is native audio, so unlike the LTX builders the
+        audio latent is decoded and kept. Decode is the plain VAEDecode the
+        template uses: the sampler output is a nested (video, audio) latent and
+        VAEDecodeTiled has not been tried against it.
+        """
+        if seed is None:
+            seed = int(time.time() * 1000) % (2**31)
+
+        files = self._minimax_loader_cfg(model_key)
+        if text_encoder:
+            files["clip"] = text_encoder
+        length = self._minimax_frame_count(num_frames)
+        steps = int(num_inference_steps or 20)
+
+        workflow = {
+            "1": {
+                "class_type": "UNETLoader",
+                "inputs": {"unet_name": files["unet"], "weight_dtype": "default"},
+            },
+            "2": {
+                "class_type": "CLIPLoader",
+                "inputs": {
+                    "clip_name": files["clip"],
+                    "type": "minimax",
+                    "device": self._minimax_clip_device(),
+                },
+            },
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": files["vae"]}},
+            "4": {"class_type": "VAELoader", "inputs": {"vae_name": files["audio_vae"]}},
+            "6": {
+                "class_type": "MiniMaxH3ImageToVideo",
+                "inputs": {
+                    "clip": ["2", 0],
+                    "vae": ["3", 0],
+                    "prompt": prompt,
+                    "width": int(width),
+                    "height": int(height),
+                    "length": length,
+                },
+            },
+            "7": {
+                "class_type": "BasicGuider",
+                "inputs": {"model": ["1", 0], "conditioning": ["6", 0]},
+            },
+            "8": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
+            "9": {
+                "class_type": "BasicScheduler",
+                "inputs": {
+                    "model": ["1", 0],
+                    "scheduler": "simple",
+                    "steps": steps,
+                    "denoise": 1.0,
+                },
+            },
+            "10": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+            "11": {
+                "class_type": "SamplerCustomAdvanced",
+                "inputs": {
+                    "noise": ["10", 0],
+                    "guider": ["7", 0],
+                    "sampler": ["8", 0],
+                    "sigmas": ["9", 0],
+                    "latent_image": ["6", 1],
+                },
+            },
+            "12": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["11", 0], "vae": ["3", 0]},
+            },
+            "13": {
+                "class_type": "VAEDecodeAudio",
+                "inputs": {"samples": ["11", 0], "vae": ["4", 0]},
+            },
+            "14": {
+                "class_type": "VHS_VideoCombine",
+                "inputs": {
+                    "images": ["12", 0],
+                    "audio": ["13", 0],
+                    "frame_rate": float(fps),
+                    "loop_count": 0,
+                    "filename_prefix": (
+                        "minimax_h3_flf2v" if (image_filename and last_frame_filename)
+                        else "minimax_h3_l2v" if last_frame_filename
+                        else "minimax_h3_i2v" if image_filename
+                        else "minimax_h3_t2v"
+                    ),
+                    "format": "video/h264-mp4",
+                    "pix_fmt": "yuv420p",
+                    "crf": 19,
+                    "save_metadata": True,
+                    "pingpong": False,
+                    "save_output": True,
+                    "videopreview": {"hidden": False, "paused": False, "params": {}},
+                },
+            },
+        }
+
+        if image_filename:
+            # The node stretches the first frame to the canvas itself
+            # (MiniMaxH3ImageToVideo._resize "disabled"), so no pre-scale node.
+            workflow["5"] = {"class_type": "LoadImage", "inputs": {"image": image_filename}}
+            workflow["6"]["inputs"]["first_frame"] = ["5", 0]
+        if last_frame_filename:
+            workflow["16"] = {"class_type": "LoadImage", "inputs": {"image": last_frame_filename}}
+            workflow["6"]["inputs"]["last_frame"] = ["16", 0]
+
+        if lora_name:
+            # Model-only LoRA: the turbo distillations touch the transformer, not
+            # the encoder. Both the guider and the scheduler read the patched model.
+            workflow["15"] = {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {"model": ["1", 0], "lora_name": lora_name, "strength_model": float(lora_strength)},
+            }
+            workflow["7"]["inputs"]["model"] = ["15", 0]
+            workflow["9"]["inputs"]["model"] = ["15", 0]
+
+        model_ref = ["15", 0] if lora_name else ["1", 0]
+        model_ref, _ = self._chain_model_only_loras(workflow, model_ref, extra_loras, 40)
+        workflow["7"]["inputs"]["model"] = model_ref
+        workflow["9"]["inputs"]["model"] = model_ref
+
+        conditioning = ["6", 0]
+        next_id = 17
+        for guide in guides or []:
+            kind = (guide or {}).get("kind")
+            filename = (guide or {}).get("filename")
+            frame_idx = int((guide or {}).get("frame_idx") or 0)
+            if kind not in ("audio", "image") or not filename:
+                raise ValueError(f"guide needs kind audio|image and a filename: {guide!r}")
+            if not -length <= frame_idx < length:
+                raise ValueError(
+                    f"guide frame_idx {frame_idx} is outside the clip's {length} frames"
+                )
+            # User LoRAs already sit at 40+; a guide pair never takes an id in use.
+            while str(next_id) in workflow or str(next_id + 1) in workflow:
+                next_id += 1
+            loader_id, guide_id = str(next_id), str(next_id + 1)
+            next_id += 2
+            if kind == "audio":
+                workflow[loader_id] = {"class_type": "LoadAudio", "inputs": {"audio": filename}}
+                inputs = {
+                    "positive": conditioning,
+                    "audio_vae": ["4", 0],
+                    "latent": ["6", 1],
+                    "audio": [loader_id, 0],
+                    "frame_idx": frame_idx,
+                }
+            else:
+                workflow[loader_id] = {"class_type": "LoadImage", "inputs": {"image": filename}}
+                inputs = {
+                    "positive": conditioning,
+                    "vae": ["3", 0],
+                    "latent": ["6", 1],
+                    "image": [loader_id, 0],
+                    "frame_idx": frame_idx,
+                }
+            workflow[guide_id] = {"class_type": "MiniMaxH3AddGuide", "inputs": inputs}
+            conditioning = [guide_id, 0]
+        workflow["7"]["inputs"]["conditioning"] = conditioning
+
+        if interpolation_multiplier > 1:
+            self._add_rife_interpolation(
+                workflow,
+                source_node_id="12",
+                video_combine_node_id="14",
+                base_fps=fps,
+                multiplier=interpolation_multiplier,
+            )
+        self._pin_model_attention(workflow, model_key, speed_profile)
+        return workflow
 
     def _build_vae_decode_node(self, samples_node: str, vae_node: str, width: int, height: int) -> dict:
         """Pick the right VAE decode strategy based on resolution.
@@ -1637,6 +2430,26 @@ class ComfyUIVideoWorkflowMixin:
             }
         }
 
+
+    def _add_av_audio_decode(self, workflow: dict, separate_node_id: str, audio_vae_node_id: str,
+                             video_combine_node_id: str) -> str:
+        """Decode the audio half of an LTX AV latent and mux it into the clip.
+
+        LTX-2.3/2.5 sample a joint video+audio latent; the builders separated it
+        and decoded only the video, discarding a soundtrack that was already
+        computed. This inserts LTXVAudioVAEDecode on the separate node's audio
+        output (index 1) and points VHS_VideoCombine's ``audio`` at it, the way
+        the official templates feed CreateVideo. RIFE and the upscaler only
+        rewire ``images``, so the audio survives them. Returns the new node id.
+        """
+        existing = [int(k) for k in workflow if str(k).isdigit()]
+        node_id = str(max(existing) + 1)
+        workflow[node_id] = {
+            "class_type": "LTXVAudioVAEDecode",
+            "inputs": {"samples": [separate_node_id, 1], "audio_vae": [audio_vae_node_id, 0]},
+        }
+        workflow[video_combine_node_id]["inputs"]["audio"] = [node_id, 0]
+        return node_id
 
     def _add_rife_interpolation(
         self,
@@ -1765,6 +2578,104 @@ class ComfyUIVideoWorkflowMixin:
         logger.info(f"Added FreeU_V2 node ({freeu_id}) after model node {model_node_id}")
         return freeu_id
 
+
+    def _stack_user_loras(self, workflow: dict, extra_loras: Optional[list], unet_node: str = "1") -> dict:
+        """Insert LoraLoaderModelOnly nodes between the UNET loader and every
+        node that reads it as ``model``. Ids continue after the graph's highest
+        numeric id, so any builder can call this after assembling its dict."""
+        if not extra_loras:
+            return workflow
+        # Consumers are collected before the chain is added: the first LoRA
+        # node reads the UNET directly and must keep doing so.
+        consumers = [
+            node["inputs"] for node in workflow.values()
+            if isinstance(node, dict) and isinstance(node.get("inputs"), dict)
+            and node["inputs"].get("model") == [unet_node, 0]
+        ]
+        ids = [int(k) for k in workflow if str(k).isdigit()]
+        model_ref, _ = self._chain_model_only_loras(workflow, [unet_node, 0], extra_loras, (max(ids) if ids else 0) + 1)
+        for inputs in consumers:
+            inputs["model"] = model_ref
+        return workflow
+
+    def _launch_attention(self) -> Optional[str]:
+        """The non-default attention backend ComfyUI was launched with (ck, sage,
+        auto) when it also offers ModelAttentionBackend to override it per model;
+        None on a default launch, where the graph is left as ComfyUI builds it."""
+        from backend.services.comfyui_launch_flags import ATTENTION_BACKENDS, ATTENTION_DEFAULT, ATTENTION_ENV
+        choice = (os.environ.get(ATTENTION_ENV) or ATTENTION_DEFAULT).strip().lower()
+        if choice not in ATTENTION_BACKENDS or choice == ATTENTION_DEFAULT:
+            return None
+        try:
+            return choice if self.comfy_node_available("ModelAttentionBackend") else None
+        except Exception:
+            return None
+
+    def _attention_pin_wanted(self) -> bool:
+        return self._launch_attention() is not None
+
+    def _apply_declared_attention(self, workflow: dict, model_key: str, refs: list, start_id: int,
+                                  speed_profile: Optional[str] = UNKNOWN_PROFILE) -> list:
+        """Put a ModelAttentionBackend after each model ref when the launch uses a
+        backend the entry has not verified for this speed profile
+        (video_render_limits.attention_pin); returns the new refs."""
+        from backend.services.video_render_limits import attention_pin
+        launch = self._launch_attention()
+        target = attention_pin(model_key, speed_profile, launch, self._model_family(model_key)) if launch else None
+        names = {"pytorch": "pytorch attention"}
+        if target not in names:
+            return list(refs)
+        out = []
+        for i, ref in enumerate(refs):
+            sid = str(int(start_id) + i)
+            workflow[sid] = {"class_type": "ModelAttentionBackend", "inputs": {"model": ref, "attention": names[target]}}
+            out.append([sid, 0])
+        return out
+
+    _MODEL_SOURCES = ("UNETLoader", "UnetLoaderGGUF", "LoraLoaderModelOnly")
+
+    def _pin_model_attention(self, workflow: dict, model_key: str, speed_profile: Optional[str]) -> dict:
+        """Pin attention on every model edge leaving the loader and LoRA chain,
+        for builders whose model chain has no fixed ids."""
+        edges = {}
+        for node in workflow.values():
+            inputs = node.get("inputs") or {}
+            ref = inputs.get("model")
+            if (isinstance(ref, list) and len(ref) == 2 and ref[0] in workflow
+                    and node.get("class_type") not in (*self._MODEL_SOURCES, "ModelAttentionBackend")
+                    and workflow[ref[0]].get("class_type") in self._MODEL_SOURCES):
+                edges.setdefault(tuple(ref), []).append(inputs)
+        if not edges:
+            return workflow
+        ids = [int(k) for k in workflow if str(k).isdigit()]
+        sources = [list(ref) for ref in edges]
+        pinned = self._apply_declared_attention(workflow, model_key, sources, max(ids) + 1, speed_profile)
+        for ref, new_ref in zip(edges, pinned):
+            for inputs in edges[ref]:
+                inputs["model"] = new_ref
+        return workflow
+
+    def _chain_model_only_loras(self, workflow: dict, model_ref: list, loras: Optional[list], start_id: int) -> tuple:
+        """Stack LoraLoaderModelOnly nodes after model_ref. Returns (new_ref, next_id)."""
+        current = model_ref
+        nid = int(start_id)
+        for spec in loras or []:
+            name = (spec or {}).get("filename") or (spec or {}).get("lora_name")
+            if not name:
+                continue
+            sid = str(nid)
+            nid += 1
+            strength = (spec or {}).get("strength")
+            workflow[sid] = {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {
+                    "model": current,
+                    "lora_name": name,
+                    "strength_model": float(0.7 if strength is None else strength),
+                },
+            }
+            current = [sid, 0]
+        return current, nid
 
     def _add_lora_loader(self, workflow: dict, model_node_id: str, clip_node_id: str, lora_name: str, strength: float = 1.0) -> tuple[str, str]:
         """Insert a LoraLoader node.

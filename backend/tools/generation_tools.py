@@ -13,7 +13,9 @@ from typing import Any, Optional
 from datetime import datetime
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
+from backend.utils.backend_http import is_mcp_transport, run_tool_in_backend
 
+from backend.utils.path_safety import safe_join
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +28,9 @@ class BulkCSVGeneratorTool(BaseTool):
     """
 
     name = "generate_bulk_csv"
+    read_only = False
+    # Small jobs write OUTPUT_DIR/csv/<filename>, replacing a file of that name.
+    destructive = True
     description = "Generate bulk CSV files with hundreds of pages efficiently using concurrent processing"
 
     parameters = {
@@ -94,6 +99,9 @@ class BulkCSVGeneratorTool(BaseTool):
 
     def execute(self, **kwargs) -> ToolResult:
         """Start bulk CSV generation job"""
+        if is_mcp_transport(self):
+            # The generation services read Flask config and the database, so the job runs in the backend.
+            return run_tool_in_backend(self.name, kwargs)
         filename = kwargs.get("filename")
         quantity = kwargs.get("quantity")
         topic = kwargs.get("topic")
@@ -104,6 +112,10 @@ class BulkCSVGeneratorTool(BaseTool):
 
         try:
             # Validate parameters
+            try:
+                quantity = int(quantity)
+            except (TypeError, ValueError):
+                return ToolResult(success=False, error="quantity must be a whole number")
             if quantity < 1:
                 return ToolResult(
                     success=False,
@@ -124,8 +136,12 @@ class BulkCSVGeneratorTool(BaseTool):
             from backend.config import OUTPUT_DIR
             output_dir = os.path.join(OUTPUT_DIR, "csv")
             os.makedirs(output_dir, exist_ok=True)
-            output_path = os.path.join(output_dir, filename)
+            try:
+                output_path = safe_join(output_dir, filename)
+            except ValueError:
+                return ToolResult(success=False, error=f"Invalid filename: {filename}")
 
+            unified_error = None
             # Try to use the unified file generation service first
             try:
                 from backend.services.unified_file_generation import (
@@ -138,15 +154,18 @@ class BulkCSVGeneratorTool(BaseTool):
                 request = GenerationRequest(
                     generation_type=GenerationType.CSV_BULK,
                     output_filename=filename,
+                    # Keys as read by UnifiedFileGenerationService._handle_csv_bulk:
+                    # one topic per row, word count as target_word_count, client
+                    # in context_variables.
                     content_spec={
-                        "topic": topic,
-                        "client": client,
-                        "quantity": quantity,
-                        "word_count": word_count
+                        "topics": [topic] if quantity == 1 else
+                                  [f"{topic} - Part {i}" for i in range(1, quantity + 1)],
+                        "target_word_count": word_count,
+                        "concurrent_workers": concurrent_workers,
                     },
                     context_variables={
+                        "client": client or "Client",
                         "project_id": str(project_id) if project_id else "",
-                        "concurrent_workers": str(concurrent_workers)
                     }
                 )
 
@@ -168,9 +187,12 @@ class BulkCSVGeneratorTool(BaseTool):
                             "filename": filename
                         }
                     )
+                unified_error = result.error or "unknown error"
+                logger.warning(f"Unified bulk generation failed: {unified_error}")
 
-            except Exception as unified_error:
-                logger.warning(f"Unified service failed, falling back to direct generation: {unified_error}")
+            except Exception as e:
+                unified_error = str(e)
+                logger.warning(f"Unified service failed, falling back to direct generation: {e}")
 
             # Fallback: Direct generation for smaller batches
             if quantity <= 10:
@@ -209,22 +231,15 @@ class BulkCSVGeneratorTool(BaseTool):
                     }
                 )
 
-            # For larger quantities, queue the job
+            # Larger jobs need the bulk generator; nothing is queued in the
+            # background here, so report the failure instead of a fake "queued".
             return ToolResult(
-                success=True,
-                output={
-                    "job_id": job_id,
-                    "output_path": output_path,
-                    "status": "queued",
-                    "message": f"Bulk generation job queued for {quantity} entries. Use job_id to track progress."
-                },
-                metadata={
-                    "quantity": quantity,
-                    "topic": topic,
-                    "client": client,
-                    "filename": filename,
-                    "note": "Large job queued for background processing"
-                }
+                success=False,
+                error=(
+                    f"Bulk generation of {quantity} rows failed ({unified_error}). "
+                    f"Try 10 rows or fewer, or use the Bulk Generation page."
+                ),
+                metadata={"quantity": quantity, "topic": topic, "filename": filename},
             )
 
         except Exception as e:
@@ -244,6 +259,9 @@ class FileGeneratorTool(BaseTool):
     """
 
     name = "generate_file"
+    read_only = False
+    # Writes to the filename it is given, replacing a file of that name.
+    destructive = True
     description = (
         "Create a brand-NEW output file from a description, written under data/outputs/files. "
         "It generates from the description ALONE and never reads any existing file. "
@@ -503,6 +521,9 @@ class CSVGeneratorTool(BaseTool):
     """
 
     name = "generate_csv"
+    read_only = False
+    # Writes to the filename it is given, replacing a file of that name.
+    destructive = True
     description = "Generate a CSV file based on user specifications and data structure instructions"
 
     parameters = {
@@ -596,7 +617,10 @@ Generate the CSV content now:"""
             from backend.config import OUTPUT_DIR
             output_dir = os.path.join(OUTPUT_DIR, "csv")
             os.makedirs(output_dir, exist_ok=True)
-            output_path = os.path.join(output_dir, filename)
+            try:
+                output_path = safe_join(output_dir, filename)
+            except ValueError:
+                return ToolResult(success=False, error=f"Invalid filename: {filename}")
 
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(csv_content)

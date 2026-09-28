@@ -11,14 +11,16 @@ ollama_resource_manager (adaptive context windows) — delegates to both.
 """
 
 import gc
+import importlib
 import logging
 import os
 import threading
 import time
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional, Any
+
+from backend.utils.clock import utcnow
 
 import requests
 
@@ -35,6 +37,12 @@ class ModelType(Enum):
     SD_PIPELINE = "sd_pipeline"
     VIDEO_PIPELINE = "video_pipeline"
     WHISPER = "whisper"
+    RERANKER = "reranker"
+    # A session booking, not a model the orchestrator can load or unload.
+    IMAGE_BATCH = "image_batch"
+    # A model a sidecar plugin (audio_foundry) loads and unloads itself; the plugin
+    # reports load, release and evict, and the admission reclaim asks it to unload.
+    EXTERNAL_PLUGIN = "external_plugin"
 
 
 class SlotState(Enum):
@@ -176,6 +184,8 @@ class GPUMemoryOrchestrator:
     - Delegates to gpu_resource_coordinator for exclusive video locks
     - Delegates to ollama_resource_manager for model metadata
     """
+    # Slots younger than this survive a hardware sync even when the probe cannot see them.
+    SYNC_GRACE_SECONDS = 90
 
     _instance = None
     _creation_lock = threading.Lock()
@@ -196,6 +206,9 @@ class GPUMemoryOrchestrator:
 
         # Model registry: slot_id → ModelSlot
         self._registry: Dict[str, ModelSlot] = {}
+        # Last `expires_at` seen per Ollama slot. A change between syncs means the
+        # model was used; see _sync_from_hardware.
+        self._ollama_expiry: Dict[str, str] = {}
 
         # Quality tier
         self._quality_tier = self._load_quality_tier()
@@ -402,6 +415,20 @@ class GPUMemoryOrchestrator:
                 slot.last_used = time.time()
                 logger.debug(f"Model {slot_id} released (still in VRAM, eviction timer started)")
 
+    def drop_booking(self, slot_id: str) -> bool:
+        """Forget a session booking without touching any model.
+
+        Session slots (video_render:*, image_batch:*) account for VRAM a caller
+        holds; once the caller's gpu_session exits the booking is stale, but the
+        weights behind it belong to whichever generator owns them.
+        """
+        with self._lock:
+            slot = self._registry.pop(slot_id, None)
+            if slot is None:
+                return False
+            slot.state = SlotState.UNLOADED
+            return True
+
     def force_evict(self, slot_id: str) -> bool:
         """Force-evict a specific model from GPU."""
         with self._lock:
@@ -587,7 +614,7 @@ class GPUMemoryOrchestrator:
             "tier_config": QUALITY_TIERS.get(self._quality_tier, {}),
             "idle_timeout_s": self._idle_timeout_s,
             "eviction_grace_s": self._eviction_grace_s,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utcnow().isoformat(),
         }
         return snapshot
 
@@ -663,17 +690,70 @@ class GPUMemoryOrchestrator:
             logger.warning(f"Could only free {freed}MB of {needed_mb}MB requested")
         return freed
 
-    def _physical_reclaim_untracked(self, needed_mb: int) -> int:
-        """When registry eviction frees nothing, unload in-process image weights + Ollama.
+    # Auxiliary in-process models: loaded on demand by non-render subsystems
+    # (retrieval, ingest, voice), never what a render job is asking for, and each
+    # one a module-global with no lifecycle of its own. Unloading them is always
+    # safe for the caller that wants the card. Deliberately NOT the diffusers
+    # pipeline: that IS what image callers want, and dropping it here would make
+    # every still reload ~11GB and defeat keep_pipeline.
+    _AUXILIARY_UNLOADS = (
+        ("reranker", "backend.utils.reranker"),
+        ("docling", "backend.utils.docling_loader"),
+        ("faster-whisper", "backend.utils.faster_whisper_utils"),
+    )
 
-        Must be called while holding ``self._lock`` (request_model path).
+    def reclaim_auxiliary_models(self) -> int:
+        """Unload in-process models no render job could want. Returns MB freed.
+
+        Ollama and ComfyUI are separate processes reached over HTTP; models this
+        process loaded itself answer to neither, and the orchestrator's own
+        reclaim sits behind a fit check that has already refused the job by the
+        time it would run. So the admission path in gpu_resource_policy calls
+        this before it decides (F-RAG-10, second half).
+
+        Takes the lock itself — callers outside this module must not reach for
+        the private helpers with nothing held.
+        """
+        with self._lock:
+            return self._reclaim_auxiliary_locked()
+
+    def _reclaim_auxiliary_locked(self) -> int:
+        """Auxiliary unloads only. Caller must hold ``self._lock``."""
+        freed = 0
+        for label, module_path in self._AUXILIARY_UNLOADS:
+            try:
+                mod = importlib.import_module(module_path)
+                unload = getattr(mod, "unload", None)
+                if unload is None:
+                    continue
+                result = unload()
+                # reranker reports {unloaded, freed_mb}; the others report a bool.
+                if isinstance(result, dict):
+                    mb = int(result.get("freed_mb") or 0)
+                elif result:
+                    # No self-measurement available; count nothing rather than
+                    # inventing a number the fit re-probe would contradict.
+                    mb = 0
+                else:
+                    continue
+                freed += mb
+                logger.info("Reclaim: %s released (~%sMB)", label, mb or "unmeasured")
+            except ImportError:
+                continue
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Reclaim: %s unload failed: %s", label, e)
+        if freed:
+            self._registry.pop("rerank:cross_encoder", None)
+        return freed
+
+    def _reclaim_in_process_locked(self, needed_mb: int) -> int:
+        """In-process unloads INCLUDING the render pipeline. Caller must hold the lock.
+
+        Only for `_physical_reclaim_untracked`, where the orchestrator has already
+        failed to free enough by every gentler means. The admission path uses
+        `reclaim_auxiliary_models` instead, which leaves the pipeline alone.
         """
         freed = 0
-        logger.warning(
-            "Physical reclaim: registry free insufficient (need %sMB); "
-            "forcing in-process SD unload + Ollama eviction",
-            needed_mb,
-        )
         # Drop all LOADED/LOADING SD/video slots after physical unload
         for slot in list(self._registry.values()):
             if slot.model_type in (ModelType.SD_PIPELINE, ModelType.VIDEO_PIPELINE):
@@ -686,6 +766,22 @@ class GPUMemoryOrchestrator:
                 freed = max(freed, needed_mb // 2)  # best-effort accounting
         except Exception as e:
             logger.warning("physical reclaim SD unload: %s", e)
+        # Auxiliary residents load themselves outside the registry, so a reclaim
+        # cannot wait for the next sync to notice them.
+        freed += self._reclaim_auxiliary_locked()
+        return freed
+
+    def _physical_reclaim_untracked(self, needed_mb: int) -> int:
+        """When registry eviction frees nothing, unload in-process image weights + Ollama.
+
+        Must be called while holding ``self._lock`` (request_model path).
+        """
+        logger.warning(
+            "Physical reclaim: registry free insufficient (need %sMB); "
+            "forcing in-process SD unload + Ollama eviction",
+            needed_mb,
+        )
+        freed = self._reclaim_in_process_locked(needed_mb)
         try:
             from backend.services.gpu_resource_policy import evict_ollama_models
             # Unlock briefly? Ollama is HTTP — ok under lock for short timeout
@@ -738,6 +834,10 @@ class GPUMemoryOrchestrator:
                 success = self._unload_video_pipeline()
             elif slot.model_type == ModelType.WHISPER:
                 success = self._unload_whisper()
+            elif slot.model_type == ModelType.RERANKER:
+                success = self._unload_reranker()
+            elif slot.model_type == ModelType.IMAGE_BATCH:
+                success = self._unload_image_batch(slot)
             else:
                 # External / plugin-driven slot — registry-only cleanup.
                 registry_only = True
@@ -755,9 +855,43 @@ class GPUMemoryOrchestrator:
         else:
             # Revert to whatever state we found it in, not blindly to LOADED.
             slot.state = original_state
-            logger.warning(f"Failed to unload {slot.slot_id}; reverted to {original_state.value}")
+            if slot.model_type == ModelType.IMAGE_BATCH:
+                # Expected while the batch runs; the booking is freed by its owner.
+                logger.debug(f"Keeping {slot.slot_id}: its image batch is still running")
+            else:
+                logger.warning(f"Failed to unload {slot.slot_id}; reverted to {original_state.value}")
 
         return success
+
+    def _unload_image_batch(self, slot: ModelSlot) -> bool:
+        """Free what an ``image_batch:<id>`` booking still accounts for.
+
+        The booking is the batch image generator's session slot: the weights
+        behind it are the diffusers pipeline (``sd:pipeline``), which the
+        generator keeps resident between images. A running batch keeps its
+        booking (nothing can be freed under it). A finished batch's booking is
+        stale: the generator releases the idle pipeline and the slot is dropped
+        from the registry, so a video render queued right after a keyframe
+        batch gets the card instead of loading against 10 GB of leftover
+        weights (2026-09-12: Wan 14B came up with ~1 GB usable, 9.6 GB
+        offloaded to CPU).
+        """
+        batch_id = slot.slot_id.split(":", 1)[1] if ":" in slot.slot_id else ""
+        try:
+            from backend.services import batch_image_generator as _big
+            generator = _big._batch_generator_instance
+        except Exception as e:  # noqa: BLE001
+            logger.debug("image batch generator unavailable for %s: %s", slot.slot_id, e)
+            generator = None
+        if generator is None:
+            # Bookings live in this process's registry; with no generator here
+            # nothing is running behind this one.
+            return True
+        try:
+            return bool(generator.release_batch_vram(batch_id))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("release_batch_vram(%s) failed: %s", batch_id, e)
+            return False
 
     def _unload_ollama_model(self, slot_id: str) -> bool:
         """Unload an Ollama model by setting keep_alive=0."""
@@ -816,9 +950,37 @@ class GPUMemoryOrchestrator:
             return False
 
     def _unload_whisper(self) -> bool:
-        """Whisper runs as an external process — nothing to unload from GPU."""
-        # whisper.cpp is a subprocess, not in-process GPU memory
-        return True
+        """Release faster-whisper if it is resident in this process.
+
+        This used to `return True` on the grounds that "whisper.cpp is a
+        subprocess, not in-process GPU memory". That is still true of the
+        transcription CLI in voice_api, but backend/utils/faster_whisper_utils
+        loads a CTranslate2 model in-process with device="auto" — which resolves
+        to CUDA — from the voice:stream_end SocketIO handler. So the one function
+        whose job was to free this was reporting a successful free of memory it
+        had never touched.
+        """
+        try:
+            from backend.utils import faster_whisper_utils as _fw
+            _fw.unload()
+            return True
+        except ImportError:
+            return True   # not installed: nothing resident, nothing to free
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to unload faster-whisper: {e}")
+            return False
+
+    def _unload_reranker(self) -> bool:
+        """Release the retrieval cross-encoder. Refused while a rerank is in flight."""
+        try:
+            from backend.utils.reranker import unload as _rerank_unload
+            info = _rerank_unload()
+            if not info.get("unloaded"):
+                logger.info("Reranker unload refused: %s", info.get("reason"))
+            return bool(info.get("unloaded"))
+        except Exception as e:
+            logger.error(f"Failed to unload reranker: {e}")
+            return False
 
     # ------------------------------------------------------------------
     # Internal: Hardware Sync
@@ -846,11 +1008,26 @@ class GPUMemoryOrchestrator:
                         model_type = ModelType.OLLAMA_EMBEDDING if is_embed else ModelType.OLLAMA_LLM
                         prefix = "ollama:" + name
 
+                        # Ollama pushes `expires_at` forward on every request, because
+                        # clients re-send keep_alive per call. That makes it the one
+                        # reliable signal that a model reached over plain HTTP is being
+                        # used -- this orchestrator never sees those calls, so without it
+                        # `last_used` stayed frozen at the moment of discovery and a model
+                        # in continuous use looked idle. During a long ingest that meant
+                        # evicting the embedding model out from under the run roughly
+                        # every idle-timeout, then paying to reload gigabytes on the next
+                        # chunk. Watching the expiry fixes it for every direct-HTTP
+                        # consumer at once, and still lets a genuinely idle model be
+                        # reclaimed -- which a pin held across a batch would not.
+                        expires_at = m.get("expires_at")
+
                         # Preserve existing slot data if we already track it
                         existing = self._registry.get(prefix)
                         if existing:
                             existing.vram_mb = vram_mb
                             existing.state = SlotState.LOADED
+                            if expires_at and self._ollama_expiry.get(prefix) != expires_at:
+                                existing.last_used = now
                             discovered[prefix] = existing
                         else:
                             discovered[prefix] = ModelSlot(
@@ -862,6 +1039,8 @@ class GPUMemoryOrchestrator:
                                 priority=70 if model_type == ModelType.OLLAMA_LLM else 50,
                                 state=SlotState.LOADED,
                             )
+                        if expires_at:
+                            self._ollama_expiry[prefix] = expires_at
             except Exception as e:
                 logger.debug(f"Ollama sync failed (non-critical): {e}")
 
@@ -869,7 +1048,9 @@ class GPUMemoryOrchestrator:
             try:
                 from backend.services.offline_image_generator import _generator_instance
                 if _generator_instance is not None and hasattr(_generator_instance, '_pipeline') and _generator_instance._pipeline is not None:
-                    prefix = f"sd:{_generator_instance._current_model or 'pipeline'}"
+                    # The generator pins its slot as "sd:pipeline"; keep that id
+                    # when it exists so begin_use()/end_use() keep working.
+                    prefix = "sd:pipeline" if "sd:pipeline" in self._registry else f"sd:{_generator_instance._current_model or 'pipeline'}"
                     existing = self._registry.get(prefix)
                     if existing:
                         existing.state = SlotState.LOADED
@@ -887,7 +1068,54 @@ class GPUMemoryOrchestrator:
             except Exception as e:
                 logger.debug(f"SD pipeline sync failed (non-critical): {e}")
 
-            # Merge: keep anything in discovered, drop anything not found
+            # 3. Sync the retrieval cross-encoder. It loads itself on the first RAG
+            # query without asking anyone, so the probe is the only thing that can
+            # discover it; before this existed it held ~2.4GB untracked and every
+            # image batch behind it was refused (F-RAG-10). Low priority and cheap
+            # to reload (~1.1s), so idle eviction is free to take it.
+            try:
+                from backend.utils import reranker as _reranker
+                rr = _reranker.status()
+                if rr.get("loaded") and rr.get("device") == "cuda":
+                    prefix = "rerank:cross_encoder"
+                    existing = self._registry.get(prefix)
+                    if existing:
+                        existing.vram_mb = rr.get("vram_mb") or existing.vram_mb
+                        existing.state = SlotState.LOADED
+                        existing.in_use = int(rr.get("in_use") or 0)
+                        discovered[prefix] = existing
+                    else:
+                        discovered[prefix] = ModelSlot(
+                            slot_id=prefix,
+                            model_type=ModelType.RERANKER,
+                            vram_mb=rr.get("vram_mb") or 1350,
+                            loaded_at=now,
+                            last_used=now,
+                            priority=30,
+                            state=SlotState.LOADED,
+                            in_use=int(rr.get("in_use") or 0),
+                        )
+            except Exception as e:
+                logger.debug(f"Reranker sync failed (non-critical): {e}")
+
+            # Merge, never replace: hardware can only tell us about Ollama and the
+            # resident SD pipeline. Session bookings (video_render:*, image_batch:*),
+            # pinned slots and slots still loading are invisible to the probe and
+            # are released by their owners (drop_booking / end_use / force_evict)
+            # or by idle eviction — dropping them here made hard_fit blind to every
+            # concurrent caller within 30 s of admission.
+            for slot_id, slot in self._registry.items():
+                if slot_id in discovered:
+                    continue
+                keep = (
+                    int(getattr(slot, "in_use", 0) or 0) > 0
+                    or slot.state == SlotState.LOADING
+                    or slot.model_type not in (ModelType.OLLAMA_LLM, ModelType.OLLAMA_EMBEDDING,
+                                               ModelType.SD_PIPELINE, ModelType.RERANKER)
+                    or (now - float(slot.loaded_at or 0)) < self.SYNC_GRACE_SECONDS
+                )
+                if keep:
+                    discovered[slot_id] = slot
             self._registry = discovered
 
         logger.debug(f"Hardware sync complete: {len(self._registry)} models tracked")
@@ -940,6 +1168,9 @@ class GPUMemoryOrchestrator:
                 # Active inference pin — never idle-evict mid-denoise / mid-batch.
                 if int(getattr(slot, "in_use", 0) or 0) > 0:
                     continue
+                # Session bookings are owner-released; retrying every cycle only logs.
+                if slot.model_type == ModelType.IMAGE_BATCH:
+                    continue
                 # CPU-only embedding-churn guard.
                 if (not gpu_present
                         and slot.model_type == ModelType.OLLAMA_EMBEDDING
@@ -991,6 +1222,12 @@ class GPUMemoryOrchestrator:
             return ModelType.VIDEO_PIPELINE
         elif lower.startswith("whisper:"):
             return ModelType.WHISPER
+        elif lower.startswith("rerank:"):
+            return ModelType.RERANKER
+        elif lower.startswith("image_batch"):
+            return ModelType.IMAGE_BATCH
+        elif lower.startswith("audio_foundry:"):
+            return ModelType.EXTERNAL_PLUGIN
         elif lower.startswith("ollama:"):
             name = slot_id.split(":", 1)[1] if ":" in slot_id else ""
             if any(kw in name.lower() for kw in ("embed", "retrieval", "minilm")):
@@ -1056,4 +1293,14 @@ def get_orchestrator() -> GPUMemoryOrchestrator:
     global _orchestrator_instance
     if _orchestrator_instance is None:
         _orchestrator_instance = GPUMemoryOrchestrator()
+    return _orchestrator_instance
+
+
+def get_orchestrator_if_created() -> Optional[GPUMemoryOrchestrator]:
+    """The instance if one exists, else None — never constructs one.
+
+    Constructing the orchestrator starts a background sync thread. A caller that
+    only wants to *free* memory has no business starting one: if none exists,
+    nothing is tracked and there is nothing here to release.
+    """
     return _orchestrator_instance

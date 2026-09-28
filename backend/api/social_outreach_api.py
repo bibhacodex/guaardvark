@@ -31,6 +31,7 @@ from typing import Any, Dict, Optional
 from flask import Blueprint, jsonify, request
 
 from backend.services.social_outreach import audit, kill_switch, persona
+from backend.utils.hosts import host_matches
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +120,8 @@ def get_approved():
 def create_draft():
     """Create a new draft from manual UI input. Lands in the queue as status='drafted'.
 
-    Body: {platform, action?, target_url?, target_thread_id?, draft_text?, grade_score?}
+    Body: {platform, action?, target_url?, target_thread_id?, draft_text?, grade_score?,
+           source?, reason?}
     Returns the new SocialOutreachLog row.
     """
     body = request.get_json(silent=True) or {}
@@ -139,8 +141,12 @@ def create_draft():
             grade_score = None
 
     # Reuse the audit pipeline so the manual draft hits jsonl + DB the same
-    # way an LLM-drafted row does. Marks "source=manual_ui" so we can later
+    # way an LLM-drafted row does. Marks "source=manual_ui" unless the caller
+    # names itself (outreach_draft_post sends "chat_tool"), so we can later
     # tell hand-rolled drafts apart from the cron-fed ones.
+    extra = {"source": body.get("source") or "manual_ui"}
+    if body.get("reason"):
+        extra["reason"] = body["reason"]
     audit_id = audit.log_outreach_event(
         platform=platform,
         action=action,
@@ -149,7 +155,7 @@ def create_draft():
         draft_text=draft_text,
         status="drafted",
         grade_score=grade_score,
-        extra={"source": "manual_ui"},
+        extra=extra,
     )
     if audit_id is None:
         return jsonify({"error": "failed to persist draft"}), 500
@@ -465,16 +471,33 @@ def fetch_meta():
 
 def _suggest_platform_from_host(host: str) -> Optional[str]:
     """Map a hostname to one of the queue's known platform slugs."""
-    host = (host or "").lower()
-    if "reddit.com" in host:
+    if host_matches(host, "reddit.com"):
         return "reddit"
-    if "discord.com" in host or "discord.gg" in host:
+    if host_matches(host, "discord.com", "discord.gg"):
         return "discord"
-    if "facebook.com" in host or "fb.com" in host:
+    if host_matches(host, "facebook.com", "fb.com"):
         return "facebook"
-    if "twitter.com" in host or "x.com" in host:
+    if host_matches(host, "twitter.com", "x.com"):
         return "twitter"
     return None
+
+
+_REDDIT_HOSTS = frozenset({"reddit.com", "www.reddit.com", "old.reddit.com", "new.reddit.com", "m.reddit.com"})
+
+
+def _reddit_thread_path(url: str) -> Optional[str]:
+    """Path of a reddit.com thread URL, or None when the host is not Reddit.
+
+    The host is matched exactly against ``_REDDIT_HOSTS`` so the JSON fetch can
+    be issued to a fixed host; a substring check would accept look-alikes such as
+    ``reddit.com.example.net``.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or (parsed.hostname or "").lower() not in _REDDIT_HOSTS:
+        return None
+    return parsed.path or "/"
 
 
 def _scout_reddit_url(url: str) -> Optional[Dict[str, Any]]:
@@ -489,11 +512,13 @@ def _scout_reddit_url(url: str) -> Optional[Dict[str, Any]]:
 
     # Reddit's JSON endpoint accepts the same path with .json appended. Strip
     # any trailing slash + querystring before tacking it on.
-    base = url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
-    json_url = base + ".json?limit=10&depth=1"
+    path = _reddit_thread_path(url)
+    if path is None:
+        return None
+    json_url = "https://www.reddit.com" + path.rstrip("/") + ".json?limit=10&depth=1"
     headers = {"User-Agent": "guaardvark-outreach/0.1 scout"}
     try:
-        resp = requests.get(json_url, headers=headers, timeout=10, allow_redirects=True)
+        resp = requests.get(json_url, headers=headers, timeout=10, allow_redirects=False)
         if not resp.ok:
             return None
         data = resp.json()
@@ -686,7 +711,7 @@ def scout_url():
         pass
 
     # Reddit JSON API — primary path unless caller forces DOM.
-    if "reddit.com" in parsed_host and not force_dom:
+    if _reddit_thread_path(url) is not None and not force_dom:
         scouted = _scout_reddit_url(url)
         if scouted:
             return jsonify(scouted)

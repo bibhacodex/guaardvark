@@ -280,6 +280,8 @@ class PluginManager:
         self._plugin_status: Dict[str, PluginStatus] = {}
         self._plugin_pids: Dict[str, int] = {}
         self._gate = PluginOperationGate()  # Traffic light for rapid clicks
+        # plugin_id -> why the process on its port is not ours (see _instance_check).
+        self._instance_problems: Dict[str, str] = {}
 
         # Initialize status for all plugins
         self._init_plugin_status()
@@ -405,24 +407,36 @@ class PluginManager:
         except (TypeError, ValueError):
             return 5002
 
+    @staticmethod
+    def _service_url(metadata: PluginMetadata) -> Optional[str]:
+        service_url = metadata.config.service_url
+        if not service_url and metadata.port:
+            service_url = f"http://localhost:{metadata.port}"
+        return service_url or None
+
     def _check_service_running(self, metadata: PluginMetadata) -> bool:
-        """Check if a service plugin is running by hitting its health endpoint"""
+        """True when OUR service answers its health endpoint.
+
+        A 200 alone is not enough for a plugin that declares an
+        ``instance_check``: another install's copy of the same service can hold
+        the port (2026-09-12: a foreign ComfyUI with an empty models tree
+        answered "/" and every Wan batch failed validation with
+        ``unet_name not in []``). Such a plugin is reported as not running and
+        the reason is kept for the status listing and for start_plugin.
+        """
         if metadata.type != 'service':
             return False
-        
+
         health_endpoint = metadata.endpoints.get('health', '/health')
-        service_url = metadata.config.service_url
-        
+        service_url = self._service_url(metadata)
         if not service_url:
-            if metadata.port:
-                service_url = f"http://localhost:{metadata.port}"
-            else:
-                return False
-        
+            return False
+
         try:
             url = f"{service_url.rstrip('/')}{health_endpoint}"
             response = requests.get(url, timeout=2)
-            return response.status_code == 200
+            if response.status_code != 200:
+                return False
         except requests.RequestException:
             # Only a genuine network/HTTP failure means "not running". A bare
             # `except Exception` here used to swallow RecursionError (raised deep
@@ -431,9 +445,123 @@ class PluginManager:
             # "health check failed (timeout)" and, when the error escaped
             # start_plugin, the 500-on-relaunch. Let non-network errors propagate.
             return False
+
+        ours, problem = self._instance_check(metadata, service_url)
+        self._note_instance_problem(getattr(metadata, 'id', None), problem)
+        return ours
+
+    def _note_instance_problem(self, plugin_id: str, problem: Optional[str]) -> None:
+        if problem:
+            problems = self.__dict__.setdefault('_instance_problems', {})
+            if problems.get(plugin_id) != problem:
+                logger.warning(f"Plugin '{plugin_id}': {problem}")
+            problems[plugin_id] = problem
+        else:
+            self.__dict__.setdefault('_instance_problems', {}).pop(plugin_id, None)
+
+    @staticmethod
+    def _local_model_files(plugin_dir: Optional[Path], subdirs: List[str], extensions: List[str]) -> set:
+        """Model files under the plugin's own tree, named the way the service
+        lists them (path relative to the folder, posix separators)."""
+        found: set = set()
+        if not plugin_dir:
+            return found
+        exts = tuple(e.lower() for e in extensions)
+        for sub in subdirs:
+            base = Path(plugin_dir) / sub
+            if not base.is_dir():
+                continue
+            for root, _dirs, files in os.walk(base):
+                for name in files:
+                    if exts and not name.lower().endswith(exts):
+                        continue
+                    rel = Path(root, name).relative_to(base).as_posix()
+                    found.add(rel)
+        return found
+
+    @staticmethod
+    def _strings_in(obj: Any) -> set:
+        out: set = set()
+        stack = [obj]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, str):
+                out.add(cur)
+            elif isinstance(cur, dict):
+                stack.extend(cur.values())
+            elif isinstance(cur, (list, tuple)):
+                stack.extend(cur)
+        return out
+
+    def _instance_check(self, metadata: PluginMetadata, service_url: str) -> Tuple[bool, Optional[str]]:
+        """Run the manifest's ``instance_check`` against an answering service.
+
+        Shape (plugin.json)::
+
+            "instance_check": {
+              "paths": ["/object_info/UNETLoader", ...],       # GET, JSON replies
+              "lists_file_from": ["ComfyUI/models/unet", ...], # relative to the plugin dir
+              "extensions": [".safetensors", ...]              # files that count
+            }
+
+        Passes when any string anywhere in any reply names a file that exists
+        under one of the listed directories: a stranger cannot know this
+        checkout's model files. With nothing local to compare against (fresh
+        install) the check is vacuous and passes. Returns (ours, problem).
+        """
+        spec = getattr(metadata, 'instance_check', None) or {}
+        if not spec:
+            return True, None
+        paths = [p for p in (spec.get('paths') or []) if isinstance(p, str)]
+        subdirs = [d for d in (spec.get('lists_file_from') or []) if isinstance(d, str)]
+        extensions = [e for e in (spec.get('extensions') or []) if isinstance(e, str)]
+        local = self._local_model_files(self.registry.get_plugin_dir(metadata.id), subdirs, extensions)
+        if not local or not paths:
+            return True, None
+
+        listed: set = set()
+        for path in paths:
+            try:
+                response = requests.get(f"{service_url.rstrip('/')}{path}", timeout=3)
+                if response.status_code == 200:
+                    listed |= self._strings_in(response.json())
+            except (requests.RequestException, ValueError):
+                continue
+        if listed & local:
+            return True, None
+        where = ", ".join(subdirs)
+        return False, (
+            f"a {metadata.name} that is not this checkout's holds port {metadata.port}: "
+            f"it lists none of the model files under {where}. Stop that process "
+            f"(it was started from another install), then start the plugin."
+        )
     
+    def _install_root(self) -> str:
+        return os.path.realpath(str(self.registry.plugins_dir.parent))
+
+    def _runs_outside_install(self, pid: int) -> bool:
+        """True when ``pid``'s working directory is known and outside this install.
+
+        Plugins are started with their plugin folder as the working directory,
+        so a process whose cwd lies elsewhere was not started by this install:
+        a second checkout sharing the ports, or a service run by hand. When the
+        cwd cannot be read (no /proc, or a non-dumpable process) the answer is
+        False and the caller keeps its old behaviour.
+        """
+        try:
+            cwd = os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
+        except OSError:
+            return False
+        root = self._install_root()
+        return not (cwd == root or cwd.startswith(root + os.sep))
+
     def _kill_by_port(self, port: int):
         """Kill any process listening on the given port (orphan cleanup).
+
+        Never under pytest: a manager built by a test over a temporary registry
+        still resolves ports that the real install uses, and a "foreign
+        instance" verdict from a stubbed HTTP layer must not reach a real
+        process (2026-09-19: a test run took down the checkout's ComfyUI).
 
         SAFETY: never kill our own PID, our parent's PID, or anything in our
         own process group. This protects against pre-existing manifest bugs
@@ -443,6 +571,9 @@ class PluginManager:
         backend that just spawned us — exactly the pattern that took the
         system down on 2026-04-28.
         """
+        if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("GUAARDVARK_MODE") == "test":
+            logger.warning(f"Not killing the process on port {port}: running under a test")
+            return
         if not port:
             return
 
@@ -473,7 +604,22 @@ class PluginManager:
                 ['lsof', '-ti', f':{port}'],
                 capture_output=True, text=True, timeout=5
             )
-            pids = result.stdout.strip().split('\n')
+            pids = [p for p in result.stdout.strip().split('\n') if p.strip().isdigit()]
+            if not pids:
+                # A plugin running from a setcap'd binary (cap_net_raw for
+                # packet capture) is non-dumpable: its /proc/<pid>/fd is
+                # unreadable, so lsof/ss cannot map the port to it. The
+                # command line is still visible — match the port there.
+                try:
+                    alt = subprocess.run(
+                        ['pgrep', '-f', f'--port {port}( |$)'],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    pids = [p for p in alt.stdout.split() if p.isdigit()]
+                    if pids:
+                        logger.info(f"Port {port}: lsof saw nothing, matched by command line: {pids}")
+                except (subprocess.SubprocessError, OSError):
+                    pids = []
             for pid_str in pids:
                 pid_str = pid_str.strip()
                 if not (pid_str and pid_str.isdigit()):
@@ -484,6 +630,13 @@ class PluginManager:
                         f"Refusing to kill PID {pid} on port {port} — it is the backend "
                         f"process (or a child of it). Plugin manifest likely declares a "
                         f"port that collides with FLASK_PORT. Fix the plugin.json port."
+                    )
+                    continue
+                if self._runs_outside_install(pid):
+                    logger.warning(
+                        f"Not killing PID {pid} on port {port}: it runs from outside this "
+                        f"install ({self._install_root()}). Another copy of Guaardvark, or a "
+                        f"service started by hand, is using the port."
                     )
                     continue
                 try:
@@ -538,14 +691,41 @@ class PluginManager:
         self._refresh_status()
         return {pid: status.value for pid, status in self._plugin_status.items()}
     
+    HEALTH_PROBE_INTERVAL_S = 0.5
+
+    @classmethod
+    def _health_wait_probes(cls, metadata: PluginMetadata) -> int:
+        """Probes to spend waiting for a started service: its manifest timeout
+        (seconds) at HEALTH_PROBE_INTERVAL_S, never fewer than 20 (10 s)."""
+        try:
+            timeout_s = float(getattr(getattr(metadata, 'config', None), 'timeout', 30) or 30)
+        except (TypeError, ValueError):
+            timeout_s = 30.0
+        return max(20, int(timeout_s / cls.HEALTH_PROBE_INTERVAL_S))
+
     def _refresh_status(self):
-        """Refresh status of all plugins"""
+        """Refresh status of all plugins.
+
+        A service seen answering after its start timed out (or started by
+        hand) joins the persisted running set, so the next boot restores it.
+        Nothing is removed here: stop.sh takes ComfyUI down while the backend
+        is still answering, and a refresh in that window must not forget that
+        the plugin was running.
+        """
+        came_up = False
         for plugin_id, metadata in self.registry.get_all_plugins().items():
+            before = self._plugin_status.get(plugin_id)
             if not metadata.config.enabled:
                 self._plugin_status[plugin_id] = PluginStatus.DISABLED
             elif metadata.type == 'service':
                 if self._check_service_running(metadata):
                     self._plugin_status[plugin_id] = PluginStatus.RUNNING
+                    came_up = came_up or before != PluginStatus.RUNNING
+                elif before == PluginStatus.ERROR and self.__dict__.get('_instance_problems', {}).get(plugin_id):
+                    # A start refused because a stranger holds the port set
+                    # ERROR with the reason; a refresh keeps it while the
+                    # stranger is still there instead of flapping to STOPPED.
+                    pass
                 else:
                     self._plugin_status[plugin_id] = PluginStatus.STOPPED
             else:
@@ -553,6 +733,16 @@ class PluginManager:
                 # "enabled" means available/ready (work runs via the task queue), so
                 # don't leave them UNKNOWN or flap them to STOPPED like a dead server.
                 self._plugin_status[plugin_id] = PluginStatus.RUNNING
+        if came_up:
+            try:
+                running = set(self.state_store.get_running())
+                now_running = {pid for pid, st in self._plugin_status.items()
+                               if st == PluginStatus.RUNNING
+                               and getattr(self.registry.get_plugin(pid), 'type', None) == 'service'}
+                if not now_running <= running:
+                    self.state_store.set_running(list(running | now_running))
+            except Exception as e:  # noqa: BLE001 — persistence must never break a listing
+                logger.debug(f"could not persist running set after refresh: {e}")
     
     def _fail_plugin_start(self, plugin_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         # Core pillars (e.g. ollama — the inference backbone) are exempt from the
@@ -579,7 +769,7 @@ class PluginManager:
         """Push plugin list to Socket.IO subscribers (replaces HTTP polling)."""
         try:
             from backend.services.plugin_status_emitter import emit_plugins_snapshot
-            emit_plugins_snapshot(reason)
+            emit_plugins_snapshot(reason, manager=self)
         except Exception:
             pass
 
@@ -631,8 +821,18 @@ class PluginManager:
                 return {'success': False, 'error': 'Plugin is disabled. Enable it first.'}
 
         if self._plugin_status.get(plugin_id) == PluginStatus.RUNNING:
-            self._broadcast_plugins_status(f"start:{plugin_id}:already_running")
-            return {'success': True, 'message': 'Plugin already running'}
+            # The status is this process's memory and outlives a service that
+            # died, so for a service plugin the flag is only worth trusting if
+            # the service still answers. Without the probe, Start reported
+            # success with nothing listening on the port.
+            if metadata.type != 'service' or self._check_service_running(metadata):
+                self._broadcast_plugins_status(f"start:{plugin_id}:already_running")
+                return {'success': True, 'message': 'Plugin already running'}
+            logger.warning(
+                f"Plugin '{plugin_id}' was marked running but its health endpoint "
+                f"is not answering — starting it"
+            )
+            self._plugin_status[plugin_id] = PluginStatus.STOPPED
 
         # Non-service plugins (e.g. lora_trainer — a TOOL the celery worker invokes
         # on demand) have NO long-running server to launch or health-check. "Starting"
@@ -680,6 +880,17 @@ class PluginManager:
             if not plugin_dir:
                 return {'success': False, 'error': 'Plugin directory not found'}
 
+            # A foreign copy of the service on our port answers the health
+            # probe; the start script would only report "already running".
+            # Refuse with the reason instead of pretending to start it.
+            if getattr(metadata, 'instance_check', None) and not self._check_service_running(metadata):
+                problem = self._instance_problems.get(plugin_id)
+                if problem:
+                    self._plugin_status[plugin_id] = PluginStatus.ERROR
+                    return self._fail_plugin_start(
+                        plugin_id, {'success': False, 'error': f'Not started: {problem}'}
+                    )
+
             # Set status to starting
             self._plugin_status[plugin_id] = PluginStatus.STARTING
 
@@ -720,8 +931,15 @@ class PluginManager:
                         plugin_id, {'success': False, 'error': f'Start script failed: {detail}'}
                     )
 
-                # Wait for service to become healthy (retry loop)
-                max_retries = 20
+                # Wait for the service to answer, for as long as its manifest
+                # says a start takes (config.timeout, ComfyUI 60 s). A fixed
+                # 10 s here marked ComfyUI ERROR while it was still importing
+                # torch and its custom nodes; the boot restore then dropped it
+                # from the running set and the next start.sh never brought it
+                # back, so the first video generation after a deploy failed
+                # with "Start the ComfyUI plugin".
+                max_retries = self._health_wait_probes(metadata)
+                problem = None
                 for i in range(max_retries):
                     if self._check_service_running(metadata):
                         self._plugin_status[plugin_id] = PluginStatus.RUNNING
@@ -736,6 +954,9 @@ class PluginManager:
                             'message': 'Plugin started successfully',
                             'output': result.get('stdout', '')
                         }
+                    problem = self._instance_problems.get(plugin_id)
+                    if problem:
+                        break  # answering, but not ours: waiting will not change that
                     time.sleep(0.5)
 
                 # Check if process is still running
@@ -745,7 +966,10 @@ class PluginManager:
                     plugin_id,
                     {
                         'success': False,
-                        'error': 'Plugin started but health check failed (timeout)',
+                        'error': (
+                            f'Not started: {problem}' if problem
+                            else 'Plugin started but health check failed (timeout)'
+                        ),
                     },
                 )
 
@@ -758,12 +982,16 @@ class PluginManager:
             self._gate.release(plugin_id)
             self._broadcast_plugins_status(f"start:{plugin_id}")
     
-    def stop_plugin(self, plugin_id: str) -> Dict[str, Any]:
+    def stop_plugin(self, plugin_id: str, *, cancel_video_jobs: bool = True) -> Dict[str, Any]:
         """
         Stop a plugin.
 
         Args:
             plugin_id: Plugin ID to stop
+            cancel_video_jobs: For ComfyUI, cancel in-flight video batches
+                first (the user stopping the sidecar). A render that restarts
+                ComfyUI to relaunch it with its own flags passes False: the
+                batch it belongs to must survive.
 
         Returns:
             Result dictionary with status and message. If the operation gate
@@ -801,7 +1029,7 @@ class PluginManager:
 
             # Video generation rides ComfyUI — cancel in-flight batches before
             # killing the sidecar so the worker doesn't keep spinning.
-            if plugin_id == "comfyui":
+            if plugin_id == "comfyui" and cancel_video_jobs:
                 try:
                     from backend.services.batch_video_generator import get_batch_video_generator
                     cancelled = get_batch_video_generator().cancel_all_active(
@@ -850,7 +1078,13 @@ class PluginManager:
             if self._check_service_running(metadata) and metadata.port:
                 logger.info(f"Killing {plugin_id} by port {metadata.port}")
                 self._kill_by_port(metadata.port)
-                time.sleep(1)
+                # SIGTERM is graceful: a service draining connections or
+                # joining threads needs a few seconds. Poll instead of
+                # declaring failure after one, which left plugins marked
+                # running that exited moments later.
+                deadline = time.time() + 10
+                while time.time() < deadline and self._check_service_running(metadata):
+                    time.sleep(0.5)
 
             if not self._check_service_running(metadata):
                 self._plugin_status[plugin_id] = PluginStatus.STOPPED
@@ -865,13 +1099,21 @@ class PluginManager:
             self._gate.release(plugin_id)
             self._broadcast_plugins_status(f"stop:{plugin_id}")
     
-    def restart_plugin(self, plugin_id: str) -> Dict[str, Any]:
+    def restart_plugin(self, plugin_id: str, *, cancel_video_jobs: bool = True) -> Dict[str, Any]:
         """Restart a plugin by stopping and starting it"""
-        stop_result = self.stop_plugin(plugin_id)
+        stop_result = self.stop_plugin(plugin_id, cancel_video_jobs=cancel_video_jobs)
         if not stop_result.get('success') and 'already stopped' not in stop_result.get('message', ''):
             return stop_result
-        
-        time.sleep(1)
+
+        # The stop leaves the plugin in its per-plugin cooldown (and the system in
+        # the global one); starting inside that window is refused, which would end
+        # a restart with the plugin down and its toggle still on. Wait it out.
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            remaining = max(self._gate.cooldown_remaining(plugin_id), self._gate._global_cooldown_active())
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 1.0) + 0.05)
         return self.start_plugin(plugin_id)
     
     def enable_plugin(self, plugin_id: str) -> Dict[str, Any]:
@@ -1010,6 +1252,26 @@ class PluginManager:
             except Exception as e:
                 logger.warning(f"Ollama disable: error unloading {name}: {e}")
     
+    def _record_health(self, plugin_id: str, *, answering: bool) -> None:
+        """Keep the recorded status in step with what a health probe just saw.
+
+        A service that crashed (ComfyUI mid-render) stays RUNNING in
+        get_status() until something refreshes it; a probe that finds it gone
+        records it STOPPED, and one that finds it answering again records it
+        RUNNING. An ERROR kept for a stranger on the port is left alone, and the
+        persisted running set is not touched (see _refresh_status).
+        """
+        before = self._plugin_status.get(plugin_id)
+        if answering and before == PluginStatus.STOPPED:
+            after = PluginStatus.RUNNING
+        elif not answering and before == PluginStatus.RUNNING:
+            after = PluginStatus.STOPPED
+        else:
+            return
+        self._plugin_status[plugin_id] = after
+        logger.info(f"Health check: '{plugin_id}' {before.value} -> {after.value}")
+        self._broadcast_plugins_status(f"health:{plugin_id}:{after.value}")
+
     def health_check(self, plugin_id: str) -> Dict[str, Any]:
         """
         Get health status of a plugin.
@@ -1042,6 +1304,7 @@ class PluginManager:
                 response = requests.get(url, timeout=5)
                 
                 if response.status_code == 200:
+                    self._record_health(plugin_id, answering=True)
                     data = response.json()
                     data['plugin_id'] = plugin_id
                     return data
@@ -1052,6 +1315,7 @@ class PluginManager:
                         'plugin_id': plugin_id
                     }
             except requests.exceptions.ConnectionError:
+                self._record_health(plugin_id, answering=False)
                 payload = {'status': 'stopped', 'error': 'Service not running'}
                 # For the swarm plugin, the sidecar can't tell us *why* it's down
                 # when it isn't running. Run its static dependency check out of
@@ -1090,6 +1354,8 @@ class PluginManager:
         info['status'] = status.value
         info['running'] = status == PluginStatus.RUNNING
         info['plugin_dir'] = str(plugin_dir) if plugin_dir else None
+        if plugin_id in self._instance_problems:
+            info['status_message'] = self._instance_problems[plugin_id]
         
         # Add health info if running
         if status == PluginStatus.RUNNING:
@@ -1108,6 +1374,8 @@ class PluginManager:
             status = self._plugin_status.get(plugin_id, PluginStatus.UNKNOWN)
             plugin_info['status'] = status.value
             plugin_info['running'] = status == PluginStatus.RUNNING
+            if plugin_id in self._instance_problems:
+                plugin_info['status_message'] = self._instance_problems[plugin_id]
             # Round to 1 decimal so the frontend doesn't get noisy fractional updates
             plugin_info['cooldown_remaining'] = round(self._gate.cooldown_remaining(plugin_id), 1)
             result.append(plugin_info)

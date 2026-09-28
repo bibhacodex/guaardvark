@@ -17,6 +17,7 @@ def get_rules():
     Query parameters:
         project_id: Optional project id used to return rules linked to that project.
         type: Optional rule type filter, such as COMMAND_RULE.
+        level: Optional level filter, such as LEARNED.
         is_active: Optional boolean-like active-state filter.
         page: Optional page number, defaulting to 1.
         per_page: Optional page size capped at 100, defaulting to 50.
@@ -36,6 +37,11 @@ def get_rules():
         rule_type = request.args.get("type")
         if rule_type:
             query = query.filter(Rule.type == rule_type)
+
+        # Filter by level (e.g. LEARNED: rules the chat added on its own)
+        level = request.args.get("level")
+        if level:
+            query = query.filter(Rule.level == level.upper())
 
         # Filter by active status
         is_active = request.args.get("is_active")
@@ -70,7 +76,7 @@ def get_rule(rule_id):
     rule = db.session.get(Rule, rule_id)
     if not rule:
         return error_response("Rule not found", 404, "NOT_FOUND")
-    return success_response("Rule retrieved", rule.to_dict())
+    return success_response(rule.to_dict(), "Rule retrieved")
 
 
 @rules_bp.route("", methods=["POST"])
@@ -139,7 +145,7 @@ def create_rule():
         )
         db.session.add(rule)
         db.session.commit()
-        return success_response("Rule created", {"id": rule.id}, 201)
+        return success_response({"id": rule.id}, "Rule created", 201)
     except IntegrityError as e:
         db.session.rollback()
         return error_response(

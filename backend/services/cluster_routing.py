@@ -16,6 +16,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Any, Literal
 
+from backend.utils.clock import utcnow
+
 
 # ---- workload specs --------------------------------------------------
 
@@ -226,7 +228,7 @@ class RoutingTableBuilder:
 
         return RoutingTable(
             routes=routes,
-            computed_at=datetime.utcnow(),
+            computed_at=utcnow(),
             computed_by=master_node_id,
             node_count=len(profiles),
             fleet_hash=compute_fleet_hash(profiles, online_map),
@@ -367,13 +369,16 @@ class RoutingTableBuilder:
 
 # ---- store ----------------------------------------------------------
 
-_DEFAULT_PERSIST = "data/cluster/routing_table.json"
+def _default_persist_path() -> str:
+    """Routing table under the configured storage root, whatever the cwd is."""
+    from backend.config import STORAGE_DIR
+    return str(Path(STORAGE_DIR) / "cluster" / "routing_table.json")
 
 
 class RoutingTableStore:
-    def __init__(self, persist_path: str = _DEFAULT_PERSIST):
+    def __init__(self, persist_path: str | None = None):
         self._table: RoutingTable | None = None
-        self._persist_path = persist_path
+        self._persist_path = persist_path or _default_persist_path()
         self._lock = threading.RLock()
 
     def get(self) -> RoutingTable | None:

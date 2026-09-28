@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import hashlib
@@ -15,14 +16,28 @@ from typing import Optional, Dict, Set
 import json
 import psutil
 import requests
+from pathlib import Path
 
-from flask import Blueprint, current_app, jsonify, request, send_file
+from flask import Blueprint, Response, current_app, jsonify, request, send_file
 from werkzeug.utils import secure_filename
 from backend.utils.response_utils import success_response, error_response
+from backend.utils.path_guard import PathEscapesRoot, contained, contained_path
+from backend.utils.privileged_apt import (
+    escalation_method,
+    manual_apt_command,
+    run_privileged_apt,
+)
 
 # Audio Foundry plugin endpoint — Kokoro primary (natural, fast per team voice audit),
 # Chatterbox for reference-clip cloning. Fallback to Piper. See plugins/audio_foundry/.
 AUDIO_FOUNDRY_URL = os.environ.get("AUDIO_FOUNDRY_URL", "http://127.0.0.1:8206")
+
+# Optional: use an already-running whisper.cpp *server* (HTTP) for STT instead of
+# building/running Guaardvark's own whisper-cli. Set GUAARDVARK_USE_WHISPER_SERVER=1
+# (and optionally GUAARDVARK_WHISPER_SERVER_URL) to enable. Mirrors the
+# GUAARDVARK_ZIMAGE_USE_COMFYUI=1 opt-in pattern.
+USE_WHISPER_SERVER = os.environ.get("GUAARDVARK_USE_WHISPER_SERVER", "").strip().lower() in ("1", "true", "yes", "on")
+WHISPER_SERVER_URL = os.environ.get("GUAARDVARK_WHISPER_SERVER_URL", "http://127.0.0.1:5800").rstrip("/")
 
 # --- Blueprint Definition ---
 voice_bp = Blueprint("voice_api", __name__, url_prefix="/api/voice")
@@ -672,6 +687,11 @@ def convert_audio_to_wav_ffmpeg(input_path, output_path):
 # Local tool paths (relative to backend directory)
 WHISPER_CLI_PATH = "tools/voice/whisper.cpp/build/bin/whisper-cli"
 WHISPER_MODEL_PATH = "tools/voice/whisper.cpp/models/ggml-base.bin"
+
+# cmake + a compiler to build whisper.cpp; git to clone it. Allowlisted because
+# the names are interpolated into a shell line run as root (same gate as the
+# agent-display installer).
+_WHISPER_APT_PACKAGES = frozenset({"git", "cmake", "build-essential"})
 PIPER_MODEL_PATH = "tools/voice/piper-models/en_US-libritts-high.onnx"
 
 # PERFORMANCE OPTIMIZATION: Voice configuration constants
@@ -983,6 +1003,31 @@ def parse_whisper_output(raw_output):
     
     return final_text
 
+def _transcribe_via_whisper_server(audio_path: str) -> str:
+    """Transcribe an audio file via a running whisper.cpp HTTP server.
+
+    whisper.cpp's server exposes POST /inference as multipart/form-data with a
+    ``file`` part carrying the audio bytes (not a path). We save the uploaded
+    audio to a temp WAV, POST it as the file part, and return the transcribed
+    text.
+    """
+    try:
+        with open(audio_path, "rb") as f:
+            resp = requests.post(
+                f"{WHISPER_SERVER_URL}/inference",
+                files={"file": (Path(audio_path).name, f, "audio/wav")},
+                data={"temperature": "0.0", "response_format": "json"},
+                timeout=120,
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        text = (data.get("text") or "").strip()
+        return text
+    except Exception as e:
+        logger.error(f"Voice API: whisper-server transcription failed: {e}")
+        raise
+
+
 @voice_bp.route("/speech-to-text", methods=["POST"])
 def speech_to_text():
     """Convert uploaded audio file to text using local Whisper.cpp with performance optimizations."""
@@ -1012,6 +1057,53 @@ def speech_to_text():
         
         if not allowed_audio_file(audio_file.filename):
             return error_response("Unsupported audio format", 400, "UNSUPPORTED_FORMAT")
+        
+        # Optional: route STT through an already-running whisper.cpp HTTP server.
+        if USE_WHISPER_SERVER:
+            try:
+                import io
+                from faster_whisper.audio import decode_audio
+                audio_bytes = audio_file.read()
+                audio_array = decode_audio(io.BytesIO(audio_bytes))
+                audio_duration = len(audio_array) / 16000.0
+
+                # Save to a temp WAV the whisper-server can read from disk.
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp_path = tmp.name
+                tmp.close()
+                try:
+                    import wave
+                    with wave.open(tmp_path, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(16000)
+                        wf.writeframes((audio_array * 32767).astype("int16").tobytes())
+
+                    start_time = time.time()
+                    final_text = _transcribe_via_whisper_server(tmp_path)
+                    processing_time = time.time() - start_time
+                    logger.info(f"Voice API: whisper-server completed in {processing_time:.2f}s")
+
+                    if final_text:
+                        release_rate_limit(request)
+                        return jsonify({
+                            "text": final_text,
+                            "transcribed_text": final_text,
+                            "duration": audio_duration,
+                            "processing_time": round(processing_time, 3),
+                            "model_used": "whisper-server",
+                            "engine": "whisper-server",
+                        })
+                    else:
+                        return jsonify({"error": "No speech detected in audio"}), 400
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+            except Exception as ws_err:
+                logger.error(f"Voice API: whisper-server path failed ({ws_err})")
+                return jsonify({"error": f"Speech recognition failed: {str(ws_err)}"}), 500
         
         # Get optional model preference from request
         preferred_model = request.form.get('model', DEFAULT_WHISPER_MODEL)
@@ -1289,10 +1381,10 @@ def _try_audio_foundry_voice(text: str, output_format: str, narrations_dir: str)
     # serve it without changing the security check on that endpoint.
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_filename = f"narration_{timestamp}.{output_format}"
-    out_path = os.path.join(narrations_dir, out_filename)
     try:
+        out_path = contained_path(narrations_dir, out_filename)
         shutil.copy2(src_path, out_path)
-    except (OSError, IOError) as e:
+    except (OSError, IOError, PathEscapesRoot) as e:
         logger.warning("Voice API: failed to stage audio_foundry output (%s) — using Piper fallback", e)
         return None
 
@@ -1423,7 +1515,7 @@ def narrate():
                     temp_files.append(section_path)
 
                 cmd = [
-                    "python", "-m", "piper",
+                    sys.executable, "-m", "piper",
                     "--model", piper_model,
                     "--output_file", section_path
                 ]
@@ -1676,6 +1768,13 @@ def voice_status():
         if not whisper_available and not piper_available:
             status = "unavailable"
 
+        whisper_build = _whisper_build_dep_status() if not whisper_cli_available else {
+            "missing_build_packages": [],
+            "can_auto_install": True,
+            "install_method": None,
+            "manual_command": None,
+        }
+
         return jsonify({
             "status": status,
             "speech_recognition": whisper_available,
@@ -1688,6 +1787,10 @@ def voice_status():
             "supported_formats": list(SUPPORTED_AUDIO_FORMATS),
             "available_voices": available_voices,
             "engine": "local (whisper.cpp + piper-tts)",
+            "missing_build_packages": whisper_build["missing_build_packages"],
+            "can_auto_install": whisper_build["can_auto_install"],
+            "install_method": whisper_build["install_method"],
+            "manual_command": whisper_build["manual_command"],
             "optimization": {
                 "enabled": True,
                 "default_model": DEFAULT_WHISPER_MODEL,
@@ -1783,6 +1886,31 @@ def stream_voice_chat():
         # Update audio file analysis after conversion
         wav_audio_size = os.path.getsize(wav_temp_path)
         logger.info(f"VOICE API: Converted WAV file analysis - Size: {wav_audio_size} bytes")
+        
+        # Optional: route STT through an already-running whisper.cpp HTTP server.
+        if USE_WHISPER_SERVER:
+            try:
+                transcribed_text = _transcribe_via_whisper_server(wav_temp_path)
+                logger.info(f"VOICE API: whisper-server transcription: '{transcribed_text}'")
+                if not transcribed_text:
+                    return jsonify({"error": "No speech detected in audio"}), 400
+                return jsonify({
+                    "transcribed_text": transcribed_text,
+                    "session_id": session_id,
+                    "streaming": True,
+                    "tts_handled_by": "frontend"
+                })
+            except Exception as ws_err:
+                logger.error(f"VOICE API: whisper-server transcription failed: {ws_err}")
+                return jsonify({"error": f"Transcription failed: {str(ws_err)}"}), 500
+            finally:
+                try:
+                    if os.path.exists(temp_file_path):
+                        os.unlink(temp_file_path)
+                    if os.path.exists(wav_temp_path):
+                        os.unlink(wav_temp_path)
+                except (OSError, IOError):
+                    pass
         
         try:
             # Step 1: Enhanced transcription using optimized Whisper with better parameters
@@ -2446,6 +2574,82 @@ def list_all_voice_models():
         return error_response(str(e), 500)
 
 
+def _missing_whisper_apt() -> list:
+    """Apt packages needed to clone and compile whisper.cpp that are not on PATH."""
+    missing = []
+    if not shutil.which("git"):
+        missing.append("git")
+    if not shutil.which("cmake"):
+        missing.append("cmake")
+    if not shutil.which("make") or not shutil.which("gcc"):
+        missing.append("build-essential")
+    return missing
+
+
+def _whisper_build_dep_status() -> dict:
+    """How (or whether) this host can install the whisper.cpp build tools."""
+    missing = _missing_whisper_apt()
+    if not missing:
+        return {
+            "missing_build_packages": [],
+            "can_auto_install": True,
+            "install_method": None,
+            "manual_command": None,
+        }
+    method = escalation_method()
+    return {
+        "missing_build_packages": missing,
+        "can_auto_install": method != "none",
+        "install_method": method,
+        "manual_command": None if method != "none" else manual_apt_command(missing),
+    }
+
+
+def _whisper_apt_failure(apt: dict, packages: list):
+    """JSON response when privileged apt could not install whisper build tools."""
+    if apt["method"] == "none":
+        return jsonify({
+            "success": False,
+            "needs_manual_install": True,
+            "manual_command": manual_apt_command(packages),
+            "missing_build_packages": packages,
+            "error": (
+                "Building Whisper.cpp needs cmake and a compiler, and this session "
+                "has no desktop to show a password prompt on. Run the command below "
+                "on the machine itself, then click Install Whisper again."
+            ),
+        }), 409
+    stderr = (apt.get("stderr") or "").strip()
+    rc = apt["returncode"]
+    if apt["method"] == "pkexec" and rc == 126:
+        return jsonify({
+            "success": False,
+            "error": (
+                "Authorisation was dismissed or the password was wrong. "
+                "Click Install Whisper again and approve the prompt on your desktop."
+            ),
+        }), 403
+    if rc == "timeout":
+        return jsonify({
+            "success": False,
+            "error": (
+                "Timed out waiting for the install. If a password prompt is open "
+                "on your desktop, approve it and try again."
+            ),
+        }), 504
+    return jsonify({
+        "success": False,
+        "needs_manual_install": True,
+        "manual_command": manual_apt_command(packages),
+        "missing_build_packages": packages,
+        "error": (
+            f"apt-get failed (exit {rc}) via {apt['method']}. "
+            "Run the command below in a terminal, then click Install Whisper again."
+        ),
+        "stderr_tail": stderr[-500:],
+    }), 500
+
+
 @voice_bp.route("/install-whisper", methods=["POST"])
 def install_whisper():
     """
@@ -2482,38 +2686,30 @@ def install_whisper():
             except Exception:
                 pass  # Binary exists but doesn't work, proceed with reinstall
 
-        # Check prerequisites
-        missing_deps = []
-        for dep in ["git", "cmake", "make", "gcc"]:
-            if not shutil.which(dep):
-                missing_deps.append(dep)
-
-        if missing_deps:
-            # Try to auto-install missing build dependencies
-            logger.info(f"Voice API: Auto-installing missing deps: {missing_deps}")
-            try:
-                install_result = subprocess.run(
-                    ["sudo", "apt-get", "install", "-y", "cmake", "build-essential"],
-                    capture_output=True, text=True, timeout=120
-                )
-                if install_result.returncode != 0:
-                    return jsonify({
-                        "success": False,
-                        "error": f"Missing build dependencies: {', '.join(missing_deps)}. Auto-install failed. Try: sudo apt install cmake build-essential"
-                    }), 400
-                # Re-check after install
-                still_missing = [dep for dep in ["git", "cmake", "make", "gcc"] if not shutil.which(dep)]
-                if still_missing:
-                    return jsonify({
-                        "success": False,
-                        "error": f"Still missing after install: {', '.join(still_missing)}. Try: sudo apt install {' '.join(still_missing)}"
-                    }), 400
-                logger.info("Voice API: Build dependencies installed successfully")
-            except Exception as e:
+        missing_apt = _missing_whisper_apt()
+        if missing_apt:
+            logger.info("Voice API: Installing whisper.cpp build tools: %s", missing_apt)
+            apt = run_privileged_apt(
+                missing_apt,
+                allowed=_WHISPER_APT_PACKAGES,
+                timeout=300,
+                log_label="Whisper.cpp install",
+            )
+            if not apt["ok"]:
+                return _whisper_apt_failure(apt, missing_apt)
+            still_missing = _missing_whisper_apt()
+            if still_missing:
                 return jsonify({
                     "success": False,
-                    "error": f"Missing build dependencies: {', '.join(missing_deps)}. Auto-install failed: {str(e)}. Try: sudo apt install cmake build-essential"
+                    "needs_manual_install": True,
+                    "manual_command": manual_apt_command(still_missing),
+                    "missing_build_packages": still_missing,
+                    "error": (
+                        "Build tools still missing after install. "
+                        "Run the command below, then click Install Whisper again."
+                    ),
                 }), 400
+            logger.info("Voice API: Whisper.cpp build tools installed")
 
         # Remove placeholder directory if it exists but has no source
         if os.path.isdir(whisper_dir):

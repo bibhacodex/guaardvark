@@ -36,8 +36,9 @@ async function getAvailableModels() {
       console.debug('Ollama plugin offline; returning empty model list');
       return [];
     }
-    // Handle non-standard envelope: {data: "string", message: {models: [...]}}
-    // Also handle: {data: {models: [...]}} or {models: [...]} or [...]
+    // Standard envelope {data: {models: [...]}}; older backends reversed the
+    // arguments and put it under message. Also accept {models: [...]} or [...].
+    if (data?.data?.models) return data.data.models;
     if (data?.message?.models) return data.message.models;
     const actualData = data?.data || data;
     return Array.isArray(actualData) ? actualData : actualData?.models || [];

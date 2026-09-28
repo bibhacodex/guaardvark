@@ -113,7 +113,11 @@ class VideoGenerationRouter:
         if self._backend_pref == "auto":
             gen = self._get_offline()
             if gen:
-                logger.info("ComfyUI unavailable, falling back to Offline Diffusers backend")
+                logger.error(
+                    "ComfyUI unavailable after start attempt — falling back to the in-process "
+                    "Offline Diffusers backend (slower, runs inside the API process). "
+                    "Check logs/comfyui.log; set GUAARDVARK_VIDEO_BACKEND=comfyui to refuse instead."
+                )
                 return gen
 
         raise RuntimeError(
@@ -121,16 +125,18 @@ class VideoGenerationRouter:
             "ComfyUI is not running and Offline generator is not installed."
         )
 
-    def interrupt(self) -> bool:
+    def interrupt(self, prompt_id: Optional[str] = None) -> bool:
         """Tell whichever backend is currently sampling to abort.
 
         Returns True if a backend acknowledged the interrupt. ComfyUI honours
         this immediately; the offline generator can only stop between items.
+        ``prompt_id`` narrows it to one ComfyUI prompt; without it every prompt
+        this process queued is stopped.
         """
         if self._check_comfyui():
             try:
                 comfy = self._get_comfyui()
-                return comfy.interrupt()
+                return comfy.interrupt(prompt_id)
             except Exception as e:
                 logger.warning(f"Router interrupt to ComfyUI failed: {e}")
                 return False
@@ -144,13 +150,29 @@ class VideoGenerationRouter:
             self._active_generation_count += 1
             self._cancel_idle_shutdown()
         try:
-            generator = self.get_active_generator()
-            result = generator.generate_video(request)
+            try:
+                generator = self.get_active_generator()
+            except RuntimeError as e:
+                # No backend: ComfyUI is down and there is nothing to fall back to.
+                from backend.services.job_types import RenderErrorKind
+                return VideoGenerationResult(
+                    success=False, error=str(e), error_kind=RenderErrorKind.COMFYUI_DOWN.value,
+                    prompt_used=request.prompt,
+                )
+            # The batch runner holds a gpu_session around every clip; direct
+            # callers (tools, adapters, tests) came through here with nothing
+            # evicting the resident chat model, so a 14 GB video budget on a
+            # 16 GB card thrashed into CPU offload. The session is re-entrant:
+            # under the batch runner's outer session this is a no-op.
+            with self._render_session(request):
+                result = generator.generate_video(request)
             return result
         except RuntimeError as e:
+            from backend.services.job_operation_gate import classify_render_exception
             return VideoGenerationResult(
                 success=False,
                 error=str(e),
+                error_kind=classify_render_exception(e).value,
                 prompt_used=request.prompt,
             )
         finally:
@@ -158,6 +180,30 @@ class VideoGenerationRouter:
                 self._active_generation_count = max(0, self._active_generation_count - 1)
                 if self._active_generation_count == 0:
                     self._schedule_idle_shutdown()
+
+    @staticmethod
+    def _render_session(request: VideoGenerationRequest):
+        """gpu_session for one clip, budgeted from the registry; a no-op context
+        when the policy module is unavailable so generation never depends on it."""
+        try:
+            from backend.services.gpu_resource_policy import gpu_session
+            from backend.services.job_types import JobKind
+            from backend.services.video_model_registry import vram_mb_for_model
+        except Exception:  # noqa: BLE001 — policy is optional at this seam
+            import contextlib
+            return contextlib.nullcontext()
+        op_id = f"router:{request.model}:{(request.metadata or {}).get('item_id') or id(request)}"
+        # The batch runner holds its session in its own thread and renders items
+        # from a pool, so this session never nests inside it; on a held gate it
+        # degrades to the register path (visible, no eviction) exactly as the
+        # batch path behaved before, instead of refusing the clip.
+        return gpu_session(
+            JobKind.VIDEO_RENDER, op_id,
+            on_busy="register",
+            evict_ollama=True,
+            free_comfyui=False,
+            vram_estimate_mb=vram_mb_for_model(request.model),
+        )
 
     @property
     def is_generating(self) -> bool:
@@ -189,17 +235,35 @@ class VideoGenerationRouter:
         return self._start_comfyui_direct(comfyui_dir)
 
     def _start_comfyui_via_plugin(self, start_script: Path) -> bool:
-        """Start ComfyUI using the plugin's start.sh script."""
+        """Start ComfyUI using the plugin's start.sh script.
+
+        The script provisions dependencies before it launches ComfyUI, so it
+        can legitimately run for minutes on a fresh install. It is never
+        killed on timeout: a killed launcher leaves half-installed pip state
+        in the shared venv. The budget only bounds how long this call waits.
+        """
         logger.info(f"Starting ComfyUI via plugin script: {start_script}")
+        budget_s = int(os.environ.get("GUAARDVARK_COMFYUI_START_TIMEOUT_S", "180"))
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 ["bash", str(start_script)],
-                capture_output=True, text=True, timeout=10,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True,
             )
-            if result.returncode != 0:
-                logger.error(f"Plugin start script failed (rc={result.returncode}): {result.stderr}")
+            deadline = time.time() + budget_s
+            while proc.poll() is None and time.time() < deadline:
+                time.sleep(1)
+            if proc.poll() is None:
+                logger.error(
+                    f"Plugin start script still running after {budget_s}s "
+                    "(dependency provisioning?); leaving it to finish, not starting a render"
+                )
                 return False
-            logger.info(f"Plugin start script output: {result.stdout.strip()}")
+            stdout, stderr = proc.communicate()
+            if proc.returncode != 0:
+                logger.error(f"Plugin start script failed (rc={proc.returncode}): {stderr.strip()}")
+                return False
+            logger.info(f"Plugin start script output: {stdout.strip()}")
 
             # Read PID from the file the script wrote
             if self._pid_file.exists():
@@ -277,12 +341,26 @@ class VideoGenerationRouter:
         logger.info(f"Starting ComfyUI directly at {comfyui_dir}...")
         try:
             log_file = open(str(log_path), "a")
+            # Mirror plugins/comfyui/scripts/start.sh: loopback bind and the
+            # memory flags the #13109 patch depends on.
+            listen = os.environ.get("GUAARDVARK_COMFYUI_LISTEN", "127.0.0.1")
+            from backend.services.comfyui_launch_flags import model_paths_launch, preview_cli_args
+            args = [
+                str(venv_python), str(main_py), "--listen", listen, "--port", "8188",
+                "--disable-smart-memory", "--cache-none", "--reserve-vram", "1.0",
+            ]
+            if os.environ.get("GUAARDVARK_COMFYUI_PINNED_MEMORY", "0") != "1":
+                args.append("--disable-pinned-memory")
+            args.extend(preview_cli_args())
+            paths_args, paths_env = model_paths_launch(GUAARDVARK_ROOT)
+            args.extend(paths_args)
             proc = subprocess.Popen(
-                [str(venv_python), str(main_py), "--listen", "--port", "8188"],
+                args,
                 cwd=str(comfyui_dir),
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                env={**os.environ, **paths_env},
             )
             self._comfyui_process = proc
 
@@ -378,10 +456,26 @@ class VideoGenerationRouter:
             self._idle_timer.cancel()
             self._idle_timer = None
 
+    def _comfyui_queue_busy(self) -> bool:
+        """True when ComfyUI reports running or pending prompts from any client."""
+        try:
+            import requests
+            data = requests.get(f"{COMFYUI_URL}/queue", timeout=5).json()
+            return bool(data.get("queue_running") or data.get("queue_pending"))
+        except Exception:
+            return False
+
     def _idle_shutdown(self):
-        """Called by timer — stop ComfyUI if still idle and no active generations."""
-        if self.is_generating:
-            logger.info("ComfyUI idle timeout fired but generation is active, rescheduling...")
+        """Called by timer — stop ComfyUI if still idle and no active generations.
+
+        Only a ComfyUI this router launched itself is eligible: the plugin
+        manager owns the lifecycle otherwise, and Celery, the stills pipeline
+        or a sibling install may be mid-render through the same server.
+        """
+        if self._comfyui_process is None:
+            return
+        if self.is_generating or self._comfyui_queue_busy():
+            logger.info("ComfyUI idle timeout fired but work is in flight, rescheduling...")
             self._schedule_idle_shutdown()
             return
         if self._check_comfyui():

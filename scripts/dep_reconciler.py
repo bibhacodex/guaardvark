@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
         log.error("sync in progress; refusing to reconcile (retry on next boot)")
         return 2
 
-    state_path = Path(args.state_file) if args.state_file else default_state_path()
+    state_path = Path(args.state_file) if args.state_file else default_state_path(repo)
     lock_path = state_path.with_suffix(".lock")
     log_path = repo / "logs" / "dep_reconciler.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,14 +135,51 @@ def _run(
     # succeeds clears it.
     fail_sentinel = repo / "logs" / ".dep_reconcile_failed"
 
-    def _clear_sentinel_if_covered() -> None:
-        # Only a run that actually covered backend_venv (the target preflight
-        # gates on) — or an unscoped run — proves the venv reconciles cleanly.
-        if not only or "backend_venv" in only:
-            try:
-                fail_sentinel.unlink(missing_ok=True)
-            except OSError:
-                pass
+    def _sentinel_failed_ids() -> set[str]:
+        """Reconciler ids named in the sentinel, or an empty set if unreadable."""
+        try:
+            body = fail_sentinel.read_text()
+        except OSError:
+            return set()
+        found = set()
+        for line in body.splitlines():
+            line = line.strip()
+            if not line.startswith("- ") or ":" not in line:
+                continue
+            # Each entry is "<id>: <message>". Split on the first ": " rather
+            # than the first ":" — isolated plugin ids carry a colon of their
+            # own ("isolated_plugin_venv:<plugin>"), and cutting at it left an
+            # id no run could ever cover.
+            head = line[2:]
+            rid = head.split(": ", 1)[0] if ": " in head else head.rstrip(":")
+            found.add(rid.strip())
+        return found
+
+    def _clear_sentinel_if_covered(covered: set[str] | None = None) -> None:
+        # The sentinel names the reconcilers that failed, and a run clears the
+        # ones it just proved good. A scoped run has to be able to clear a
+        # failure in its own scope: gating the clear on backend_venv alone left
+        # a plugin_bundle failure jamming preflight until some unrelated run
+        # happened to cover the venv.
+        if not fail_sentinel.exists():
+            return
+        recorded = _sentinel_failed_ids()
+        # Unparseable or pre-format sentinel: only a full run can vouch for it.
+        outstanding = (recorded - (covered or set())) if recorded else (set() if not only else {"?"})
+        try:
+            if outstanding:
+                if recorded:
+                    fail_sentinel.write_text(
+                        "dep_reconciler failed at "
+                        + datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        + "\n"
+                        + "".join(f"  - {rid}: (still unreconciled)\n" for rid in sorted(outstanding))
+                        + f"Full log: {log_path}\n"
+                    )
+                return
+            fail_sentinel.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # Trust-on-upgrade: state file is empty AND we detect a populated venv.
     # Write current hashes as initial state without re-installing.
@@ -167,7 +204,11 @@ def _run(
                 }
             save_state(state_path, state)
             log.info("trust-on-upgrade: snapshot saved; no installers run")
-            _clear_sentinel_if_covered()
+            snapshot_ids = {r.id for r in preliminary_reconcilers if getattr(r, "id", None)}
+            snapshot_ids |= {
+                m for r in preliminary_reconcilers for m in (getattr(r, "members", None) or [])
+            }
+            _clear_sentinel_if_covered(snapshot_ids)
             return 0
 
     reconcilers = build_active_reconcilers(repo)
@@ -266,7 +307,7 @@ def _run(
         except OSError:
             pass
         return 1
-    _clear_sentinel_if_covered()
+    _clear_sentinel_if_covered(active_ids | member_ids)
     return 0
 
 

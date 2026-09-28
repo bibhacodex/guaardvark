@@ -249,6 +249,7 @@ Format as a clear, organized list."""
 
                 # Use chat() instead of generate() — supports conversation history
                 # and works with natively multimodal models (Gemma 4, etc.)
+                from backend.utils.ollama_resource_manager import think_payload
                 response = client.chat(
                     model=vision_model,
                     messages=[{
@@ -256,6 +257,7 @@ Format as a clear, organized list."""
                         'content': analysis_prompt,
                         'images': [image_bytes],
                     }],
+                    **think_payload(vision_model),
                 )
 
                 # chat() returns response in message.content

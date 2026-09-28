@@ -44,6 +44,7 @@ import { getAvailableModels } from "../api/modelService";
 import GpuGateBanner from "../components/common/GpuGateBanner";
 import useJobsGate from "../hooks/useJobsGate";
 import { useUnifiedProgress } from "../contexts/UnifiedProgressContext";
+import LiveLatentPreview from "../components/videogen/LiveLatentPreview";
 import { formatUiError } from "../utils/uiError";
 
 const POLL_MS = 5000;
@@ -611,7 +612,7 @@ const stageLabel = (mv) => {
 
 const MusicVideoPage = () => {
   const { gpuBusy, gpuSubmitBlocked, blockReason } = useJobsGate({ submitMode: "queue" });
-  const { getProcessesByType, activeProcesses } = useUnifiedProgress();
+  const { getProcessesByType, activeProcesses, getPreviewUrl } = useUnifiedProgress();
   const [videos, setVideos] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [detail, setDetail] = useState(null);
@@ -689,6 +690,27 @@ const MusicVideoPage = () => {
   const comfyDisabled = !!(comfyInfo && (comfyInfo.status === 'disabled' || comfyInfo.status === 'error'));
   const comfyReady = !comfyDisabled; // allow click-to-start when pref is on (even if currently stopped)
 
+  const videoEditorInfo = useMemo(() => {
+    if (!pluginStatus) return null;
+    const arr = pluginStatus.plugins || [];
+    if (Array.isArray(arr) && arr.length) {
+      const found = arr.find((p) => p && p.id === "video_editor");
+      if (found) return found;
+    }
+    const st = pluginStatus.status || pluginStatus;
+    if (st && typeof st === "object" && !Array.isArray(st)) {
+      const val = st.video_editor ?? st["video_editor"];
+      if (val != null) {
+        const s = typeof val === "string" ? val : (val.status || "unknown");
+        return { id: "video_editor", status: s, running: s === "running" || !!val.running };
+      }
+    }
+    return null;
+  }, [pluginStatus]);
+  const videoEditorDisabled = !!(
+    videoEditorInfo && (videoEditorInfo.status === "disabled" || videoEditorInfo.status === "error")
+  );
+
   // Advanced render tuning (per video) — collapsed by default; defaults match the
   // backend _settings so leaving this untouched is a no-op.
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -706,7 +728,7 @@ const MusicVideoPage = () => {
   // When false, more options for beautiful output (better keyframe models + top-tier I2V like Wan2.2).
   const [useLoraConsistency, setUseLoraConsistency] = useState(false);
   const [keyframeModel, setKeyframeModel] = useState(DEFAULT_KEYFRAME_MODEL);
-  const [i2vModel, setI2vModel] = useState("wan22-14b-i2v");
+  const [i2vModel, setI2vModel] = useState("wan22-5b");
 
   const keyframeModelOptions = useMemo(
     () =>
@@ -750,17 +772,58 @@ const MusicVideoPage = () => {
     return () => { alive = false; };
   }, []);
 
-  // I2V-capable models (subset from VideoGeneratorPage MODEL_OPTIONS for consistency)
-  const I2V_MODEL_OPTIONS = {
+  // I2V-capable models. The registry decides which models animate a keyframe
+  // (capabilities.supports_i2v); this static list only stands in until the
+  // API answers or when it is down.
+  const FALLBACK_I2V_MODEL_OPTIONS = {
+    "wan22-5b": {
+      label: "Wan 2.2 5B TI2V — default",
+      description: "Text + image to video, ~5s, fits 16GB",
+    },
     "wan22-14b-i2v": {
-      label: "Wan 2.2 14B I2V (GGUF Q5) — Recommended",
-      description: "Excellent cinematic motion, ~5s clips, good VRAM efficiency",
+      label: "Wan 2.2 14B I2V (GGUF Q5)",
+      description: "Cinematic motion, ~5s clips",
     },
     "cogvideox-5b-i2v": {
       label: "CogVideoX 5B I2V",
       description: "Solid alternative I2V (~6s)",
     },
+    "hunyuan-i2v": {
+      label: "HunyuanVideo 13B I2V (GGUF Q5)",
+      description: "Follows the keyframe closely, 24fps, ~3s clips",
+    },
   };
+  const [i2vModelOptions, setI2vModelOptions] = useState(FALLBACK_I2V_MODEL_OPTIONS);
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/batch-video/models")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!alive) return;
+        const payload = data?.data || data || {};
+        const rows = (payload.models || []).filter((m) => m.capabilities?.supports_i2v);
+        if (!rows.length) return;
+        const opts = {};
+        rows.forEach((m) => {
+          const caps = m.capabilities;
+          const seconds = caps.max_frames && caps.native_fps ? Math.round(caps.max_frames / caps.native_fps) : null;
+          opts[m.id] = {
+            label: `${m.name}${m.is_ready ? "" : " (not installed)"}`,
+            description: [
+              caps.audio_out ? "renders each cut in one pass with the song slice as its beat anchor" : "keyframe → silent clip",
+              seconds ? `up to ~${seconds}s per clip` : null,
+              m.license?.attribution || null,
+            ].filter(Boolean).join(" · "),
+            ready: !!m.is_ready,
+          };
+        });
+        setI2vModelOptions(opts);
+        const active = payload.active_i2v;
+        if (active && opts[active]) setI2vModel(active);
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
 
   const refreshList = useCallback(async () => {
     try {
@@ -855,7 +918,7 @@ const MusicVideoPage = () => {
       setUseLoraConsistency(false);
       setSelectedSubjectIds([]);
       setKeyframeModel(DEFAULT_KEYFRAME_MODEL);
-      setI2vModel("wan22-14b-i2v");
+      setI2vModel("wan22-5b");
       // Reset any future advanced model params here too
       if (fileInputRef.current) fileInputRef.current.value = "";
       await refreshList();
@@ -991,6 +1054,11 @@ const MusicVideoPage = () => {
         <Stack spacing={2} sx={{ flex: "1 1 360px", minWidth: 320 }}>
           <Paper variant="outlined" sx={{ p: 2 }}>
             <Typography variant="subtitle1" sx={{ mb: 1.5 }}>New music video</Typography>
+            {videoEditorDisabled && (
+              <Typography variant="caption" color="warning.main" sx={{ display: "block", mb: 1 }}>
+                Enable Video Editor in Plugins to assemble the final cut. Analysis and clip generation can still run.
+              </Typography>
+            )}
             <Stack spacing={1.5}>
               <TextField
                 label="Name" size="small" fullWidth value={name}
@@ -1162,12 +1230,17 @@ const MusicVideoPage = () => {
                     label="I2V / Animation Model"
                     value={i2vModel}
                     onChange={(e) => setI2vModel(e.target.value)}
-                    helperText="Wan 2.2 I2V generally produces superior motion/quality (may use more time/VRAM — your choice)"
+                    helperText="Default follows the active video model. Pick any installed I2V family your card can hold."
                     sx={{ mt: 1 }}
                   >
-                    {Object.entries(I2V_MODEL_OPTIONS).map(([key, cfg]) => (
-                      <MenuItem key={key} value={key}>
-                        {cfg.label}
+                    {Object.entries(i2vModelOptions).map(([key, cfg]) => (
+                      <MenuItem key={key} value={key} disabled={cfg.ready === false}>
+                        <Box>
+                          <Typography variant="body2">{cfg.label}</Typography>
+                          {cfg.description && (
+                            <Typography variant="caption" color="text.secondary">{cfg.description}</Typography>
+                          )}
+                        </Box>
                       </MenuItem>
                     ))}
                   </TextField>
@@ -1492,6 +1565,7 @@ const MusicVideoPage = () => {
                   />
                   {activeClipStep && (
                     <Box>
+                      <LiveLatentPreview src={getPreviewUrl(activeClipStep.job_id)} />
                       <LinearProgress
                         variant={activeClipStep.progress != null ? "determinate" : "indeterminate"}
                         value={activeClipStep.progress || 0}

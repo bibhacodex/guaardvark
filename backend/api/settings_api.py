@@ -11,7 +11,7 @@ except Exception:  # pragma: no cover - optional dependency
 from backend.models import Setting, SystemSetting, db
 from backend.utils.response_utils import error_response, success_response
 from backend.utils.password_validation import validate_password_strength
-from backend.utils.settings_utils import get_web_access
+from backend.utils.settings_utils import get_web_access, redact_exception
 
 settings_bp = Blueprint("settings_api", __name__, url_prefix="/api/settings")
 
@@ -73,15 +73,85 @@ def set_web_access():
     return success_response({"allow_web_search": allow})
 
 
+@settings_bp.route("/address_provider", methods=["GET"])
+def get_address_provider():
+    """Address-suggestion provider status. The key itself is never returned."""
+    from backend.services import address_lookup
+
+    return success_response(
+        {
+            "provider": address_lookup.provider_name(),
+            "has_key": bool(address_lookup.api_key()),
+            "available": address_lookup.is_configured(),
+            "unavailable_reason": address_lookup.unavailable_reason(),
+            "attribution": address_lookup.ATTRIBUTION,
+        }
+    )
+
+
+@settings_bp.route("/address_provider", methods=["POST"])
+def set_address_provider():
+    """Store the provider name and/or key. An empty key clears it.
+
+    Address fields keep working from on-file addresses either way; this only
+    controls the optional third-party source.
+    """
+    from backend.services import address_lookup
+
+    if not request.is_json:
+        return error_response("Request must be JSON")
+    data = request.get_json() or {}
+    updates = {}
+    if "provider" in data:
+        updates[address_lookup.PROVIDER_SETTING] = (
+            str(data.get("provider") or "").strip().lower()
+            or address_lookup.DEFAULT_PROVIDER
+        )
+    if "api_key" in data:
+        updates[address_lookup.API_KEY_SETTING] = str(data.get("api_key") or "").strip()
+    if not updates:
+        return error_response("Nothing to update")
+    try:
+        for key, value in updates.items():
+            setting = db.session.get(Setting, key)
+            if setting:
+                setting.value = value
+            else:
+                db.session.add(Setting(key=key, value=value))
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(
+            "Failed to update address provider setting: %s",
+            redact_exception(e, *updates),
+        )
+        return error_response("Failed to update setting", status_code=500)
+    return success_response(
+        {
+            "provider": address_lookup.provider_name(),
+            "has_key": bool(address_lookup.api_key()),
+            "available": address_lookup.is_configured(),
+            "unavailable_reason": address_lookup.unavailable_reason(),
+        }
+    )
+
+
 @settings_bp.route("/verbatim_prompts", methods=["GET"])
 def get_verbatim_prompts():
-    """Whether image/video prompts go to the model verbatim (director-LLM rewrite OFF)."""
+    """Whether image/video prompts go to the model verbatim (director-LLM rewrite OFF).
+
+    ``enabled`` is the effective value the generators use. ``stored`` is the
+    toggle's own value; ``forced_by_env`` says VERBATIM_PROMPTS overrides it.
+    """
+    from backend.services.media_director import verbatim_prompts_env_forced
+
     try:
         row = db.session.get(SystemSetting, "verbatim_prompts")
-        enabled = bool(row and str(row.value).lower() == "true")
+        stored = bool(row and str(row.value).lower() == "true")
     except Exception:
-        enabled = False
-    return success_response({"enabled": enabled})
+        stored = False
+    forced = verbatim_prompts_env_forced()
+    return success_response({"enabled": stored or forced, "stored": stored, "forced_by_env": forced})
 
 
 @settings_bp.route("/chat_image_model", methods=["GET"])
@@ -106,6 +176,65 @@ def set_chat_image_model_route():
         current_app.logger.error(f"Failed to update chat_image_model setting: {e}")
         return error_response("Failed to update setting", status_code=500)
     return success_response({"model": model})
+
+
+@settings_bp.route("/active_video_model", methods=["GET"])
+def get_active_video_model_route():
+    """Persisted video-model default plus the resolved t2v/i2v/scene ids."""
+    from backend.utils.settings_utils import get_active_video_model, get_active_video_model_overrides
+    from backend.services.video_model_registry import resolve_active_video_model
+
+    overrides = get_active_video_model_overrides()
+    resolved = {}
+    for role in ("t2v", "i2v", "scene"):
+        mid, err = resolve_active_video_model(role)
+        resolved[role] = {"model": mid, "error": err}
+    return success_response({
+        "model": get_active_video_model(),
+        "i2v": overrides["i2v"],
+        "music_video": overrides["music_video"],
+        "film_crew": overrides["film_crew"],
+        "resolved": resolved,
+    })
+
+
+@settings_bp.route("/active_video_model", methods=["POST"])
+def set_active_video_model_route():
+    """Set the global video model and optional per-pipeline overrides.
+
+    Empty string clears a field (inherit / hardware fallback). An id that is
+    unknown or not installed is refused.
+    """
+    if not request.is_json:
+        return error_response("Request must be JSON")
+    data = request.get_json() or {}
+    from backend.utils.settings_utils import save_setting
+    from backend.services.video_model_registry import preflight_video_model, VIDEO_MODEL_REGISTRY
+
+    mapping = {
+        "model": "active_video_model",
+        "i2v": "active_video_model_i2v",
+        "music_video": "active_video_model_music_video",
+        "film_crew": "active_video_model_film_crew",
+    }
+    saved = {}
+    for field, key in mapping.items():
+        if field not in data:
+            continue
+        value = (data.get(field) or "").strip()
+        if value:
+            if value not in VIDEO_MODEL_REGISTRY:
+                return error_response(f"Unknown video model '{value}'", 400)
+            ready, err = preflight_video_model(value)
+            if not ready:
+                return error_response(err or f"{value} is not installed", 400)
+        try:
+            save_setting(key, value)
+        except Exception as e:
+            current_app.logger.error(f"Failed to update {key}: {e}")
+            return error_response("Failed to update setting", status_code=500)
+        saved[field] = value
+    return success_response(saved)
 
 
 @settings_bp.route("/media_models", methods=["GET"])
@@ -178,7 +307,10 @@ def set_verbatim_prompts():
         db.session.rollback()
         current_app.logger.error(f"Failed to update verbatim_prompts setting: {e}")
         return error_response("Failed to update setting", status_code=500)
-    return success_response({"enabled": enabled})
+    from backend.services.media_director import verbatim_prompts_env_forced
+
+    forced = verbatim_prompts_env_forced()
+    return success_response({"enabled": enabled or forced, "stored": enabled, "forced_by_env": forced})
 
 
 @settings_bp.route("/advanced_debug", methods=["GET"])
@@ -217,6 +349,23 @@ def set_advanced_debug():
         )
         return error_response("Failed to update setting", status_code=500)
     return success_response({"advanced_debug": enabled})
+
+
+@settings_bp.route("/confine_tool_paths", methods=["GET"])
+def get_confine_tool_paths_route():
+    from backend.utils.settings_utils import get_confine_tool_paths
+
+    return success_response({"confine_tool_paths": get_confine_tool_paths()})
+
+
+@settings_bp.route("/confine_tool_paths", methods=["POST"])
+def set_confine_tool_paths_route():
+    if not request.is_json:
+        return error_response("Request must be JSON")
+    from backend.utils.settings_utils import get_confine_tool_paths, set_confine_tool_paths
+
+    set_confine_tool_paths(bool(request.get_json().get("confine_tool_paths")))
+    return success_response({"confine_tool_paths": get_confine_tool_paths()})
 
 
 @settings_bp.route("/llm_debug", methods=["GET"])
@@ -389,7 +538,98 @@ def get_branding():
     # Default to profile-default.png if no logo set
     if not logo:
         logo = "system/profile-default.png"
-    return success_response({"system_name": name, "logo_path": logo})
+    # The active profile rides on this response: it is the only config fetch
+    # the frontend makes at startup. DB branding wins over the profile's brand.
+    from backend import profiles as P
+    profile = P.active_profile()
+    if not name and profile.brand.get("app_name"):
+        name = profile.brand["app_name"]
+    return success_response({
+        "system_name": name,
+        "logo_path": logo,
+        "profile": profile.public_dict(),
+        "profile_first_run": not P.profile_chosen(),
+    })
+
+
+@settings_bp.route("/profile", methods=["GET"])
+def get_profile():
+    """The running profile, the one .env names for the next start, and the choices."""
+    from backend import profiles as P
+    active = P.active_profile()
+    available = []
+    for name, (source, path) in P.available_profiles().items():
+        try:
+            loaded = P.load_profile(name)
+            available.append({"name": name, "label": loaded.label, "description": loaded.description, "source": source})
+        except Exception:  # pragma: no cover - load_profile never raises
+            available.append({"name": name, "label": name, "description": "", "source": source})
+    from backend import extensions as X
+    return success_response({
+        "active": active.public_dict(),
+        "configured": P.configured_name() or P.DEFAULT_PROFILE,
+        "available": available,
+        "env_writable": P.env_file_writable(),
+        "extensions": X.load_report(),
+    })
+
+
+@settings_bp.route("/profile", methods=["POST"])
+def set_profile():
+    """Persist a profile choice to .env. Applies on the next start: feature
+    flags are read once at boot, so a live switch would half-apply."""
+    from backend import profiles as P
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name") or "").strip()
+    try:
+        P.set_configured_name(name)
+        P.mark_profile_chosen()
+    except ValueError as e:
+        return error_response(str(e), 400)
+    except OSError as e:
+        return error_response(f"could not write .env: {e}", 500)
+    # Applying the running profile again changes nothing; only a different one needs a restart.
+    return success_response({"name": name, "restart_required": name != P.active_profile().name})
+
+
+OLLAMA_KEEP_ENV = "GUAARDVARK_OLLAMA_KEEP_RUNNING"
+OLLAMA_EXTERNAL_ENV = "GUAARDVARK_OLLAMA_EXTERNAL"
+
+
+def _env_flag(value) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+@settings_bp.route("/ollama_lifecycle", methods=["GET"])
+def get_ollama_lifecycle():
+    """How stop.sh and start.sh treat Ollama, as recorded in .env."""
+    from backend import profiles as P
+    return success_response({
+        "keep_running": _env_flag(P.read_env_value(OLLAMA_KEEP_ENV)),
+        "external": _env_flag(P.read_env_value(OLLAMA_EXTERNAL_ENV)),
+        "env_writable": P.env_file_writable(),
+    })
+
+
+@settings_bp.route("/ollama_lifecycle", methods=["POST"])
+def set_ollama_lifecycle():
+    """Persist the Ollama policy to .env. stop.sh reads it on every stop, start.sh on
+    every start, so no restart is needed."""
+    from backend import profiles as P
+    payload = request.get_json(silent=True) or {}
+    try:
+        if "keep_running" in payload:
+            P.set_env_value(OLLAMA_KEEP_ENV, "1" if _env_flag(payload["keep_running"]) else None)
+        if "external" in payload:
+            P.set_env_value(OLLAMA_EXTERNAL_ENV, "1" if _env_flag(payload["external"]) else None)
+    except ValueError as e:
+        return error_response(str(e), 400)
+    except OSError as e:
+        return error_response(f"could not write .env: {e}", 500)
+    return success_response({
+        "keep_running": _env_flag(P.read_env_value(OLLAMA_KEEP_ENV)),
+        "external": _env_flag(P.read_env_value(OLLAMA_EXTERNAL_ENV)),
+    })
 
 
 @settings_bp.route("/branding", methods=["POST"])
@@ -445,53 +685,15 @@ def set_branding():
     return success_response({"system_name": name, "logo_path": logo_rel})
 
 
-@settings_bp.route("/rag_debug", methods=["GET"])
-def get_rag_debug():
-    enabled = False
-    try:
-        setting = db.session.get(Setting, "rag_debug_enabled")
-        if setting and setting.value == "true":
-            enabled = True
-    except Exception as e:
-        current_app.logger.error(f"Failed to read RAG debug setting: {e}")
-    return success_response({"rag_debug_enabled": enabled})
-
-
-@settings_bp.route("/rag_debug", methods=["POST"])
-def set_rag_debug():
-    if not request.is_json:
-        return error_response("Request must be JSON")
-    data = request.get_json()
-    enabled = bool(data.get("rag_debug_enabled"))
-    try:
-        setting = db.session.get(Setting, "rag_debug_enabled")
-        if setting:
-            setting.value = "true" if enabled else "false"
-        else:
-            setting = Setting(
-                key="rag_debug_enabled", value="true" if enabled else "false"
-            )
-            db.session.add(setting)
-        db.session.commit()
-    except Exception as e:
-        db.session.rollback()
-        current_app.logger.error(
-            f"Failed to update RAG debug setting: {e}", exc_info=True
-        )
-        return error_response("Failed to update setting", status_code=500)
-    return success_response({"rag_debug_enabled": enabled})
-
-
 @settings_bp.route("/rag-features", methods=["GET"])
 def get_rag_features():
     """Get all RAG-related feature settings"""
     try:
-        from backend.config import ENHANCED_CONTEXT_ENABLED, ADVANCED_RAG_ENABLED, RAG_DEBUG_ENABLED
+        from backend.config import ENHANCED_CONTEXT_ENABLED, ADVANCED_RAG_ENABLED
         
         # Get database settings (runtime overrides)
         enhanced_context = ENHANCED_CONTEXT_ENABLED
-        advanced_rag = ADVANCED_RAG_ENABLED  
-        rag_debug = RAG_DEBUG_ENABLED
+        advanced_rag = ADVANCED_RAG_ENABLED
         
         # Check for database overrides
         try:
@@ -503,17 +705,12 @@ def get_rag_features():
             if rag_setting:
                 advanced_rag = rag_setting.value == "true"
                 
-            debug_setting = db.session.get(Setting, "rag_debug_enabled")
-            if debug_setting:
-                rag_debug = debug_setting.value == "true"
-                
         except Exception as db_error:
             current_app.logger.warning(f"Failed to read RAG settings from database: {db_error}")
         
         return success_response({
             "enhanced_context": enhanced_context,
             "advanced_rag": advanced_rag,
-            "rag_debug": rag_debug
         })
         
     except Exception as e:
@@ -533,8 +730,7 @@ def update_rag_features():
         # Update settings that are provided
         settings_to_update = {
             "enhanced_context_enabled": data.get("enhanced_context"),
-            "advanced_rag_enabled": data.get("advanced_rag"), 
-            "rag_debug_enabled": data.get("rag_debug")
+            "advanced_rag_enabled": data.get("advanced_rag"),
         }
         
         updated_settings = {}
@@ -557,8 +753,6 @@ def update_rag_features():
                     updated_settings["enhanced_context"] = bool_value
                 elif key == "advanced_rag_enabled":
                     updated_settings["advanced_rag"] = bool_value
-                elif key == "rag_debug_enabled":
-                    updated_settings["rag_debug"] = bool_value
         
         db.session.commit()
         
@@ -729,3 +923,96 @@ def set_music_directory():
         db.session.rollback()
         current_app.logger.error(f"Failed to update music_directory setting: {e}")
         return error_response(f"Failed to update setting: {e}", status_code=500)
+
+
+@settings_bp.route("/index_profiles", methods=["GET"])
+def get_index_profiles():
+    """List index profiles, their activation state, and each projection's real size."""
+    try:
+        from backend.services.index_profiles import load_profiles
+        profiles = load_profiles()
+    except Exception as e:
+        current_app.logger.error(f"Failed to load index profiles: {e}")
+        return error_response("Failed to load index profiles", status_code=500)
+
+    out = []
+    for p in profiles:
+        entry = p.to_dict()
+        # Report what the projection actually holds rather than whether it is
+        # configured: a profile can be active and still have nothing indexed.
+        try:
+            from backend.services.indexing_service import vector_store_stats
+            entry["projection"] = vector_store_stats(profile=p.name)
+        except Exception as e:
+            entry["projection"] = {"error": str(e)[:160]}
+        out.append(entry)
+    return success_response({"profiles": out})
+
+
+@settings_bp.route("/index_profiles", methods=["POST"])
+def set_index_profiles():
+    """Activate a set of profiles, and optionally update one profile's settings.
+
+    Body: {"active": ["default", "mcp"]} and/or {"profile": {...}}
+    """
+    if not request.is_json:
+        return error_response("Request must be JSON")
+    data = request.get_json() or {}
+
+    try:
+        from backend.services.index_profiles import (
+            IndexProfile, load_profiles, save_profiles, set_active,
+        )
+
+        if isinstance(data.get("profile"), dict):
+            incoming = IndexProfile.from_dict(data["profile"])
+            if not incoming.name:
+                return error_response("profile.name is required")
+            profiles = load_profiles()
+            for i, existing in enumerate(profiles):
+                if existing.name == incoming.name:
+                    # Activation is owned by the "active" field below, so an edit
+                    # cannot silently switch a projection on.
+                    incoming.active = existing.active
+                    incoming.embed_dim = existing.embed_dim
+                    profiles[i] = incoming
+                    break
+            else:
+                profiles.append(incoming)
+            save_profiles(profiles)
+
+        if isinstance(data.get("active"), list):
+            set_active([str(n) for n in data["active"]])
+
+        from backend.services.index_profiles import load_profiles as reload_profiles
+        return success_response({"profiles": [p.to_dict() for p in reload_profiles()]})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Failed to update index profiles: {e}", exc_info=True)
+        return error_response(f"Failed to update index profiles: {e}", status_code=500)
+
+
+@settings_bp.route("/index_profiles/<name>/rebuild", methods=["POST"])
+def rebuild_index_profile(name):
+    """Drop a profile's projection so it can be rebuilt from the Document registry.
+
+    Deletion happens at the projection, never at the registry: the registry is the
+    source of truth and dropping a derived table must not remove a document.
+    """
+    try:
+        from backend.services.index_profiles import get_profile
+        if get_profile(name) is None:
+            return error_response(f"Unknown profile '{name}'", status_code=404)
+        from backend.services.indexing_service import drop_vector_store
+        result = drop_vector_store(profile=name)
+        if result.get("error"):
+            return error_response(f"Could not drop projection: {result['error']}", status_code=500)
+        return success_response({
+            "profile": name,
+            "dropped": result.get("dropped", False),
+            "table": result.get("table"),
+            "note": "Projection cleared. Re-index documents to rebuild it.",
+        })
+    except Exception as e:
+        current_app.logger.error(f"Failed to rebuild profile {name}: {e}", exc_info=True)
+        return error_response(f"Failed to rebuild profile: {e}", status_code=500)

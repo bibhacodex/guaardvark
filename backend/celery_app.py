@@ -80,6 +80,7 @@ def create_celery_app():
             'backend.tasks.task_scheduler_celery.check_scheduled_tasks': {'queue': 'default'},
             'backend.tasks.task_scheduler_celery.recover_stuck_tasks': {'queue': 'default'},
             'backend.tasks.task_scheduler_celery.scheduler_health_check': {'queue': 'health'},
+            'indexing.resume_pending_tick': {'queue': 'indexing'},
             'training.finetune_model': {'queue': 'training_gpu'},
             'training.export_gguf': {'queue': 'training_gpu'},
             'training.parse_transcripts': {'queue': 'training'},
@@ -126,6 +127,17 @@ def create_celery_app():
                 'task': 'maintenance.daily_backup',
                 'schedule': 86400.0,  # 24 hours
                 'options': {'queue': 'default'},
+            },
+            # Documents left PENDING by an interrupted run — a reboot, a killed
+            # worker — would otherwise sit there indefinitely, because indexing
+            # progress is durable but nothing restarted it. Deliberately slow and
+            # small: the task yields to the Pause Indexing toggle and to GPU
+            # pressure, so it catches up during quiet periods instead of competing
+            # with generation work.
+            'resume-pending-indexing': {
+                'task': 'indexing.resume_pending_tick',
+                'schedule': float(os.environ.get("GUAARDVARK_INDEX_RESUME_INTERVAL_S", 900)),
+                'options': {'queue': 'indexing'},
             },
             'google-indexing-drip': {
                 'task': 'google_indexing.drip_tick',
@@ -276,6 +288,22 @@ def create_celery_app():
 
     celery_app.Task = ContextTask
 
+    # A task that raises must not leave its progress entry parked at 0 %: mark it
+    # errored with the exception text so the UI shows a failure, not a stall.
+    try:
+        from celery.signals import task_failure
+
+        @task_failure.connect
+        def _surface_task_failure(sender=None, task_id=None, exception=None, kwargs=None, **_ignored):
+            try:
+                from backend.utils.progress_failure import mark_progress_failed
+
+                mark_progress_failed(task_id, exception, kwargs)
+            except Exception:  # noqa: BLE001 - never fail a failing task twice
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
     # Flush the runtime-liveness buffer when a worker child recycles
     # (max_tasks_per_child=50) or the worker shuts down, so a recycling child
     # doesn't drop its buffered hits. Solo/concurrency=1 means count-based
@@ -385,6 +413,17 @@ def create_celery_app():
     except ImportError as e:
         logger.warning(f"Could not import social outreach tasks: {e}")
 
+    # Beat entries a Settings toggle governs are held back by the scheduler
+    # while the toggle is off (backend/celery_beat_gates.py); declared here,
+    # next to the entries, so a new loop cannot be added without deciding.
+    from backend.celery_beat_gates import gate_beat_entries
+    gate_beat_entries(celery_app, {
+        'social-outreach-reddit-tick': 'social_outreach',
+        'social-outreach-self-share-tick': 'social_outreach',
+        'social-outreach-process-approved': 'social_outreach',
+        'social-outreach-reap-stuck-processing': 'social_outreach',
+    })
+
     try:
         from backend.tasks.memory_maintenance_tasks import cleanup_old_session_memory  # noqa: F401
         logger.info("Memory maintenance tasks imported successfully")
@@ -444,6 +483,22 @@ def create_celery_app():
         logger.warning(f"Could not import cluster heartbeat sweeper: {e}")
 
     try:
+        from backend.tasks import interconnector_client_heartbeat  # noqa: F401 - registers task
+        # Scheduled on EVERY node; the task early-returns cheaply unless this node
+        # is a configured, enabled client with a master URL. Makes a worker's
+        # liveness independent of whether a browser tab is open.
+        celery_app.conf.beat_schedule['interconnector-client-heartbeat'] = {
+            'task': 'interconnector.client_heartbeat',
+            'schedule': float(os.environ.get("INTERCONNECTOR_HEARTBEAT_INTERVAL_S", 60)),
+            'options': {'queue': 'health'},
+        }
+        # Beat holds it back unless this node is an enabled client with a master.
+        gate_beat_entries(celery_app, {'interconnector-client-heartbeat': 'interconnector_client'})
+        logger.info("Interconnector client-heartbeat task registered and scheduled")
+    except ImportError as e:
+        logger.warning(f"Could not import interconnector client heartbeat: {e}")
+
+    try:
         from backend.tasks.plugin_tasks import reconcile_plugin_deps  # noqa: F401
         logger.info("Plugin dependency reconciler task imported successfully")
     except ImportError as e:
@@ -479,6 +534,29 @@ def create_celery_app():
         logger.info("Google Indexing tasks imported successfully")
     except ImportError as e:
         logger.warning(f"Could not import Google Indexing tasks: {e}")
+
+    try:
+        from backend.tasks.index_resume_tasks import (  # noqa: F401
+            resume_pending_tick,
+        )
+        logger.info("Index auto-resume task imported successfully")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Index auto-resume task not available: %s", e)
+
+    try:
+        from backend.tasks.raptor_tasks import build_raptor_tree_task  # noqa: F401
+        logger.info("RAPTOR build task registered (on demand only, never scheduled)")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("RAPTOR build task not available: %s", e)
+
+    # Extensions: tasks/*.py register at import; beat entries come from
+    # extension.json. See backend/extensions.
+    try:
+        from backend import extensions as _ext
+        for _ext_id, _mods in _ext.register_tasks(_ext.discover(), celery_app).items():
+            logger.info("extension %s: %d task module(s) registered", _ext_id, len(_mods))
+    except Exception as e:  # noqa: BLE001
+        logger.error("Extension task registration failed: %s", e, exc_info=True)
 
     logger.info("Celery app configured with enhanced performance settings and Beat schedule")
     return celery_app

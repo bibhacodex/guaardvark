@@ -35,6 +35,27 @@ def _fresh_gpu_gate(monkeypatch):
     # test_gpu_resource_policy instead.
     import backend.services.gpu_resource_policy as grp
     monkeypatch.setattr(grp, "reclaim_gpu", lambda **kw: None)
+    # With eviction neutralised, the fit check must not read the real card either:
+    # it probes get_available_vram(), so whatever happens to be resident on the
+    # developer's GPU (a chat model, a warm ComfyUI) decided these tests. Answer
+    # with an idle 16GB card; the probe itself is covered by test_gpu_resource_policy.
+    monkeypatch.setattr(
+        grp, "fit_verdict",
+        lambda estimate_mb, *, reserve_mb=0, margin_mb=1024: grp.Fit(
+            ok=True, capacity=False, free_mb=16000, total_mb=16000,
+            need_mb=int(estimate_mb) + int(margin_mb), headroom=True,
+        ),
+    )
+    monkeypatch.setattr(grp, "_load_admit_or_busy", lambda *a, **k: None)
+    monkeypatch.setattr(grp, "_acquire_cross_process_lease", lambda *a, **k: False)
+    monkeypatch.setattr(
+        "backend.services.video_model_registry.resolve_active_video_model",
+        lambda role, explicit=None, surface=None: (explicit or "wan22-5b", None),
+    )
+    monkeypatch.setattr(
+        "backend.services.video_model_registry.preflight_video_model",
+        lambda m: (True, ""),
+    )
     return fresh
 
 
@@ -183,7 +204,27 @@ def test_run_screenwriter_idempotent_when_stage_mismatch(app, production):
     assert SwarmMessage.query.count() == 0
 
 
-def test_run_cinematographer_updates_shots_with_camera_and_image_prompt(app, production):
+def _director_plans(monkeypatch, subject_ids, *, camera="wide", framing="full body",
+                    duration=4.5, mood="calm", prompt="A cafe in the morning"):
+    """run_cinematographer is director-first: it calls director_service.plan
+    (SCRIPT_SCENES) and only falls back to the injected llm when that fails. Patch
+    the seam it really calls, with the fields the mapping reads (camera, framing,
+    duration, mood, prompt, subjects), so the test exercises the production path
+    instead of whatever model happens to be running on the developer's box."""
+    from backend.services import director_service as ds
+
+    def fake_plan(brief):
+        n = len(brief.scenes[0]["shots"]) if brief.scenes else 0
+        return ds.DirectorResult(treatment=None, shots=[
+            ds.ShotPrompt(prompt=prompt, index=i, camera=camera, framing=framing,
+                          duration=duration, mood=mood, subjects=list(subject_ids))
+            for i in range(n)
+        ])
+
+    monkeypatch.setattr(ds, "plan", fake_plan)
+
+
+def test_run_cinematographer_updates_shots_with_camera_and_image_prompt(app, production, monkeypatch):
     production.current_stage = "cinematography"
     subj = Subject(name="Alice", kind="character", description="A test character")
     db.session.add(subj)
@@ -191,6 +232,7 @@ def test_run_cinematographer_updates_shots_with_camera_and_image_prompt(app, pro
     shot = ProductionShot(production_id=production.id, scene_number=1, shot_number=1, description="Wide shot")
     db.session.add(shot)
     db.session.commit()
+    _director_plans(monkeypatch, [subj.id])
 
     def fake_llm(*args, **kwargs):
         return json.dumps({
@@ -223,8 +265,39 @@ def test_run_cinematographer_updates_shots_with_camera_and_image_prompt(app, pro
     assert production.current_stage == "storyboard_gen"
 
 
+def test_run_cinematographer_falls_back_to_agent_llm_when_director_fails(app, production, monkeypatch):
+    """When director_service.plan raises, the swarm Cinematographer (injected llm) plans."""
+    from backend.services import director_service as ds
+    production.current_stage = "cinematography"
+    subj = Subject(name="Alice", kind="character", description="A test character")
+    db.session.add(subj)
+    db.session.commit()
+    shot = ProductionShot(production_id=production.id, scene_number=1, shot_number=1, description="Wide shot")
+    db.session.add(shot)
+    db.session.commit()
+
+    def boom(brief):
+        raise RuntimeError("director down")
+    monkeypatch.setattr(ds, "plan", boom)
+
+    def fake_llm(*args, **kwargs):
+        return json.dumps({"plans": [{
+            "scene_number": 1, "shot_number": 1, "camera_angle": "low angle",
+            "framing": "close up", "duration_seconds": 3.0, "mood": "tense",
+            "image_prompt": "Rain on a window", "subjects_in_shot": [subj.id],
+        }]})
+
+    with patch("backend.celery_app.celery.send_task"):
+        run_cinematographer(production.id, llm=fake_llm)
+
+    db.session.refresh(shot)
+    assert shot.camera_angle == "low angle"
+    assert shot.duration_seconds == 3.0
+    assert "IMAGE PROMPT: Rain on a window" in shot.description
+
+
 @patch("backend.tasks.production_swarm_tasks.current_app")
-def test_run_cinematographer_dispatches_storyboard_artist_next(mock_current_app, app, production):
+def test_run_cinematographer_dispatches_storyboard_artist_next(mock_current_app, app, production, monkeypatch):
     production.current_stage = "cinematography"
     shot = ProductionShot(production_id=production.id, scene_number=1, shot_number=1, description="Wide shot")
     db.session.add(shot)
@@ -234,12 +307,13 @@ def test_run_cinematographer_dispatches_storyboard_artist_next(mock_current_app,
         return json.dumps({"plans": []})
 
     # We need to patch celery.send_task. Since we don't have it directly, we can patch the import or current_app.extensions['celery']
+    _director_plans(monkeypatch, [])
     with patch("backend.celery_app.celery.send_task") as mock_send_task:
         run_cinematographer(production.id, llm=fake_llm)
         mock_send_task.assert_called_once_with("production.run_storyboard_artist", args=[production.id])
 
 
-def test_run_cinematographer_drops_hallucinated_subject_ids(app, production):
+def test_run_cinematographer_drops_hallucinated_subject_ids(app, production, monkeypatch):
     """The LLM occasionally invents subject_ids that aren't in the set we passed.
     We must filter those out before insert — otherwise the FK constraint blows
     up the whole transaction and the production gets stuck."""
@@ -249,6 +323,8 @@ def test_run_cinematographer_drops_hallucinated_subject_ids(app, production):
     real_id = real.id
     shot = ProductionShot(production_id=production.id, scene_number=1, shot_number=1, description="Wide")
     db.session.add(shot); db.session.commit()
+    # The director (primary path) is the one that can hallucinate ids; feed them through it.
+    _director_plans(monkeypatch, [real_id, 99999, -1], prompt="x", duration=3.0)
 
     def fake_llm(*args, **kwargs):
         return json.dumps({
@@ -275,14 +351,21 @@ def test_run_storyboard_artist_advances_to_awaiting_approval(app, production):
     db.session.add(shot)
     db.session.commit()
 
-    # image_generator=None → run_storyboard_artist builds a default
-    # ComfyUIImageGenerator. Patch it so the unit test doesn't need ComfyUI.
-    with patch("backend.services.comfyui_image_generator.ComfyUIImageGenerator") as MockGen:
-        MockGen.return_value.generate_image.side_effect = lambda **kw: kw["output_path"]
+    # image_generator=None → run_storyboard_artist renders through
+    # character_still_pipeline.render_character_still (the offline Z-Image path).
+    # Patch THAT seam: the old ComfyUIImageGenerator patch was never reached and
+    # this test loaded Z-Image on the real GPU and rendered a real still (39s).
+    from types import SimpleNamespace
+
+    def fake_still(prompt, *, output_path, **kw):
+        return SimpleNamespace(success=True, image_path=output_path, error=None)
+
+    with patch("backend.services.character_still_pipeline.render_character_still", side_effect=fake_still):
         run_storyboard_artist(production.id, image_generator=None)
 
     db.session.refresh(shot)
-    assert shot.storyboard_image_path.endswith(f"/storyboards/{production.id}/shot_1.png")
+    # _storyboard_path names files shot_<scene>_<shot>.png
+    assert shot.storyboard_image_path.endswith(f"/storyboards/{production.id}/shot_1_1.png")
 
     db.session.refresh(production)
     assert production.current_stage == "awaiting_approval"
@@ -456,7 +539,7 @@ def test_regen_storyboard_shot_no_op_when_not_awaiting_approval(app, production)
     assert shot.storyboard_image_path == "/tmp/old.png"
     assert mock_generator.generate_image.call_count == 0
 
-def test_run_cinematographer_retry_does_not_duplicate_shot_subjects(app, production):
+def test_run_cinematographer_retry_does_not_duplicate_shot_subjects(app, production, monkeypatch):
     production.current_stage = "cinematography"
     subj = Subject(name="Alice", kind="character", description="A test character")
     db.session.add(subj)
@@ -464,6 +547,7 @@ def test_run_cinematographer_retry_does_not_duplicate_shot_subjects(app, product
     shot = ProductionShot(production_id=production.id, scene_number=1, shot_number=1, description="Wide shot")
     db.session.add(shot)
     db.session.commit()
+    _director_plans(monkeypatch, [subj.id])
 
     def fake_llm(*args, **kwargs):
         return json.dumps({
@@ -522,3 +606,92 @@ def test_run_editor_failure_calls_fail_stage(app, production):
     db.session.refresh(production)
     assert production.status == "failed_rendering"
     assert "I2V failed" in str(production.error_blob)
+
+
+def test_run_editor_uses_a_scene_renderer_for_a_native_audio_model(app, production):
+    """A production whose settings name a model that renders its own
+    soundtrack gets an Editor with a scene renderer, and each shot carries the
+    cast's name, references and description for it."""
+    production.current_stage = "rendering"
+    production.settings_json = {"video_model": "minimax-h3-int8"}
+    subj = Subject(
+        kind="character", name="Mara", voice_id="af_bella", description="a woman in a grey coat",
+        ref_image_paths=["/refs/mara_1.png", "/refs/mara_2.png"],
+    )
+    db.session.add(subj)
+    db.session.commit()
+    shot = ProductionShot(
+        production_id=production.id, scene_number=1, shot_number=1,
+        description="Close up", storyboard_image_path="/tmp/i.png",
+        character_name="Mara", dialogue_text="Hello there", approved=True,
+    )
+    db.session.add(shot)
+    db.session.commit()
+    db.session.add(ProductionShotSubject(shot_id=shot.id, subject_id=subj.id))
+    db.session.commit()
+
+    with patch("backend.tasks.production_swarm_tasks.Editor") as MockEditor:
+        from backend.services.swarm.agents.editor import RenderResult
+        MockEditor.return_value.render.return_value = RenderResult(
+            final_mp4_path="/tmp/final.mp4", mlt_path=None,
+            clip_paths=["/tmp/w1.mp4"], voiceover_paths=["/tmp/w1.mp4"], music_path=None,
+        )
+        run_editor(production.id, i2v=MagicMock(), audio_foundry=MagicMock(), ffmpeg=MagicMock())
+        editor_kwargs = MockEditor.call_args.kwargs
+        shots_arg = MockEditor.return_value.render.call_args.kwargs["shots"]
+
+    from backend.services.comfyui_video_generator import MiniMaxH3SceneGenerator
+    assert isinstance(editor_kwargs["scene_renderer"], MiniMaxH3SceneGenerator)
+    assert editor_kwargs["scene_renderer"].model == "minimax-h3-int8"
+    assert shots_arg[0].character_name == "Mara"
+    assert shots_arg[0].ref_image_paths == ["/refs/mara_1.png", "/refs/mara_2.png"]
+    assert shots_arg[0].character_description == "a woman in a grey coat"
+
+
+def test_run_editor_honours_a_silent_i2v_model(app, production, monkeypatch):
+    production.current_stage = "rendering"
+    production.settings_json = {"video_model": "wan22-5b"}
+    shot = ProductionShot(
+        production_id=production.id, scene_number=1, shot_number=1,
+        description="Wide", storyboard_image_path="/tmp/i.png", approved=True,
+    )
+    db.session.add(shot)
+    db.session.commit()
+    captured = {}
+
+    class _I2V:
+        def __init__(self, model="wan22-5b", fps=None):
+            captured["model"] = model
+            captured["fps"] = fps
+
+    monkeypatch.setattr(
+        "backend.services.comfyui_video_generator.Wan22I2VGenerator", _I2V,
+    )
+    with patch("backend.tasks.production_swarm_tasks.Editor") as MockEditor:
+        from backend.services.swarm.agents.editor import RenderResult
+        MockEditor.return_value.render.return_value = RenderResult(
+            final_mp4_path="/tmp/final.mp4", mlt_path=None,
+            clip_paths=["/tmp/shot_1.mp4"], voiceover_paths=[None], music_path=None,
+        )
+        run_editor(production.id, i2v=None, audio_foundry=MagicMock(), ffmpeg=MagicMock())
+        assert MockEditor.call_args.kwargs["scene_renderer"] is None
+    assert captured.get("model") == "wan22-5b"
+    assert captured.get("fps") == 24
+
+
+def test_run_editor_without_a_video_model_has_no_scene_renderer(app, production):
+    production.current_stage = "rendering"
+    shot = ProductionShot(
+        production_id=production.id, scene_number=1, shot_number=1,
+        description="Wide", storyboard_image_path="/tmp/i.png", approved=True,
+    )
+    db.session.add(shot)
+    db.session.commit()
+    with patch("backend.tasks.production_swarm_tasks.Editor") as MockEditor:
+        from backend.services.swarm.agents.editor import RenderResult
+        MockEditor.return_value.render.return_value = RenderResult(
+            final_mp4_path="/tmp/final.mp4", mlt_path=None,
+            clip_paths=["/tmp/shot_1.mp4"], voiceover_paths=[None], music_path=None,
+        )
+        run_editor(production.id, i2v=MagicMock(), audio_foundry=MagicMock(), ffmpeg=MagicMock())
+        assert MockEditor.call_args.kwargs["scene_renderer"] is None

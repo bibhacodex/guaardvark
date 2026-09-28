@@ -20,16 +20,32 @@ from flask import Blueprint, request, send_file
 from werkzeug.utils import secure_filename
 
 from backend.utils.response_utils import success_response, error_response
+from backend.utils.path_guard import PathEscapesRoot, contained
 from backend.services.batch_video_generator import get_batch_video_generator
+from backend.services.job_types import RenderErrorKind, batch_failure, describe_failure, failure_kind
 # Single source of truth for video-model file layout (download dst == install
 # check == ComfyUI loader paths). See backend/services/video_model_registry.py.
 from backend.services.video_model_registry import (
     VIDEO_MODEL_REGISTRY,
     DEFAULT_T2V_MODEL,
     DEFAULT_I2V_MODEL,
-    preflight_video_model,
+    prepare_video_model,
     classify_hf_download_error,
+    model_capabilities,
+    tier_defaults_for,
+    resolve_active_video_model,
+    clip_defaults_for,
+    LORA_STACK_TYPES,
+    TEXT_ENCODER_SWAP_TYPES,
 )
+from backend.services.user_video_models import (
+    preview_hf_url,
+    add_user_model,
+    remove_user_model,
+    is_user_model_id,
+    parse_hf_url,
+)
+from backend.services.user_model_families import DuplicateUserModel, hf_inspect_url
 
 # GPU Resource Coordinator for pre-flight availability check
 try:
@@ -113,6 +129,58 @@ def _parse_int(value):
         return None
 
 
+def _parse_float(value):
+    """A number, or None for a field left out (the model's own value applies)."""
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def _failure_response(message, default_kind=RenderErrorKind.INVALID_REQUEST, status_code: int = 400):
+    """A refused request, with its failure record (job_types.describe_failure)
+    under error.details so every caller reads the same kind."""
+    kind = failure_kind(message, default_kind)
+    return error_response(str(message), status_code, details={"failure": describe_failure(kind, message)})
+
+
+def _withheld_style_error(params: dict):
+    """400 when the request asks for a prompt style its model does not offer."""
+    if not params.get("enhance_prompt"):
+        return None
+    from backend.services.video_render_limits import withheld_style
+    why = withheld_style(params["model"], params.get("prompt_style"))
+    return _failure_response(why) if why else None
+
+
+def _resolve_request_model(data, role: str):
+    """Explicit body model, else the active-video-model resolver."""
+    explicit = (data.get("model") or "").strip() or None
+    model_id, err = resolve_active_video_model(role, explicit)
+    if err:
+        return None, err
+    return model_id, None
+
+
+def _clip_params(data, model_id: str) -> dict:
+    """Fill omitted fps/frames/steps/canvas from the model's native defaults."""
+    defaults = clip_defaults_for(model_id)
+    def _num(key, fallback):
+        raw = data.get(key)
+        if raw in (None, ""):
+            return fallback
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return fallback
+    return {
+        "duration_frames": _num("duration_frames", defaults["duration_frames"]),
+        "fps": _num("fps", defaults["fps"]),
+        "width": _num("width", defaults["width"]),
+        "height": _num("height", defaults["height"]),
+        "num_inference_steps": _num("num_inference_steps", defaults["num_inference_steps"]),
+    }
+
+
 @batch_video_bp.route("/generate/text", methods=["POST"])
 def generate_text_to_video_batch():
     """
@@ -136,20 +204,26 @@ def generate_text_to_video_batch():
         if not prompts:
             return error_response("No prompts provided", 400)
 
-        model_id = data.get("model", DEFAULT_T2V_MODEL)
-        ready, preflight_err = preflight_video_model(model_id)
+        model_id, resolve_err = _resolve_request_model(data, "t2v")
+        if resolve_err:
+            return _failure_response(resolve_err)
+        ready, preflight_err = prepare_video_model(model_id)
         if not ready:
-            return error_response(preflight_err, 400)
+            return _failure_response(preflight_err)
+        # Per-prompt guides (audio or image anchors) on models that declare
+        # audio_in: a list per prompt of {"kind", "path", "frame_idx", ...}.
+        guides = data.get("guides") if isinstance(data.get("guides"), list) else []
+        clip = _clip_params(data, model_id)
 
         params = {
             "model": model_id,
-            "duration_frames": int(data.get("duration_frames", 49)),
-            "fps": int(data.get("fps", 24)),
-            "width": int(data.get("width", 512)),
-            "height": int(data.get("height", 512)),
+            "duration_frames": clip["duration_frames"],
+            "fps": clip["fps"],
+            "width": clip["width"],
+            "height": clip["height"],
             "motion_strength": float(data.get("motion_strength", 1.0)),
-            "num_inference_steps": int(data.get("num_inference_steps", 25)),
-            "guidance_scale": float(data.get("guidance_scale", 7.5)),
+            "num_inference_steps": clip["num_inference_steps"],
+            "guidance_scale": _parse_float(data.get("guidance_scale")),
             "seed": _parse_int(data.get("seed")),
             "generate_frames_only": str(data.get("generate_frames_only", "false")).lower() == "true",
             "frames_per_batch": int(data.get("frames_per_batch", 1)),
@@ -158,11 +232,18 @@ def generate_text_to_video_batch():
             "prompt_style": data.get("prompt_style", "cinematic"),
             "enhance_prompt": str(data.get("enhance_prompt", "true")).lower() != "false",
             "fidelity_mode": str(data.get("fidelity_mode", data.get("preserve_text_fidelity", "false"))).lower() == "true",
+            "wan_sampler_profile": (data.get("wan_sampler_profile") or None),
             "negative_prompt": data.get("negative_prompt", "") or "",
             "freeu": str(data.get("freeu", "false")).lower() == "true",
             "face_restore": str(data.get("face_restore", "false")).lower() == "true",
             "lora_name": data.get("lora_name"),
             "lora_strength": float(data.get("lora_strength", 1.0)),
+            "adapters": data.get("adapters") if isinstance(data.get("adapters"), list) else [],
+            "text_encoder": (data.get("text_encoder") or "").strip() or None,
+            # Capability-contract knobs; the generator validates them against
+            # what the model declares.
+            "speed_profile": data.get("speed_profile") or None,
+            "style_embedding": data.get("style_embedding") or None,
             # Quality pipeline (v2.6.2) — opt-in cinematic director + keyframe->I2V.
             "director_mode": str(data.get("director_mode", "false")).lower() == "true",
             "cinematic_keyframe": str(data.get("cinematic_keyframe", "false")).lower() == "true",
@@ -179,6 +260,9 @@ def generate_text_to_video_batch():
                 "teacache_threshold": float(data.get("teacache_threshold")) if data.get("teacache_threshold") else None,
                 "feta_weight": float(data.get("feta_weight")) if data.get("feta_weight") else None,
                 "high_consistency": str(data.get("high_consistency", "false")).lower() == "true",
+                # A step count the person typed keeps priority over a model's
+                # step floor; preset-driven values are raised to the floor.
+                "steps_explicit": str(data.get("steps_explicit", "false")).lower() == "true",
             },
         }
 
@@ -187,7 +271,10 @@ def generate_text_to_video_batch():
             return error_response("Video generation service not available", 503)
 
         gpu_hint = _gpu_queue_hint()
-        status = generator.start_batch_from_prompts(prompts=prompts, **params)
+        style_err = _withheld_style_error(params)
+        if style_err:
+            return style_err
+        status = generator.start_batch_from_prompts(prompts=prompts, guides=guides, **params)
         return success_response({
             "batch_id": status.batch_id,
             "status": status.status,
@@ -212,22 +299,29 @@ def generate_image_to_video_batch():
         image_paths = _parse_list(data.get("image_paths") or data.get("image_ids"))
         if not image_paths:
             return error_response("No image_paths provided", 400)
+        # Index-paired with image_paths on models that declare l2v/flf2v and
+        # audio_in. guides is a list per item of {"kind", "path", "frame_idx", ...}.
+        last_frame_paths = _parse_list(data.get("last_frame_paths"))
+        guides = data.get("guides") if isinstance(data.get("guides"), list) else []
 
-        model_id = data.get("model", DEFAULT_I2V_MODEL)
-        ready, preflight_err = preflight_video_model(model_id)
+        model_id, resolve_err = _resolve_request_model(data, "i2v")
+        if resolve_err:
+            return _failure_response(resolve_err)
+        ready, preflight_err = prepare_video_model(model_id)
         if not ready:
-            return error_response(preflight_err, 400)
+            return _failure_response(preflight_err)
+        clip = _clip_params(data, model_id)
 
         params = {
             "prompt": data.get("prompt", ""),
             "model": model_id,
-            "duration_frames": int(data.get("duration_frames", 49)),
-            "fps": int(data.get("fps", 24)),
-            "width": int(data.get("width", 512)),
-            "height": int(data.get("height", 512)),
+            "duration_frames": clip["duration_frames"],
+            "fps": clip["fps"],
+            "width": clip["width"],
+            "height": clip["height"],
             "motion_strength": float(data.get("motion_strength", 1.0)),
-            "num_inference_steps": int(data.get("num_inference_steps", 25)),
-            "guidance_scale": float(data.get("guidance_scale", 7.5)),
+            "num_inference_steps": clip["num_inference_steps"],
+            "guidance_scale": _parse_float(data.get("guidance_scale")),
             "seed": _parse_int(data.get("seed")),
             "generate_frames_only": str(data.get("generate_frames_only", "false")).lower() == "true",
             "frames_per_batch": int(data.get("frames_per_batch", 1)),
@@ -236,11 +330,18 @@ def generate_image_to_video_batch():
             "prompt_style": data.get("prompt_style", "cinematic"),
             "enhance_prompt": str(data.get("enhance_prompt", "true")).lower() != "false",
             "fidelity_mode": str(data.get("fidelity_mode", data.get("preserve_text_fidelity", "false"))).lower() == "true",
+            "wan_sampler_profile": (data.get("wan_sampler_profile") or None),
             "negative_prompt": data.get("negative_prompt", "") or "",
             "freeu": str(data.get("freeu", "false")).lower() == "true",
             "face_restore": str(data.get("face_restore", "false")).lower() == "true",
             "lora_name": data.get("lora_name"),
             "lora_strength": float(data.get("lora_strength", 1.0)),
+            "adapters": data.get("adapters") if isinstance(data.get("adapters"), list) else [],
+            "text_encoder": (data.get("text_encoder") or "").strip() or None,
+            # Capability-contract knobs; the generator validates them against
+            # what the model declares.
+            "speed_profile": data.get("speed_profile") or None,
+            "style_embedding": data.get("style_embedding") or None,
             # Quality pipeline (v2.6.2) — opt-in cinematic director + keyframe->I2V.
             "director_mode": str(data.get("director_mode", "false")).lower() == "true",
             "cinematic_keyframe": str(data.get("cinematic_keyframe", "false")).lower() == "true",
@@ -252,6 +353,9 @@ def generate_image_to_video_batch():
                 "teacache_threshold": float(data.get("teacache_threshold")) if data.get("teacache_threshold") else None,
                 "feta_weight": float(data.get("feta_weight")) if data.get("feta_weight") else None,
                 "high_consistency": str(data.get("high_consistency", "false")).lower() == "true",
+                # A step count the person typed keeps priority over a model's
+                # step floor; preset-driven values are raised to the floor.
+                "steps_explicit": str(data.get("steps_explicit", "false")).lower() == "true",
             },
         }
 
@@ -259,8 +363,13 @@ def generate_image_to_video_batch():
         if not generator.service_available:
             return error_response("Video generation service not available", 503)
 
+        style_err = _withheld_style_error(params)
+        if style_err:
+            return style_err
         gpu_hint = _gpu_queue_hint()
-        status = generator.start_batch_from_images(image_paths=image_paths, **params)
+        status = generator.start_batch_from_images(
+            image_paths=image_paths, last_frame_paths=last_frame_paths, guides=guides, **params
+        )
         return success_response({
             "batch_id": status.batch_id,
             "status": status.status,
@@ -301,21 +410,17 @@ def enhance_prompt_preview():
         # fidelity_mode: UI "Exact text mode" / preserve fidelity toggle
         fidelity = str(data.get("fidelity_mode", data.get("preserve_text_fidelity", "false"))).lower() == "true"
 
-        # model_family hint (frontend can send model or we infer)
+        # Family comes from the registry entry, not a substring. Hunyuan used
+        # to miss the "cog"/"wan"/"ltx" tests and get the generic path; a
+        # default of cogvideox would have been a silent mis-label.
         model = data.get("model", "")
         model_family = None
-        if "ltx" in (model or "").lower():
-            model_family = "ltx"
-        elif "wan" in (model or "").lower():
-            model_family = "wan"
-        elif "cog" in (model or "").lower():
-            model_family = "cogvideox"
+        if model:
+            from backend.services.video_model_registry import VIDEO_MODEL_REGISTRY
+            model_family = (VIDEO_MODEL_REGISTRY.get(model) or {}).get("type")
 
-        from backend.utils.prompt_enhancer import (
-            enhance_video_prompt,
-            get_default_negative_prompt,
-            has_text_intent,
-        )
+        from backend.services import video_render_limits as render_limits
+        from backend.utils.prompt_enhancer import enhance_video_prompt, has_text_intent
 
         enhanced = enhance_video_prompt(
             prompt,
@@ -324,15 +429,22 @@ def enhance_prompt_preview():
             height=height,
             fidelity_mode=fidelity,
             model_family=model_family,
+            motion_strength=data.get("motion_strength"),
         )
 
         # Default negative that the backend would inject if user left it blank
-        default_neg = get_default_negative_prompt(style=style)
+        character = bool(_parse_list(data.get("subject_ids")) or data.get("lora_name") or data.get("adapters"))
+        default_neg = render_limits.default_negative(
+            model, style, enhanced=True, character=character, family=model_family)
+        unset_cfg = render_limits.cfg_when_unset(model, model_family) if model else None
 
         return success_response({
             "original_prompt": prompt,
             "enhanced_prompt": enhanced,
             "default_negative_prompt": default_neg,
+            # Guidance a request that names none renders with.
+            "cfg_when_unset": unset_cfg if unset_cfg is not None else render_limits.LEGACY_CFG,
+            "reference_defaults": render_limits.reference_defaults_enabled(),
             "fidelity_mode": fidelity,
             "has_text_intent": has_text_intent(prompt),
             "model_family": model_family,
@@ -359,6 +471,8 @@ def get_batch_status(batch_id: str):
                 "frame_paths": r.frame_paths,
                 "thumbnail_path": r.thumbnail_path,
                 "error": r.error,
+                "error_kind": r.error_kind,
+                "failure": None if r.success else describe_failure(r.error_kind, r.error),
                 "metadata": r.metadata,
             }
             for r in status.results
@@ -373,6 +487,11 @@ def get_batch_status(batch_id: str):
                 "total_videos": status.total_videos,
                 "completed_videos": status.completed_videos,
                 "failed_videos": status.failed_videos,
+                # Finished but not usable as rendered: the post-render quality flags.
+                "flagged_videos": sum(
+                    1 for r in status.results
+                    if r.success and ((r.metadata or {}).get("quality") or {}).get("flagged")
+                ),
                 "start_time": status.start_time.isoformat() if status.start_time else None,
                 "end_time": status.end_time.isoformat() if status.end_time else None,
                 "results": results,
@@ -380,6 +499,8 @@ def get_batch_status(batch_id: str):
                 "output_dir": status.output_dir,
                 "retry_data": getattr(status, "retry_data", None),
                 "error": getattr(status, "error", None),
+                # Why it stopped, the same record for the batch and each clip.
+                "failure": batch_failure(status),
             }
         )
     except Exception as e:
@@ -416,11 +537,10 @@ def list_batches():
 def get_video(batch_id: str, video_name: str):
     try:
         generator = get_batch_video_generator()
-        batch_dir = Path(generator.base_output_dir) / batch_id
-        video_path = (batch_dir / video_name).resolve()
         try:
-            video_path.relative_to(batch_dir)
-        except ValueError:
+            batch_dir = contained(generator.base_output_dir, batch_id)
+            video_path = contained(batch_dir, video_name)
+        except PathEscapesRoot:
             return error_response("Invalid video path", 400)
 
         if not video_path.exists():
@@ -448,11 +568,10 @@ def get_video(batch_id: str, video_name: str):
 def delete_video(batch_id: str, video_name: str):
     try:
         generator = get_batch_video_generator()
-        batch_dir = Path(generator.base_output_dir) / batch_id
-        target_path = (batch_dir / video_name).resolve()
         try:
-            target_path.relative_to(batch_dir)
-        except ValueError:
+            batch_dir = contained(generator.base_output_dir, batch_id)
+            target_path = contained(batch_dir, video_name)
+        except PathEscapesRoot:
             return error_response("Invalid video path", 400)
 
         if not target_path.exists():
@@ -493,11 +612,10 @@ def rename_video(batch_id: str, video_name: str):
             return error_response("New name cannot be empty", 400)
 
         generator = get_batch_video_generator()
-        batch_dir = Path(generator.base_output_dir) / batch_id
-        src_path = (batch_dir / video_name).resolve()
         try:
-            src_path.relative_to(batch_dir)
-        except ValueError:
+            batch_dir = contained(generator.base_output_dir, batch_id)
+            src_path = contained(batch_dir, video_name)
+        except PathEscapesRoot:
             return error_response("Invalid video path", 400)
 
         if not src_path.exists():
@@ -662,7 +780,10 @@ def rename_batch(batch_id: str):
 def download_batch(batch_id: str):
     try:
         generator = get_batch_video_generator()
-        batch_dir = Path(generator.base_output_dir) / batch_id
+        try:
+            batch_dir = contained(generator.base_output_dir, batch_id)
+        except PathEscapesRoot:
+            return error_response("Batch not found", 404)
         if not batch_dir.exists():
             return error_response("Batch not found", 404)
 
@@ -794,17 +915,10 @@ _reconcile_download_status_on_load()
 
 
 def _check_model_downloaded(model_id: str) -> bool:
-    """Check if a video model's files exist and are non-empty."""
-    model_info = VIDEO_MODEL_REGISTRY.get(model_id)
-    if not model_info:
-        return False
-    models_dir = _get_comfyui_models_dir()
-    base = models_dir / model_info["local_subdir"]
-    for check_file in model_info["check_files"]:
-        fpath = base / check_file
-        if not fpath.exists() or fpath.stat().st_size == 0:
-            return False
-    return True
+    """Check if a video model's files exist and are non-empty (wherever the
+    entry's `dest` says they live; see video_model_registry.resolve_entry_dir)."""
+    from backend.services.video_model_registry import entry_files_present
+    return entry_files_present(VIDEO_MODEL_REGISTRY.get(model_id))
 
 
 def _missing_check_files(model_id: str) -> List[str]:
@@ -813,11 +927,18 @@ def _missing_check_files(model_id: str) -> List[str]:
     holds GBs of the wrong quant but the one required file is missing, instead of
     leaving the UI with an unexplained is_ready=False.
     """
-    models_dir = _get_comfyui_models_dir()
+    from backend.services.local_weights import is_cached
+    from backend.services.video_model_registry import resolve_entry_dir
+
     missing: List[str] = []
     for eid in _resolve_download_plan(model_id):
         info = VIDEO_MODEL_REGISTRY.get(eid, {})
-        base = models_dir / info.get("local_subdir", "")
+        if info.get("dest") == "hf_cache":
+            for f in info.get("files", []):
+                if not is_cached(info["hf_repo"], f["src"]):
+                    missing.append(f"{eid}:{f['src']}")
+            continue
+        base = resolve_entry_dir(info)
         for cf in info.get("check_files", []):
             fp = base / cf
             if not fp.exists() or fp.stat().st_size == 0:
@@ -845,14 +966,28 @@ def _resolve_download_plan(model_id: str) -> List[str]:
     return plan
 
 
+def _detected_total_vram_mb() -> int:
+    """Total VRAM of the primary card, 0 when there is none or the probe
+    fails. Read once per listing so the tier lookup does not probe per model."""
+    try:
+        from backend.services.gpu_resource_coordinator import get_available_vram
+        return int((get_available_vram() or {}).get("total_mb") or 0)
+    except Exception:
+        return 0
+
+
 @batch_video_bp.route("/models", methods=["GET"])
 def list_video_models():
     """List all video models and their installation status."""
     try:
         models = []
+        total_vram_mb = _detected_total_vram_mb()
+        active_t2v, _ = resolve_active_video_model("t2v")
+        active_i2v, _ = resolve_active_video_model("i2v")
         for model_id, info in VIDEO_MODEL_REGISTRY.items():
             plan = _resolve_download_plan(model_id)
             requires = info.get("requires", [])
+            caps = model_capabilities(model_id)
             models.append({
                 "id": model_id,
                 "name": info["name"],
@@ -877,10 +1012,63 @@ def list_video_models():
                         for e in plan if not _check_model_downloaded(e)),
                     2,
                 ),
+                # Capability contract (registry SSOT): empty for companions.
+                # tier_defaults is already resolved for this card's VRAM class
+                # so the page seeds its controls without knowing the tiers.
+                "capabilities": caps,
+                "tier_defaults": tier_defaults_for(model_id, total_vram_mb) if caps else {},
+                "license": info.get("license"),
+                # LoRA companions name the generation entries they apply to.
+                "applies_to": info.get("applies_to", []),
+                "active": model_id in {active_t2v, active_i2v} and bool(model_id),
+                "user": bool(info.get("user")) or is_user_model_id(model_id),
+                "like": info.get("like"),
+                # User text encoders name the shipped companion they stand in for;
+                # generation rows say whether their graph accepts one.
+                "replaces": info.get("replaces"),
+                "encoder_swap": info.get("type") in TEXT_ENCODER_SWAP_TYPES,
+                "lora_stack": info.get("type") in LORA_STACK_TYPES,
             })
-        return success_response({"models": models})
+        return success_response({"models": models, "active_t2v": active_t2v, "active_i2v": active_i2v})
     except Exception as e:
         logger.error(f"Error listing video models: {e}")
+        return error_response(str(e), 500)
+
+
+@batch_video_bp.route("/prompt-presets", methods=["GET"])
+def list_prompt_presets():
+    """Prompt presets for a model family, read from plugins/comfyui/scripts/prompt_bundles.
+
+    Each preset carries its structured intent and the prompt the compiler
+    renders from it, plus format hints (duration, ratio, mode). The community
+    gallery is returned as attributed links, never as copied prompt text
+    (see the bundle's NOTICE.md).
+    """
+    try:
+        from backend.services import h3_prompt_compiler as h3
+        model_id = (request.args.get("model") or "").strip()
+        family = (VIDEO_MODEL_REGISTRY.get(model_id) or {}).get("type") or request.args.get("family") or ""
+        if family != "minimax":
+            return success_response({"family": family, "presets": [], "gallery": None})
+        bundle = json.loads((h3.BUNDLE_DIR / "presets.json").read_text(encoding="utf-8"))
+        presets = []
+        for preset in bundle.get("presets", []):
+            intent = h3.intent_from_dict({**preset["intent"], "duration_s": preset.get("duration_s", 5),
+                                          "mode": preset.get("mode", "t2va")})
+            prompt, diag = h3.compile(intent)
+            presets.append({
+                "slug": preset["slug"], "title": preset["title"], "category": preset.get("category"),
+                "duration_s": preset.get("duration_s"), "ratio": preset.get("ratio"),
+                "mode": preset.get("mode", "t2va"), "style": preset.get("style"),
+                "prompt": prompt, "intent": preset["intent"], "frames": diag["frames"],
+            })
+        gallery = None
+        gallery_path = h3.BUNDLE_DIR / "gallery_index.json"
+        if gallery_path.exists():
+            gallery = json.loads(gallery_path.read_text(encoding="utf-8"))
+        return success_response({"family": family, "presets": presets, "gallery": gallery})
+    except Exception as e:
+        logger.error(f"Error listing prompt presets: {e}")
         return error_response(str(e), 500)
 
 
@@ -976,7 +1164,13 @@ def start_video_model_download(model_id):
 
             def _pull_one(einfo, local_dir):
                 """Pull a single registry entry's files into local_dir."""
-                if "direct_urls" in einfo:
+                if einfo.get("dest") == "hf_cache":
+                    # The loader that reads this file calls hf_hub_download
+                    # itself, so the file has to sit in the Hugging Face cache
+                    # under its own repo, not in a local_dir.
+                    for spec in einfo.get("files", []):
+                        hf_hub_download(repo_id=einfo["hf_repo"], filename=spec["src"])
+                elif "direct_urls" in einfo:
                     import urllib.request
                     for spec in einfo["direct_urls"]:
                         dst = local_dir / spec["dst"]
@@ -1042,9 +1236,10 @@ def start_video_model_download(model_id):
                 # unet/ may already hold other models). Unique dirs only, so a
                 # shared dir isn't double-counted.
                 entries = []
+                from backend.services.video_model_registry import resolve_entry_dir
                 for eid in plan_ids:
                     einfo = VIDEO_MODEL_REGISTRY[eid]
-                    ldir = models_dir / einfo["local_subdir"]
+                    ldir = resolve_entry_dir(einfo)
                     ldir.mkdir(parents=True, exist_ok=True)
                     entries.append((eid, einfo, ldir))
                 uniq_dirs = list({str(ldir): ldir for (_, _, ldir) in entries}.values())
@@ -1161,6 +1356,128 @@ def start_video_model_download(model_id):
     except Exception as e:
         logger.error(f"Error starting video model download: {e}")
         return error_response(str(e), 500)
+
+
+@batch_video_bp.route("/models/from-hf", methods=["POST"])
+def preview_hf_video_model():
+    """Parse a Hugging Face paste and list weight files. Does not download."""
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return error_response("Paste a Hugging Face URL or org/repo.", 400)
+    repo_id = None
+    try:
+        repo_id = parse_hf_url(url)["hf_repo"]
+        preview = preview_hf_url(url)
+        return success_response(preview)
+    except ValueError as e:
+        return error_response(str(e), 400)
+    except Exception as e:
+        logger.error("HF preview failed: %s", e)
+        return error_response(classify_hf_download_error(e, repo_id=repo_id), 400)
+
+
+@batch_video_bp.route("/models/user", methods=["POST"])
+def add_user_video_model():
+    """Register a user model (same shape as the shipped catalog) and optionally Install."""
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    hf_repo = (data.get("hf_repo") or "").strip()
+    revision = (data.get("revision") or "main").strip() or "main"
+    files = data.get("files") if isinstance(data.get("files"), list) else []
+    inspected = None
+    if not url and hf_repo:
+        src = None
+        if len(files) == 1 and isinstance(files[0], dict):
+            src = files[0].get("src")
+        url = hf_inspect_url(hf_repo, revision, src)
+    if url:
+        try:
+            inspected = preview_hf_url(url)
+        except ValueError as e:
+            return error_response(str(e), 400)
+        except Exception as e:
+            logger.error("HF re-inspect failed: %s", e)
+            return error_response(classify_hf_download_error(e, repo_id=hf_repo or None), 400)
+        hf_repo = inspected["hf_repo"]
+        revision = inspected.get("revision") or revision
+        if inspected.get("unwired"):
+            return error_response(inspected["unwired"].get("reason") or "That architecture is not wired yet.", 400)
+        if inspected.get("src") and not files:
+            files = [{"src": inspected["src"]}]
+    else:
+        return error_response("Paste a Hugging Face URL or org/repo.", 400)
+    if not files:
+        return error_response(
+            "Pick at least one weight file. Pasting a repo root does not snapshot the whole repo.",
+            400,
+        )
+    try:
+        mid, entry, problems = add_user_model(
+            role=(data.get("role") or "").strip(),
+            like_id=(data.get("like") or "").strip(),
+            hf_repo=hf_repo,
+            files=files,
+            name=(data.get("name") or "").strip() or None,
+            model_id=(data.get("id") or "").strip() or None,
+            description=(data.get("description") or "").strip() or None,
+            revision=revision,
+            known_files=inspected["files"] if inspected else None,
+        )
+    except DuplicateUserModel as e:
+        return error_response(str(e), 409, data={"id": e.model_id})
+    except ValueError as e:
+        return error_response(str(e), 400)
+    except Exception as e:
+        logger.error("add user video model failed: %s", e)
+        return error_response(str(e), 500)
+    install = str(data.get("install", "true")).lower() != "false"
+    download_payload = None
+    if install:
+        dl = start_video_model_download(mid)
+        resp_obj, status = dl if isinstance(dl, tuple) else (dl, getattr(dl, "status_code", 200))
+        body = resp_obj.get_json(silent=True) or {}
+        if status >= 400 or not body.get("success"):
+            err = (body.get("error") or {})
+            download_payload = {
+                "error": err.get("message") if isinstance(err, dict) else (err or body.get("message")),
+                "status": status,
+            }
+        else:
+            download_payload = body.get("data")
+    return success_response({
+        "id": mid,
+        "entry": {
+            "id": mid,
+            "name": entry.get("name"),
+            "type": entry.get("type"),
+            "like": entry.get("like"),
+            "applies_to": entry.get("applies_to") or [],
+            "files": entry.get("files"),
+            "hf_repo": entry.get("hf_repo"),
+            "size_gb": entry.get("size_gb"),
+        },
+        "verify": problems,
+        "download": download_payload,
+    })
+
+
+@batch_video_bp.route("/models/user/<model_id>", methods=["DELETE"])
+def delete_user_video_model(model_id):
+    """Remove a user-added catalog entry. Shipped ids are refused."""
+    delete_files = str(request.args.get("delete_files") or (request.get_json(silent=True) or {}).get("delete_files") or "").lower() in (
+        "1", "true", "yes",
+    )
+    try:
+        result = remove_user_model(model_id, delete_files=delete_files)
+    except ValueError as e:
+        return error_response(str(e), 403)
+    except KeyError as e:
+        return error_response(str(e), 404)
+    except Exception as e:
+        logger.error("remove user video model failed: %s", e)
+        return error_response(str(e), 500)
+    return success_response(result)
 
 
 @batch_video_bp.route("/models/download-status", methods=["GET"])

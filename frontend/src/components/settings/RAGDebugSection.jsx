@@ -33,17 +33,18 @@ import {
   getHealthColor,
   getHealthPercentage,
 } from "../../api/ragDebugService";
+import { Cluster, DashboardStrip, DashboardTile } from "./ui";
 
 // Modal components
 import TestRetrievalModal from "../modals/TestRetrievalModal";
 import QueryPatternsModal from "../modals/QueryPatternsModal";
 import ContextQualityModal from "../modals/ContextQualityModal";
 
-const RAGDebugSection = ({ ragDebugEnabled }) => {
+const RAGDebugSection = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [systemHealth, setSystemHealth] = useState(null);
-  const [_performanceMetrics, setPerformanceMetrics] = useState(null);
+  const [performanceMetrics, setPerformanceMetrics] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
 
   // Modal states
@@ -51,10 +52,7 @@ const RAGDebugSection = ({ ragDebugEnabled }) => {
   const [queryPatternsModalOpen, setQueryPatternsModalOpen] = useState(false);
   const [contextQualityModalOpen, setContextQualityModalOpen] = useState(false);
 
-  // Fetch RAG data — only when RAG debug is enabled
   const fetchRAGData = useCallback(async () => {
-    if (!ragDebugEnabled) return;
-
     setLoading(true);
     setError(null);
 
@@ -65,7 +63,7 @@ const RAGDebugSection = ({ ragDebugEnabled }) => {
       ]);
 
       setSystemHealth(healthResponse.data);
-      setPerformanceMetrics(metricsResponse.data);
+      setPerformanceMetrics(metricsResponse.data ?? metricsResponse);
       setLastUpdated(new Date());
     } catch (err) {
       console.error("Failed to fetch RAG data:", err);
@@ -73,20 +71,13 @@ const RAGDebugSection = ({ ragDebugEnabled }) => {
     } finally {
       setLoading(false);
     }
-  }, [ragDebugEnabled]);
+  }, []);
 
-  // Fetch when enabled, clear polling when disabled
   useEffect(() => {
-    if (!ragDebugEnabled) {
-      setSystemHealth(null);
-      setPerformanceMetrics(null);
-      setError(null);
-      return;
-    }
     fetchRAGData();
     const interval = setInterval(fetchRAGData, 30000);
     return () => clearInterval(interval);
-  }, [fetchRAGData, ragDebugEnabled]);
+  }, [fetchRAGData]);
 
   return (
     <Box>
@@ -112,8 +103,8 @@ const RAGDebugSection = ({ ragDebugEnabled }) => {
       </Box>
 
       {error && (
-        <Alert severity="info" sx={{ mb: 2 }}>
-          No RAG data available. Index some documents to see performance stats.
+        <Alert severity="warning" sx={{ mb: 2 }}>
+          Could not load retrieval health: {error}
         </Alert>
       )}
 
@@ -150,7 +141,7 @@ const RAGDebugSection = ({ ragDebugEnabled }) => {
               </Typography>
 
               {systemHealth.health_issues?.length > 0 && (
-                <Alert severity="warning" size="small">
+                <Alert severity="warning">
                   <Typography variant="caption">
                     Issues: {systemHealth.health_issues.join(", ")}
                   </Typography>
@@ -236,8 +227,49 @@ const RAGDebugSection = ({ ragDebugEnabled }) => {
             </Paper>
           </Grid>
 
-          {/* Debug Actions — only shown when RAG Debug is enabled */}
-          {ragDebugEnabled && (
+          {performanceMetrics && (
+            <Grid item xs={12}>
+              <Cluster
+                label="Retrieval window"
+                note={performanceMetrics.time_period || "Last 24 hours"}
+              >
+                <DashboardStrip>
+                  <DashboardTile
+                    label="Retrievals"
+                    value={performanceMetrics.retrieval_stats?.total_retrievals ?? 0}
+                    sub="count"
+                  />
+                  <DashboardTile
+                    label="Avg retrieval"
+                    value={(performanceMetrics.retrieval_stats?.avg_retrieval_time ?? 0).toFixed(2)}
+                    sub="ms"
+                  />
+                  <DashboardTile
+                    label="Avg nodes"
+                    value={(performanceMetrics.retrieval_stats?.avg_nodes_retrieved ?? 0).toFixed(1)}
+                    sub="nodes"
+                  />
+                  <DashboardTile
+                    label="Avg similarity"
+                    value={(performanceMetrics.retrieval_stats?.avg_similarity_score ?? 0).toFixed(3)}
+                    sub="score"
+                  />
+                  <DashboardTile
+                    label="Avg relevance"
+                    value={(performanceMetrics.context_quality_stats?.avg_relevance_score ?? 0).toFixed(3)}
+                    sub="score"
+                  />
+                  <DashboardTile
+                    label="Assessments"
+                    value={performanceMetrics.context_quality_stats?.total_assessments ?? 0}
+                    sub="count"
+                  />
+                </DashboardStrip>
+              </Cluster>
+            </Grid>
+          )}
+
+          {(
             <Grid item xs={12}>
               <Paper variant="outlined" sx={{ p: 2 }}>
                 <Typography variant="subtitle1" gutterBottom>

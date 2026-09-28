@@ -22,8 +22,9 @@ import uuid
 from pathlib import Path
 
 import requests
-from flask import Blueprint, request as flask_request, current_app, send_file
+from flask import Blueprint, request as flask_request, current_app, jsonify, send_file
 from werkzeug.utils import secure_filename
+from backend.utils.path_guard import PathEscapesRoot, contained, contained_path
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +46,17 @@ def _voice_ref_dir() -> Path:
     return target
 
 
+def _safe_ref_path(p) -> Path:
+    """``p`` as a Path inside the voice_references directory, or raise PathEscapesRoot."""
+    return contained(_voice_ref_dir(), p)
+
+
 def _is_safe_ref_path(p: Path) -> bool:
     """Reject anything that would escape the voice_references directory."""
     try:
-        p.resolve().relative_to(_voice_ref_dir().resolve())
+        _safe_ref_path(p)
         return True
-    except (ValueError, OSError):
+    except PathEscapesRoot:
         return False
 
 audio_foundry_bp = Blueprint("audio_foundry", __name__, url_prefix="/api/audio-foundry")
@@ -63,25 +69,57 @@ GENERATION_TIMEOUT = 600  # /generate/* — songs up to 4 minutes plus model loa
 def _proxy_get(path: str, timeout: int = QUICK_TIMEOUT):
     try:
         resp = requests.get(f"{AUDIO_FOUNDRY_URL}{path}", timeout=timeout)
-        return resp.json(), resp.status_code
+        return jsonify(resp.json()), resp.status_code
     except requests.ConnectionError:
-        return {"error": "Audio Foundry service not running"}, 503
+        return jsonify({"error": "Audio Foundry service not running"}), 503
     except Exception as e:
         logger.exception("Audio Foundry GET %s failed", path)
-        return {"error": str(e)}, 500
+        return jsonify({"error": str(e)}), 500
 
 
 def _proxy_post(path: str, json_data: dict, timeout: int):
     try:
         resp = requests.post(f"{AUDIO_FOUNDRY_URL}{path}", json=json_data, timeout=timeout)
-        return resp.json(), resp.status_code
+        return jsonify(resp.json()), resp.status_code
     except requests.ConnectionError:
-        return {"error": "Audio Foundry service not running"}, 503
+        return jsonify({"error": "Audio Foundry service not running"}), 503
     except requests.Timeout:
-        return {"error": f"Audio Foundry request timed out after {timeout}s"}, 504
+        return jsonify({"error": f"Audio Foundry request timed out after {timeout}s"}), 504
     except Exception as e:
         logger.exception("Audio Foundry POST %s failed", path)
-        return {"error": str(e)}, 500
+        return jsonify({"error": str(e)}), 500
+
+
+def _audio_foundry_up() -> bool:
+    try:
+        return requests.get(f"{AUDIO_FOUNDRY_URL}/health", timeout=2).status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def _proxy_generate(path: str, json_data: dict):
+    """POST a generation, starting Audio Foundry first when it is down.
+
+    The start happens only with GUAARDVARK_JOB_SERVICE_START on; the status and
+    health routes the Studio polls never start it.
+    """
+    from backend.services.plugin_bridge import job_service_start_enabled, start_for_job
+    if job_service_start_enabled():
+        ok, why = start_for_job("audio", "generating", is_up=_audio_foundry_up)
+        if not ok:
+            return jsonify({"error": f"Audio Foundry service not running ({why})"}), 503
+    return _proxy_post(path, json_data, GENERATION_TIMEOUT)
+
+
+def _proxy_delete(path: str, timeout: int = QUICK_TIMEOUT):
+    try:
+        resp = requests.delete(f"{AUDIO_FOUNDRY_URL}{path}", timeout=timeout)
+        return jsonify(resp.json()), resp.status_code
+    except requests.ConnectionError:
+        return jsonify({"error": "Audio Foundry service not running"}), 503
+    except Exception as e:
+        logger.exception("Audio Foundry DELETE %s failed", path)
+        return jsonify({"error": str(e)}), 500
 
 
 @audio_foundry_bp.route("/health", methods=["GET"])
@@ -108,6 +146,36 @@ def voices():
     return body, status_code
 
 
+# ---------- Model catalog / install (plugin-offline safe) -------------------
+#
+# Weights live in the shared Hugging Face cache. Listing and download run in
+# this process so a stopped sidecar does not hide the Install button.
+
+
+@audio_foundry_bp.route("/models", methods=["GET"])
+def list_models():
+    from backend.services.audio_foundry_models import list_models as _list
+    payload = _list()
+    return jsonify({"success": True, **payload}), 200
+
+
+@audio_foundry_bp.route("/models/download", methods=["POST"])
+def download_model():
+    from backend.services.audio_foundry_models import start_download
+    body = flask_request.get_json(silent=True) or {}
+    model_id = str(body.get("id") or body.get("model_id") or "").strip()
+    if not model_id:
+        return jsonify({"success": False, "error": "id is required"}), 400
+    payload, status = start_download(model_id)
+    return jsonify(payload), status
+
+
+@audio_foundry_bp.route("/models/download-status", methods=["GET"])
+def download_status():
+    from backend.services.audio_foundry_models import download_status as _status
+    return jsonify(_status()), 200
+
+
 @audio_foundry_bp.route("/generate/voice", methods=["POST"])
 def generate_voice():
     data = flask_request.get_json(silent=True) or {}
@@ -116,26 +184,57 @@ def generate_voice():
         # Consent enforcement (voice specialist audit): reference must have been
         # uploaded via /voice-clips/upload (which creates .consent sidecar) and
         # be safe. This blocks arbitrary FS paths for cloning without consent.
-        p = Path(ref)
-        consent = p.with_name(p.name + ".consent")
-        if not p.exists() or not consent.exists() or not _is_safe_ref_path(p):
+        try:
+            p = _safe_ref_path(ref)
+        except PathEscapesRoot:
             return {"error": "Invalid or unconsented reference_clip_path (upload via UI for consent)"}, 403
-    body, status_code = _proxy_post(
-        "/generate/voice",
-        data,
-        GENERATION_TIMEOUT,
-    )
+        consent = p.with_name(p.name + ".consent")
+        if not p.exists() or not consent.exists():
+            return {"error": "Invalid or unconsented reference_clip_path (upload via UI for consent)"}, 403
+    body, status_code = _proxy_generate("/generate/voice", data)
     return body, status_code
 
 
 @audio_foundry_bp.route("/generate/music", methods=["POST"])
 def generate_music():
-    body, status_code = _proxy_post(
-        "/generate/music",
-        flask_request.get_json(silent=True) or {},
-        GENERATION_TIMEOUT,
-    )
+    """Music generation. ``model`` picks the backend: the sidecar's ACE-Step
+    (default) or MiniMax Music 3 through ComfyUI, which returns a job id to
+    poll at /generate/music/status/<id> like the sidecar's own jobs."""
+    payload = flask_request.get_json(silent=True) or {}
+    model = str(payload.get("model") or "").strip()
+    if model.startswith("minimax-music3"):
+        from flask import current_app, jsonify
+        from backend.services import comfyui_music_generator as m3
+        from backend.services.plugin_bridge import job_service_start_enabled
+        from backend.services.video_model_registry import prepare_video_model, preflight_video_model
+        check = prepare_video_model if job_service_start_enabled() else preflight_video_model
+        ready, err = check(model)
+        if not ready:
+            return jsonify({"success": False, "error": err}), 400
+        try:
+            seconds = float(payload.get("duration_s") or payload.get("seconds") or 60)
+        except (TypeError, ValueError):
+            seconds = 60.0
+        job_id = m3.start_job(
+            app=current_app._get_current_object(),
+            caption=payload.get("style_prompt") or payload.get("caption") or "",
+            lyrics="" if payload.get("instrumental_only") else (payload.get("lyrics") or ""),
+            seconds=seconds, seed=payload.get("seed"), steps=payload.get("steps"), model_id=model,
+        )
+        return jsonify({"success": True, "job_id": job_id, "model": model, "status": "queued",
+                        "attribution": "MiniMax-Music3"}), 202
+    body, status_code = _proxy_generate("/generate/music", payload)
     return body, status_code
+
+
+@audio_foundry_bp.route("/generate/music/status/<job_id>", methods=["GET"])
+def music_job_status(job_id):
+    from flask import jsonify
+    from backend.services import comfyui_music_generator as m3
+    job = m3.job_status(job_id)
+    if job is None:
+        return jsonify({"success": False, "error": "unknown job"}), 404
+    return jsonify({"success": True, **job}), 200
 
 
 @audio_foundry_bp.route("/rewrite-music-prompt", methods=["POST"])
@@ -198,11 +297,7 @@ def rewrite_music_prompt():
 
 @audio_foundry_bp.route("/generate/fx", methods=["POST"])
 def generate_fx():
-    body, status_code = _proxy_post(
-        "/generate/fx",
-        flask_request.get_json(silent=True) or {},
-        GENERATION_TIMEOUT,
-    )
+    body, status_code = _proxy_generate("/generate/fx", flask_request.get_json(silent=True) or {})
     return body, status_code
 
 
@@ -216,6 +311,22 @@ def generate_fx():
 
 @audio_foundry_bp.route("/jobs/<job_id>", methods=["GET"])
 def job_status(job_id):
+    """Job status. A MiniMax Music 3 job (run here through ComfyUI) answers in
+    the sidecar's shape so the page polls both the same way."""
+    from backend.services import comfyui_music_generator as m3
+    job = m3.job_status(job_id)
+    if job is not None:
+        from flask import jsonify
+        status = {"failed": "error"}.get(job["status"], job["status"])
+        result = None
+        if status == "done":
+            result = {
+                "path": job.get("path"), "document_id": job.get("document_id"),
+                "duration_s": job.get("seconds"), "model": job.get("model"),
+                "attribution": job.get("attribution"), "seed": job.get("seed"),
+            }
+        return jsonify({"id": job_id, "status": status, "error": job.get("error"),
+                        "progress": {"current": 0, "total": 0}, "result": result}), 200
     body, status_code = _proxy_get(f"/jobs/{job_id}")
     return body, status_code
 
@@ -229,6 +340,13 @@ def jobs_list():
 @audio_foundry_bp.route("/jobs/<job_id>/cancel", methods=["POST"])
 def job_cancel(job_id):
     body, status_code = _proxy_post(f"/jobs/{job_id}/cancel", {}, QUICK_TIMEOUT)
+    return body, status_code
+
+
+@audio_foundry_bp.route("/jobs", methods=["DELETE"])
+def jobs_clear():
+    """Clear finished jobs from the sidecar's history. Active jobs untouched."""
+    body, status_code = _proxy_delete("/jobs")
     return body, status_code
 
 
@@ -260,7 +378,7 @@ def list_voice_clips():
         return {"clips": clips}, 200
     except Exception as e:
         logger.exception("voice clip list failed")
-        return {"error": str(e)}, 500
+        return jsonify({"error": str(e)}), 500
 
 
 @audio_foundry_bp.route("/voice-clips/upload", methods=["POST"])
@@ -318,7 +436,7 @@ def upload_voice_clip():
     except Exception as e:
         target.unlink(missing_ok=True)
         logger.exception("voice clip upload failed")
-        return {"error": str(e)}, 500
+        return jsonify({"error": str(e)}), 500
 
     # Consent sidecar for enforcement (per voice team audit): generate/voice with
     # reference_clip_path will require the sibling .consent to exist (created only

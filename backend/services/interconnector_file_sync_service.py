@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from flask import current_app
+from backend.utils.path_guard import PathEscapesRoot, contained, contained_path
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +71,23 @@ class InterconnectorFileSyncService:
             "backend/tasks/",
             "backend/migrations/",
             "backend/tests/",
+            # This list is an allowlist: a backend/ package that is not named
+            # here never reaches a client, while the synced app.py/config.py
+            # already import it -- the client then dies at import on its next
+            # boot. test_interconnector_exclude.py::test_every_backend_entry_is_synced
+            # fails when a new top-level entry is added without a line here.
+            "backend/extensions/",
+            "backend/profiles/",
+            "backend/mcp/",
+            "backend/rule_bundles/",
+            "backend/lesson_bundles/",
+            "backend/static/",
+            "backend/oom_priority.py",
+            "backend/schema.sql",
+            "backend/seed_rules.json",
             "backend/app.py",
             "backend/celery_app.py",
+            "backend/celery_beat_gates.py",
             "backend/celery_tasks_isolated.py",
             "backend/config.py",
             "backend/cuda_config.py",
@@ -107,6 +123,13 @@ class InterconnectorFileSyncService:
             "plugins/",
             "frontend/vite.config.js",
             "frontend/index.html",
+            # Static assets the bundle build copies as-is (icons, the voice-input
+            # worklet); without them a client's rebuilt bundle serves stale or
+            # missing files.
+            "frontend/public/",
+            # app.py and /api/system/version read this; a client that never
+            # receives it reports the version it was first cloned at.
+            "VERSION",
         ]
         
         self.exclude_patterns = [
@@ -302,15 +325,11 @@ class InterconnectorFileSyncService:
         patterns_include = include_patterns or []
         
         for sync_path in sync_paths:
-            if os.path.isabs(sync_path):
-                full_path = Path(sync_path).resolve()
-                try:
-                    full_path.relative_to(project_root)
-                except ValueError:
-                    logger.warning(f"[FILE_SYNC] Skipping absolute path outside project root: {full_path}")
-                    continue
-            else:
-                full_path = (project_root / sync_path).resolve()
+            try:
+                full_path = contained(project_root, sync_path)
+            except PathEscapesRoot:
+                logger.warning(f"[FILE_SYNC] Skipping path outside project root: {sync_path}")
+                continue
             
             logger.debug(f"[FILE_SYNC] Scanning path: {sync_path} -> {full_path}")
             
@@ -370,10 +389,9 @@ class InterconnectorFileSyncService:
         for rel_path in paths:
             if not rel_path:
                 continue
-            file_path = (project_root / rel_path).resolve()
             try:
-                file_path.relative_to(project_root)
-            except ValueError:
+                file_path = contained(project_root, rel_path)
+            except PathEscapesRoot:
                 logger.warning(f"[FILE_SYNC] Skipping path outside project root: {rel_path}")
                 continue
             if not file_path.is_file():
@@ -390,10 +408,9 @@ class InterconnectorFileSyncService:
     def resolve_local_file(self, relative_path: str) -> Optional[Dict]:
         """Hash a single local path (fallback when a batch scan omitted it)."""
         project_root = self.get_project_root()
-        file_path = (project_root / relative_path).resolve()
         try:
-            file_path.relative_to(project_root)
-        except ValueError:
+            file_path = contained(project_root, relative_path)
+        except PathEscapesRoot:
             return None
         if not file_path.is_file() or self.should_exclude_file(str(file_path)):
             return None
@@ -1058,7 +1075,10 @@ class InterconnectorFileSyncService:
         expected_size: Optional[int] = None
     ) -> Dict[str, Any]:
         project_root = self.get_project_root()
-        file_path = project_root / relative_path
+        try:
+            file_path = contained(project_root, relative_path)
+        except PathEscapesRoot:
+            file_path = None
         
         result = {
             "path": relative_path,
@@ -1073,7 +1093,7 @@ class InterconnectorFileSyncService:
         }
         
         try:
-            if not file_path.exists():
+            if file_path is None or not file_path.exists():
                 logger.warning(f"[FILE_SYNC VERIFY] File missing: {relative_path}")
                 result["errors"].append("File does not exist")
                 return result

@@ -5,7 +5,8 @@
 import logging
 import os
 import sys
-from typing import Optional
+from datetime import datetime
+from typing import Optional, Dict
 
 # Add backend to Python path for imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -17,10 +18,6 @@ try:
     from backend.app import app, db
     # Model (previously ModelInfo) is kept as an alias so legacy seed code still runs.
     from backend.models import Rule, Client, Project, Website, Task, Model as ModelInfo
-    from backend.utils.prompt_utils import (
-        FALLBACK_QA_PROMPT_TEXT,
-        FALLBACK_CODE_GEN_PROMPT_TEXT,
-    )
     import json
 
     logger = logging.getLogger(__name__)
@@ -81,6 +78,156 @@ def seed_rules_from_file(rules_file: Optional[str] = None):
         logger.error(f"Error seeding rules: {e}")
         db.session.rollback()
         return 0
+
+
+def load_rule_bundle(bundle_file: str) -> Dict[str, int]:
+    """Apply a rule bundle to the database, upserting by rule name.
+
+    A bundle is the voice of one distribution — the engine's own or a vertical's
+    — and a distribution has to be able to re-apply it after editing the text,
+    flipping ``is_active`` or changing model targets. ``seed_rules_from_file``
+    cannot do that: it skips every name it has already seen, so a rule that
+    shipped inactive stays inactive forever.
+
+    For each entry the row with the same name, level and type is updated in
+    place; any other active row carrying that name is deactivated first, so the
+    partial unique index on active identity is never violated; a missing row is
+    inserted. ``is_active`` comes from the bundle. Returns counts.
+    """
+    with open(bundle_file, "r") as f:
+        data = json.load(f)
+
+    counts = {"inserted": 0, "updated": 0, "deactivated": 0}
+    for entry in data.get("rules", []):
+        name = entry["name"]
+        level = entry.get("level", "SYSTEM")
+        rule_type = entry.get("type", "PROMPT_TEMPLATE")
+        active = bool(entry.get("is_active", True))
+
+        rows = Rule.query.filter_by(name=name).all()
+        match = next((r for r in rows if r.level == level and r.type == rule_type), None)
+
+        if active:
+            for row in rows:
+                if row is not match and row.is_active:
+                    row.is_active = False
+                    counts["deactivated"] += 1
+            # The unique index is checked per statement: retire the old identity
+            # before the new one becomes active.
+            db.session.flush()
+
+        if match is None:
+            match = Rule(name=name, level=level, type=rule_type, rule_text=entry["rule_text"])
+            db.session.add(match)
+            counts["inserted"] += 1
+        else:
+            counts["updated"] += 1
+
+        match.rule_text = entry["rule_text"]
+        match.description = entry.get("description", "")
+        match.command_label = entry.get("command_label")
+        match.output_schema_name = entry.get("output_schema_name")
+        match.target_models_json = entry.get("target_models_json", '["__ALL__"]')
+        match.is_active = active
+        # The active-prompt cache is keyed on the newest updated_at; bump it even
+        # when nothing else changed so a re-applied bundle is picked up.
+        match.updated_at = datetime.now()
+
+    db.session.commit()
+    logger.info("Applied rule bundle %s: %s", bundle_file, counts)
+    return counts
+
+
+def _lesson_title_from_row(row) -> str:
+    """Title stored in lesson JSON content, falling back to extra_data."""
+    payload = None
+    try:
+        decoded = json.loads(row.content or "")
+        if isinstance(decoded, dict):
+            payload = decoded
+    except (json.JSONDecodeError, TypeError):
+        payload = None
+    if payload is None:
+        extra = row.extra_data if isinstance(getattr(row, "extra_data", None), dict) else {}
+        lesson = extra.get("lesson") if isinstance(extra.get("lesson"), dict) else {}
+        payload = lesson
+    return str((payload or {}).get("title") or "").strip()
+
+
+def load_lesson_bundle(path: str) -> Dict[str, int]:
+    """Apply a lesson bundle, upserting procedures by title.
+
+    Each entry is validated with ``validate_lesson_payload``. A lesson row with
+    the same title is updated in place; otherwise a new row is written via
+    ``add_memory`` with ``memory_type="lesson"`` and ``source="bundle"``.
+    Re-applying a bundle does not create duplicates.
+    """
+    from backend.api.memory_api import add_memory
+    from backend.models import AgentMemory
+    from backend.services.memory_contract import (
+        coerce_importance,
+        normalize_tags,
+        validate_lesson_payload,
+    )
+
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    counts = {"inserted": 0, "updated": 0, "invalid": 0}
+    existing_by_title = {}
+    for row in AgentMemory.query.filter(AgentMemory.type == "lesson").all():
+        title = _lesson_title_from_row(row)
+        if title and title.lower() not in existing_by_title:
+            existing_by_title[title.lower()] = row
+
+    for entry in data.get("lessons") or []:
+        ok, err = validate_lesson_payload(entry)
+        if not ok:
+            logger.warning("Skipping invalid lesson in %s: %s", path, err)
+            counts["invalid"] += 1
+            continue
+
+        title = str(entry.get("title") or "").strip()
+        payload = {
+            "title": title,
+            "steps": entry["steps"],
+            "parameters": entry.get("parameters") or [],
+        }
+        content = json.dumps(payload)
+        tags = normalize_tags(entry.get("tags"))
+        importance = coerce_importance(entry.get("importance", 0.8), "lesson")
+        match = existing_by_title.get(title.lower())
+
+        if match is None:
+            memory = add_memory(
+                content=content,
+                memory_type="lesson",
+                source="bundle",
+                importance=importance,
+                tags=tags,
+            )
+            if memory is None:
+                logger.warning("Failed to insert lesson %r from %s", title, path)
+                counts["invalid"] += 1
+                continue
+            existing_by_title[title.lower()] = memory
+            counts["inserted"] += 1
+        else:
+            match.content = content
+            extra = dict(match.extra_data or {})
+            extra["lesson"] = payload
+            match.extra_data = extra
+            match.tags = json.dumps(tags) if tags else None
+            match.importance = importance
+            match.source = "bundle"
+            match.status = "active"
+            match.updated_at = datetime.now()
+            db.session.commit()
+            existing_by_title[title.lower()] = match
+            counts["updated"] += 1
+
+    logger.info("Applied lesson bundle %s: %s", path, counts)
+    return counts
 
 
 def seed_essential_system_data():

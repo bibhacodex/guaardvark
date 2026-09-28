@@ -64,14 +64,18 @@ def _doctor_cli_check() -> None:
     from pathlib import Path
 
     from llx.backend_bootstrap import is_backend_healthy
-    from llx.config import CONFIG_FILE, get_server_url
+    from llx.config import CONFIG_FILE, LEGACY_CONFIG_FILE, get_server_url
     from llx.launch_config import _config_path as launch_cfg_path, load_launch_config
     from llx.lite_mode import is_lite_mode
 
     checks: list[tuple[str, bool, str]] = []
 
-    llx_cfg = CONFIG_FILE
-    checks.append(("~/.llx/config.json", llx_cfg.is_file(), str(llx_cfg)))
+    if CONFIG_FILE.is_file():
+        checks.append(("~/.guaardvark/cli.json", True, str(CONFIG_FILE)))
+    elif LEGACY_CONFIG_FILE.is_file():
+        checks.append(("~/.llx/config.json (legacy)", True, str(LEGACY_CONFIG_FILE)))
+    else:
+        checks.append(("CLI config", True, f"{CONFIG_FILE} (not created yet)"))
 
     launch_path = launch_cfg_path()
     launch_exists = launch_path.is_file()
@@ -99,13 +103,24 @@ def _doctor_cli_check() -> None:
             )
         )
 
+    try:
+        from llx.termcaps import detect, tmux_hints
+
+        caps = detect()
+        gfx = caps.graphics
+        checks.append(("terminal", True, f"{caps.name}  colors={caps.color_count}  graphics={gfx}"))
+        if caps.tmux:
+            checks.append(("tmux", True, "passthrough needed for inline images: " + "; ".join(tmux_hints()[:2])))
+    except Exception:
+        pass
+
     console.print("[llx.brand]CLI Doctor[/llx.brand]\n")
     all_ok = True
     for label, ok, detail in checks:
         icon = ICON_ONLINE if ok else ICON_OFFLINE
         style = "llx.status.online" if ok else "llx.status.offline"
         console.print(f"  [{style}]{icon}[/{style}] [llx.kv.key]{label}:[/llx.kv.key] {detail}")
-        if label not in ("lite/full note", "launch mode") and not ok:
+        if label not in ("lite/full note", "launch mode", "terminal", "tmux") and not ok:
             all_ok = False
 
     if not all_ok:
@@ -191,6 +206,10 @@ def status(
             metrics_data = client.get("/api/meta/metrics")
         except LlxError:
             metrics_data = {}
+        try:
+            mcp_data = client.get("/api/automation/mcp/status")
+        except LlxError:
+            mcp_data = {}
 
         if json_out or output.is_pipe():
             output.print_json(
@@ -201,6 +220,7 @@ def status(
                         "model": model_data,
                         "celery": celery_data,
                         "metrics": metrics_data,
+                        "mcp": mcp_data,
                     },
                 }
             )
@@ -233,7 +253,17 @@ def status(
         version = health_data.get("version", "?")
         ver_line = f"[llx.kv.key]Version:[/llx.kv.key] {version}"
 
-        content = "\n".join([server_line, model_line, celery_line, gpu_line, cpu_line, ver_line])
+        if mcp_data.get("mcp_enabled"):
+            mcp_ok = not mcp_data.get("errors") and not mcp_data.get("config_errors")
+            m_style = "llx.status.online" if mcp_ok else "llx.status.offline"
+            mcp_line = (f"[llx.kv.key]MCP:[/llx.kv.key]     {mcp_data.get('servers_connected', 0)}/"
+                        f"{mcp_data.get('servers_configured', 0)} servers, "
+                        f"{mcp_data.get('total_tools_available', 0)} tools"
+                        + ("" if mcp_ok else f"  [{m_style}]{ICON_OFFLINE} see: llx mcp client status[/{m_style}]"))
+        else:
+            mcp_line = "[llx.kv.key]MCP:[/llx.kv.key]     [llx.dim]disabled or unavailable[/llx.dim]"
+
+        content = "\n".join([server_line, model_line, celery_line, gpu_line, cpu_line, mcp_line, ver_line])
         console.print(make_panel(content, title="System Status"))
 
     except LlxConnectionError as e:

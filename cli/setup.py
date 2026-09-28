@@ -8,14 +8,32 @@ from setuptools import setup, find_packages
 # render on PyPI, which does not serve repo-relative assets.
 _repo_root = Path(__file__).resolve().parent.parent
 
-# Single source of truth for the version: the repo-root VERSION file.
-_version_path = _repo_root / "VERSION"
-_version = _version_path.read_text(encoding="utf-8").strip() if _version_path.exists() else "2.6.2"
+# Single source of truth for the version: the repo-root VERSION file. An sdist
+# cannot carry a file from outside the package, so the release build copies it
+# to cli/VERSION (see MANIFEST.in) and that copy is what a wheel built from the
+# sdist reads. Never fall back to a literal: pip prefers the wheel, so a stale
+# default here publishes the wrong version under the right filename.
+_version = None
+for _candidate in (Path(__file__).resolve().parent / "VERSION", _repo_root / "VERSION"):
+    if _candidate.exists():
+        _version = _candidate.read_text(encoding="utf-8").strip()
+        break
+if not _version:
+    raise RuntimeError(
+        "VERSION not found. Expected cli/VERSION (created by the release build) "
+        "or VERSION at the repo root. Refusing to guess a version number."
+    )
 
-_readme_path = _repo_root / "README.md"
+# Same arrangement as VERSION: the wheel is built from the sdist, which cannot
+# see the repo root, so the release build copies README.md to cli/README.md
+# (see MANIFEST.in). Without that copy the 2.8.0 wheel shipped with an empty
+# project page.
 _long_description = ""
-if _readme_path.exists():
-    _long_description = _readme_path.read_text(encoding="utf-8")
+for _readme_path in (Path(__file__).resolve().parent / "README.md", _repo_root / "README.md"):
+    if _readme_path.exists():
+        _long_description = _readme_path.read_text(encoding="utf-8")
+        break
+if _long_description:
     _raw_base = "https://raw.githubusercontent.com/guaardvark/guaardvark/main/"
     _long_description = re.sub(
         r'\(docs/screenshots/', f'({_raw_base}docs/screenshots/', _long_description
@@ -31,12 +49,28 @@ setup(
     long_description=_long_description,
     long_description_content_type="text/markdown",
     author="Guaardvark",
+    author_email="info@guaardvark.com",
     url="https://guaardvark.com",
     project_urls={
         "Source": "https://github.com/guaardvark/guaardvark",
         "Homepage": "https://guaardvark.com",
         "Issues": "https://github.com/guaardvark/guaardvark/issues",
     },
+    keywords=[
+        "self-hosted",
+        "local AI",
+        "MCP",
+        "mcp-server",
+        "image generation",
+        "video generation",
+        "music",
+        "voice",
+        "RAG",
+        "agents",
+        "Claude Code",
+        "Cursor",
+        "Codex",
+    ],
     packages=find_packages(),
     install_requires=[
         "typer[all]>=0.9.0",

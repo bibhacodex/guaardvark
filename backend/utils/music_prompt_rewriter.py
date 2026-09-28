@@ -25,6 +25,7 @@ from typing import Optional, TypedDict
 import requests
 
 from backend.config import OLLAMA_BASE_URL
+from backend.utils.ollama_resource_manager import think_payload
 from backend.utils.llm_service import get_saved_active_model_name
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,7 @@ def rewrite_music_prompt(
             "temperature": 0.3,  # Low — we want consistent tag output, not creative drift
             "num_ctx": 2048,     # Plenty for the system prompt + a short user line
         },
+        **think_payload(chosen_model),
     }
 
     try:

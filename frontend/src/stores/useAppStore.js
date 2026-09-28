@@ -1,6 +1,15 @@
 import { create } from "zustand";
 import { persist, createJSONStorage, subscribeWithSelector, devtools } from "zustand/middleware";
 import brand from "../config/brand";
+import { DEFAULT_PROFILE } from "../config/profile";
+import { extensionStoreSlices } from "../extensions";
+
+// Extensions may add state (extensions/<id>/frontend/index.jsx storeSlice);
+// their persisted keys join partialize below.
+const extensionSlices = extensionStoreSlices();
+const createExtensionSlices = (set, get) =>
+  Object.assign({}, ...extensionSlices.map((slice) => (slice.state ? slice.state(set, get) : {})));
+const extensionPersistedKeys = extensionSlices.flatMap((slice) => slice.partialize || []);
 
 const createUISlice = (set, get) => ({
   themeName: brand.defaultThemeKey,
@@ -12,6 +21,12 @@ const createUISlice = (set, get) => ({
   sidebarExpanded: false,
   setSidebarExpanded: (expanded) => set({ sidebarExpanded: expanded }),
   toggleSidebar: () => set((state) => ({ sidebarExpanded: !state.sidebarExpanded })),
+
+  navChrome: "sidebar",
+  setNavChrome: (chrome) => {
+    if (chrome !== "sidebar" && chrome !== "software") return;
+    set({ navChrome: chrome });
+  },
 
   listenerModeEnabled: false,
   toggleListenerMode: () => set((state) => ({ listenerModeEnabled: !state.listenerModeEnabled })),
@@ -91,6 +106,11 @@ const createDataSlice = (set, get) => ({
   activeProjectId: null,
   systemName: null,
   systemLogo: null,
+  // The active profile from /api/settings/branding. Deliberately not
+  // persisted: a stale copy must not outlive a change to .env.
+  profile: DEFAULT_PROFILE,
+  // First run: no profile chosen yet (no .env key, no marker, no extension). Not persisted.
+  profileFirstRun: false,
   isFetchingSystemInfo: false,
 
   setProjects: (projects) => set({ projects }),
@@ -101,6 +121,8 @@ const createDataSlice = (set, get) => ({
     systemName: name,
     systemLogo: logo
   }),
+  setProfile: (profile) => set({ profile: profile ? { ...DEFAULT_PROFILE, ...profile } : DEFAULT_PROFILE }),
+  setProfileFirstRun: (pending) => set({ profileFirstRun: Boolean(pending) }),
 
   // eslint-disable-next-line no-unused-vars
   fetchSystemInfo: async (force = false) => {
@@ -129,6 +151,8 @@ const createDataSlice = (set, get) => ({
       set({
         systemName: data.system_name || null,
         systemLogo: data.logo_path || null,
+        profile: data.profile ? { ...DEFAULT_PROFILE, ...data.profile } : DEFAULT_PROFILE,
+        profileFirstRun: Boolean(data.profile_first_run),
       });
       clearError();
     } catch (err) {
@@ -153,6 +177,7 @@ export const useAppStore = create(
         (set, get) => ({
           ...createUISlice(set, get),
           ...createDataSlice(set, get),
+          ...createExtensionSlices(set, get),
         }),
         {
           name: "guaardvark-app-storage",
@@ -161,11 +186,13 @@ export const useAppStore = create(
             themeName: state.themeName,
             dashboardLayout: state.dashboardLayout,
             sidebarExpanded: state.sidebarExpanded,
+            navChrome: state.navChrome,
             listenerModeEnabled: state.listenerModeEnabled,
             activeModel: state.activeModel,
             activeProjectId: state.activeProjectId,
             systemName: state.systemName,
             systemLogo: state.systemLogo,
+            ...Object.fromEntries(extensionPersistedKeys.map((k) => [k, state[k]])),
           }),
           merge: (persistedState, currentState) => ({
             ...currentState,
@@ -182,6 +209,7 @@ export const useAppStore = create(
 
 export const useAppSelectors = {
   themeName: (state) => state.themeName,
+  profile: (state) => state.profile,
   
   projects: (state) => state.projects,
   clients: (state) => state.clients,

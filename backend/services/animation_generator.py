@@ -300,6 +300,8 @@ class AnimationGenerator:
 
             # Use a vision model — try gemma4 first
             vision_models = ["gemma4:e4b", "llava:7b", "moondream:latest"]
+            from backend.utils.ollama_resource_manager import think_payload
+
             for model in vision_models:
                 try:
                     response = ollama.chat(
@@ -310,12 +312,12 @@ class AnimationGenerator:
                             "images": [img_b64],
                         }],
                         options={"num_predict": 150, "temperature": 0.3},
+                        **think_payload(model),
                     )
                     text = response.get("message", {}).get("content", "").strip()
                     if text and len(text) > 20:
-                        # Strip any thinking tags
-                        import re
-                        text = re.sub(r'<think>[\s\S]*?</think>\s*', '', text).strip()
+                        from backend.utils.inline_reasoning import split_inline_reasoning
+                        text = split_inline_reasoning(text)[1]
                         return text
                 except Exception:
                     continue

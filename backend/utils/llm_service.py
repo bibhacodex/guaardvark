@@ -59,7 +59,14 @@ def _safe_content(message) -> Optional[str]:
         return None
 
 
-def get_llm_instance(model: Optional[str] = None) -> Optional[LLM]:
+def get_llm_instance(
+    model: Optional[str] = None,
+    thinking: Optional[bool] = None,
+    request_timeout: Optional[float] = None,
+    json_mode: bool = False,
+    num_ctx: Optional[int] = None,
+    num_predict: Optional[int] = None,
+) -> Optional[LLM]:
     """Return the active LLM, or a per-call Ollama bound to `model`.
 
     `model=None` (the default) preserves the historical behavior: cloud
@@ -70,34 +77,55 @@ def get_llm_instance(model: Optional[str] = None) -> Optional[LLM]:
     a DIFFERENT model than the proposer (same-model judging is
     self-confirmation bias). Cloud routing is deliberately skipped for
     explicit local model requests.
+
+    `thinking` is only meaningful with an explicit `model`. Left unset, a
+    thinking-capable model gets thinking off (`build_ollama` decides from the
+    model's capabilities); `True` asks for reasoning; `None` passed on purpose
+    keeps the model's own default. Thinking-capable models reason by default,
+    and for mechanical work that burned 2-4k reasoning tokens per call, enough
+    to blow the request timeout and to return no visible answer at all.
+
+    `request_timeout` (seconds) also only applies to an explicit `model`.
+    The default caps at 180s so an interactive caller fails fast; batch
+    callers with genuinely long prompts pass their own.
+
+    `json_mode` asks Ollama for `format: "json"`: syntactically valid JSON
+    guaranteed by the server, without the field-level grammar of a JSON
+    schema (which measurably degraded extraction quality on qwen3.5:9b).
+
+    `num_ctx` (explicit `model` only) fixes the request's context window so a
+    caller that sized its prompt to a budget gets that budget from the server
+    instead of the server default.
+
+    `num_predict` (explicit `model` only) caps the tokens generated per call,
+    so a model that wanders never runs the context window to its end.
     """
     if model:
         try:
-            from backend.config import OLLAMA_BASE_URL
-            from llama_index.llms.ollama import Ollama
-            return Ollama(
-                model=model,
+            from backend.config import LLM_REQUEST_TIMEOUT, OLLAMA_BASE_URL
+            from backend.utils.ollama_resource_manager import build_ollama
+            timeout = (
+                float(request_timeout)
+                if request_timeout
+                else min(LLM_REQUEST_TIMEOUT, 180.0)
+            )
+            # build_ollama bounds the context window when the caller sets none
+            # and mirrors an explicit one into additional_kwargs itself.
+            extra_kwargs = {"context_window": int(num_ctx)} if num_ctx else {}
+            if num_predict:
+                extra_kwargs["additional_kwargs"] = {"num_predict": int(num_predict)}
+            if thinking is not None:
+                extra_kwargs["thinking"] = bool(thinking)
+            return build_ollama(
+                model,
                 base_url=OLLAMA_BASE_URL,
-                request_timeout=120.0,
+                request_timeout=timeout,
+                json_mode=bool(json_mode),
+                **extra_kwargs,
             )
         except Exception as e:
             logger.warning("Per-model LLM construction failed for %r: %s", model, e)
             return None
-
-    # Cloud provider routing: when the master cloud toggle is on AND a cloud
-    # provider (e.g. Mistral) is the active selection, hand back a cloud-backed
-    # LlamaIndex LLM so every .chat()/.complete() caller routes to the API.
-    # Resolved per-call (cheap) so the toggle takes effect without a restart.
-    # Falls through to the local Ollama instance otherwise (and on any error).
-    try:
-        from backend.services import llm_provider as _llm_provider
-        if _llm_provider.is_mistral_active():
-            from backend.services import mistral_provider
-            cloud_llm = mistral_provider.make_llamaindex_llm(_llm_provider.get_mistral_model())
-            if cloud_llm is not None:
-                return cloud_llm  # type: ignore
-    except Exception as e:  # noqa: BLE001 - never let provider logic break LLM access
-        logger.warning("Cloud provider resolution failed, falling back to Ollama: %s", e)
 
     if not current_app:
         logger.error("Flask current_app context not available.")
@@ -382,12 +410,8 @@ def generate_text_basic(llm=None, prompt=None, is_json_response: bool = False):
             f"generate_text_basic: Raw LLM response received (length: {len(content)}). Preview: {content[:100]}"
         )
 
-        # --- Post-processing to remove <think>...</think> blocks ---
-        # Using re.DOTALL to make '.' match newlines, and re.IGNORECASE for the tags.
-        # Non-greedy match .*? is important.
-        cleaned_content = re.sub(
-            r"<think>.*?</think>", "", content, flags=re.DOTALL | re.IGNORECASE
-        )
+        from backend.utils.inline_reasoning import split_inline_reasoning
+        cleaned_content = split_inline_reasoning(content)[1]
 
         if len(cleaned_content) < len(content):
             logger.info(
@@ -449,16 +473,16 @@ def get_default_llm() -> Ollama:
     except Exception as e:
         logger.warning("Failed to get saved active model, using default: %s", e)
 
-    # Adaptive context window based on available resources
-    try:
-        from backend.utils.ollama_resource_manager import compute_optimal_num_ctx
-        num_ctx = compute_optimal_num_ctx(model_name)
-    except Exception as e:
-        logger.warning("Failed to compute adaptive num_ctx, using 8192: %s", e)
-        num_ctx = 8192
+    # Adaptive context window based on available resources. A placeholder
+    # chosen while Ollama is down is re-resolved by refresh_context_window().
+    from backend.utils.ollama_resource_manager import (
+        mark_provisional, resolve_num_ctx_decision, thinking_kwargs,
+    )
+    decision = resolve_num_ctx_decision(model_name)
+    num_ctx = decision.num_ctx
 
     temperature, sampling_kwargs = _default_chat_sampling()
-    return Ollama(
+    llm = Ollama(
         model=model_name,
         base_url=OLLAMA_BASE_URL,
         request_timeout=timeout_value,
@@ -466,7 +490,10 @@ def get_default_llm() -> Ollama:
         context_window=num_ctx,
         keep_alive=get_chat_keep_alive(),  # hardware-aware: ~15m on GPU (don't squat VRAM), resident on CPU
         additional_kwargs={"num_ctx": num_ctx, **sampling_kwargs},
+        **thinking_kwargs(model_name),
     )
+    mark_provisional(llm, decision.resolved)
+    return llm
 
 
 def get_llm_for_startup() -> Ollama:
@@ -520,10 +547,18 @@ def get_llm_for_startup() -> Ollama:
             model_name = installed[0]
             logger.info("Falling back to first installed model '%s'.", model_name)
 
-    # Validate model can be loaded and compute adaptive context window
+    # Validate model can be loaded and compute adaptive context window. When
+    # Ollama cannot describe the model yet, num_ctx is a placeholder that
+    # refresh_context_window() replaces on first use.
+    from backend.utils.ollama_resource_manager import mark_provisional, thinking_kwargs
+    resolved = False
     try:
-        from backend.utils.ollama_resource_manager import validate_model_before_load
+        from backend.utils.ollama_resource_manager import (
+            model_info_available,
+            validate_model_before_load,
+        )
         safe, reason, num_ctx = validate_model_before_load(model_name)
+        resolved = model_info_available(model_name)
         if not safe:
             logger.warning(
                 "Model '%s' may not fit in available memory: %s. Using minimum context.",
@@ -546,8 +581,14 @@ def get_llm_for_startup() -> Ollama:
         context_window=num_ctx,
         keep_alive=get_chat_keep_alive(),  # hardware-aware: ~15m on GPU (don't squat VRAM), resident on CPU
         additional_kwargs={"num_ctx": num_ctx, **sampling_kwargs},
+        **thinking_kwargs(model_name),
     )
-    logger.info("Loaded LLM '%s' with num_ctx=%d in %.2fs", model_name, num_ctx, time.time() - start)
+    mark_provisional(llm, resolved)
+    logger.info(
+        "Loaded LLM '%s' with num_ctx=%d%s in %.2fs",
+        model_name, num_ctx, "" if resolved else " (placeholder, model info unavailable)",
+        time.time() - start,
+    )
     return llm
 
 
@@ -564,7 +605,7 @@ def get_default_embed_model():
     logger.info("Initializing embedding model")
 
     try:
-        from backend.config import get_active_embedding_model
+        from backend.config import get_active_embedding_model, get_embedding_keep_alive
         from llama_index.embeddings.ollama import OllamaEmbedding
 
         model_name = get_active_embedding_model()
@@ -574,7 +615,9 @@ def get_default_embed_model():
             model_name=model_name,
             base_url=OLLAMA_BASE_URL,
             ollama_additional_kwargs={"mirostat": 0},
-            keep_alive=0,  # Unload after use to free VRAM for chat
+            # A short idle TTL: consecutive queries reuse the loaded model instead of
+            # paying a cold load each, and VRAM still frees between sessions.
+            keep_alive=get_embedding_keep_alive(),
         )
         return embed_model
 
@@ -678,12 +721,14 @@ def load_active_llm() -> Ollama:
                 if saved_model in names:
                     logger.info("Loading previously active model: %s", saved_model)
                     timeout_value = min(LLM_REQUEST_TIMEOUT, 180.0)
-                    # Adaptive context window
-                    try:
-                        from backend.utils.ollama_resource_manager import compute_optimal_num_ctx
-                        num_ctx = compute_optimal_num_ctx(saved_model)
-                    except Exception:
-                        num_ctx = 8192
+                    # Adaptive context window; a placeholder is re-resolved later
+                    from backend.utils.ollama_resource_manager import (
+                        mark_provisional,
+                        resolve_num_ctx_decision,
+                        thinking_kwargs,
+                    )
+                    decision = resolve_num_ctx_decision(saved_model)
+                    num_ctx = decision.num_ctx
                     temperature, sampling_kwargs = _default_chat_sampling()
                     llm = Ollama(
                         model=saved_model,
@@ -693,7 +738,9 @@ def load_active_llm() -> Ollama:
                         context_window=num_ctx,
                         keep_alive=get_chat_keep_alive(),  # hardware-aware: ~15m GPU / resident CPU (no 24h squat)
                         additional_kwargs={"num_ctx": num_ctx, **sampling_kwargs},
+                        **thinking_kwargs(saved_model),
                     )
+                    mark_provisional(llm, decision.resolved)
                     llm.complete("Test.")
                     return llm
                 else:

@@ -16,14 +16,64 @@ from typing import Any
 # Family sampling + canvas (PoA image gen unification §4).
 # Z-Image Turbo: official HF recipe is num_inference_steps=9 (→ 8 DiT forwards),
 # guidance_scale=0.0 (CFG distilled out).
-_FAMILY_DEFAULTS: dict[str, dict[str, Any]] = {
-    "zimage": {"width": 1024, "height": 1024, "steps": 9, "guidance": 0.0},
-    "krea2-turbo": {"width": 1024, "height": 1024, "steps": 8, "guidance": 0.0},
-    "krea2-raw": {"width": 1024, "height": 1024, "steps": 52, "guidance": 3.5},
-    "sdxl": {"width": 1024, "height": 1024, "steps": 25, "guidance": 7.0},
-    "sd": {"width": 512, "height": 512, "steps": 20, "guidance": 7.5},
-    "flux": {"width": 1024, "height": 1024, "steps": 28, "guidance": 3.5},
-}
+#
+# prompt_style says what kind of text the family's encoder was trained on, and
+# therefore what the product may add to a person's prompt:
+#   "tags"    CLIP-era models (SD 1.5 / SDXL). Comma-separated quality and
+#             anatomy tags are how these were captioned, so appending them helps.
+#   "natural" LLM text encoders (Z-Image: Qwen3). Trained on prose captions; the
+#             model card asks for long natural-language descriptions and states
+#             that negative prompts have no effect (CFG-distilled). Tag suffixes
+#             are read as scene content: measured 2026-09-07 on this box, "full
+#             body shot, realistic stance, correct anatomy, ..." appended to
+#             "A man and woman watching a movie on a couch" produced posed,
+#             camera-facing figures with tangled legs on 4/4 seeds, while the
+#             same seeds with the bare sentence or a prose rewrite were clean.
+#             Natural families get an LLM rewrite (media_director) or nothing.
+# Krea 2 also uses an LLM encoder (Qwen3-VL per its model_index) but has not
+# been A/B'd here yet, so it keeps "tags" until it is.
+
+
+def _build_family_defaults() -> dict[str, dict[str, Any]]:
+    """The caller-side defaults per sampling family, from the registry rows
+    (media_model_registry.IMAGE_FAMILY_SPECS / IMAGE_MODEL_LIMITS, where the
+    measurements behind each number are recorded)."""
+    from backend.services.image_render_limits import defaults_for
+
+    table: dict[str, dict[str, Any]] = {}
+    for key in ("zimage", "krea2-turbo", "krea2-raw", "sdxl", "sd", "flux"):
+        d = defaults_for(key, strict=False)
+        entry: dict[str, Any] = {}
+        if d["min_steps"] is not None:
+            entry["min_steps"] = int(d["min_steps"])
+        entry.update({"width": d["width"], "height": d["height"], "steps": d["steps"],
+                      "guidance": d["guidance"], "prompt_style": d["prompt_style"]})
+        table[key] = entry
+    return table
+
+
+# min_steps: the no-bad-knob floor for steps a default or an agent chose; only
+# families with a measured floor carry one.
+_FAMILY_DEFAULTS: dict[str, dict[str, Any]] = _build_family_defaults()
+
+# Generator-side family names (OfflineImageGenerator._model_family) that do not
+# carry the turbo/raw split used above.
+_GENERATOR_FAMILY_ALIASES = {"krea2": "krea2-turbo"}
+
+
+def prompt_style_for_family(family: str | None) -> str:
+    """'natural' or 'tags' for a stills family name from either naming scheme."""
+    fam = (family or "").strip().lower()
+    fam = _GENERATOR_FAMILY_ALIASES.get(fam, fam)
+    entry = _FAMILY_DEFAULTS.get(fam)
+    if not entry:
+        return "tags"
+    return str(entry.get("prompt_style", "tags"))
+
+
+def prompt_style(model: str | None = "auto") -> str:
+    """'natural' or 'tags' for a catalog key / HF id / auto."""
+    return prompt_style_for_family(model_family(model))
 
 # When callers still ship classic SD-era "unset" markers, treat as None so
 # family defaults win for modern models.
@@ -61,17 +111,24 @@ def resolve_stills_defaults(
     width: int | None = None,
     height: int | None = None,
     steps: int | None = None,
+    steps_explicit: bool = False,
     guidance: float | None = None,
     replace_legacy_sd_markers: bool = True,
 ) -> dict[str, Any]:
-    """Return resolved {model, family, width, height, steps, guidance}.
+    """Return family defaults and sampling provenance, applying any measured floor.
 
     Explicit non-None values are kept unless ``replace_legacy_sd_markers`` is
     True and the value is the classic 512/20/7.5 placeholder (then family wins
-    for modern families).
+    for modern families). ``steps_explicit`` preserves typed steps, including
+    legacy markers, and bypasses the floor.
     """
     family = model_family(model)
     base = dict(_FAMILY_DEFAULTS.get(family) or _FAMILY_DEFAULTS["sd"])
+    from backend.services.image_render_limits import defaults_for, strict_limits_enabled
+    if strict_limits_enabled():
+        # The model's own starting point (sdxl-turbo 4/0.0, not SDXL's 25/7.0).
+        own = defaults_for(model, strict=True)
+        base.update({k: own[k] for k in ("width", "height", "steps", "guidance")})
 
     # Classic "unset" form: all three SD-era placeholders together. Intentional
     # draft sizes (e.g. 512² with Turbo steps/CFG) must NOT be rewritten.
@@ -95,23 +152,35 @@ def resolve_stills_defaults(
             return int(base[key])
         return int(val)
 
+    # Steps and guidance follow the same rule as size: only the complete
+    # 512/20/7.5 triple is an "unset" marker. A lone 20 steps (SDXL Fast preset)
+    # or 7.5 guidance (SDXL High) is a value somebody chose and must survive.
     def _pick_steps(val: int | None) -> int:
-        if val is None:
+        if val is None or int(val) <= 0:
             return int(base["steps"])
-        if replace_legacy_sd_markers and int(val) == _LEGACY_STEPS and family != "sd":
+        if full_legacy_unset and not steps_explicit and int(val) == _LEGACY_STEPS:
             return int(base["steps"])
         return int(val)
 
     def _pick_guidance(val: float | None) -> float:
         if val is None:
             return float(base["guidance"])
-        if (
-            replace_legacy_sd_markers
-            and abs(float(val) - _LEGACY_GUIDANCE) < 1e-6
-            and family != "sd"
-        ):
+        if full_legacy_unset and abs(float(val) - _LEGACY_GUIDANCE) < 1e-6:
             return float(base["guidance"])
         return float(val)
+
+    resolved_steps = _pick_steps(steps)
+    floor = base.get("min_steps")
+    floor = int(floor) if floor is not None else None
+    notice = None
+    if floor is not None and resolved_steps < floor and not steps_explicit:
+        label = {
+            "zimage": "Z-Image Turbo", "krea2-turbo": "Krea 2 Turbo",
+            "krea2-raw": "Krea 2 Raw", "sdxl": "SDXL",
+            "sd": "Stable Diffusion", "flux": "FLUX",
+        }[family]
+        notice = f"{label} needs at least {floor} steps; raised {resolved_steps} to {floor}."
+        resolved_steps = floor
 
     resolved_model = (model or "auto").strip() or "auto"
     return {
@@ -119,7 +188,10 @@ def resolve_stills_defaults(
         "family": family,
         "width": _pick_size(width, "width"),
         "height": _pick_size(height, "height"),
-        "steps": _pick_steps(steps),
+        "steps": resolved_steps,
+        "steps_requested": steps,
+        "steps_floor": floor,
+        "steps_notice": notice,
         "guidance": _pick_guidance(guidance),
     }
 

@@ -255,23 +255,20 @@ def list_models():
     models_data = get_available_ollama_models(use_cache=True, force_refresh=force_refresh)
     if isinstance(models_data, dict) and models_data.get("error"):
         if models_data.get("offline"):
-            return success_response(
-                "Ollama offline",
-                {"models": [], "ollama_offline": True},
-            )
+            return success_response({"models": [], "ollama_offline": True}, "Ollama offline")
         return error_response(models_data["error"], 502, "OLLAMA_ERROR")
     logger.info(f"Returning {len(models_data)} available models from Ollama.")
-    return success_response("Models retrieved", {"models": models_data})
+    return success_response({"models": models_data}, "Models retrieved")
 
 
 @model_bp.route("/loaded", methods=["GET"])
 def list_loaded_models():
     """API endpoint to list currently loaded models in Ollama memory."""
     loaded = get_loaded_models()
-    return success_response("Loaded models retrieved", {
+    return success_response({
         "models": loaded,
         "count": len(loaded)
-    })
+    }, "Loaded models retrieved")
 
 
 @model_bp.route("/unload", methods=["POST"])
@@ -284,11 +281,11 @@ def unload_models():
     if unload_all:
         keep_model = data.get("keep")
         count = unload_all_except(keep_model)
-        return success_response(f"Unloaded {count} models", {"unloaded_count": count})
+        return success_response({"unloaded_count": count}, f"Unloaded {count} models")
     elif model_name:
         success = unload_model_from_ollama(model_name)
         if success:
-            return success_response(f"Unloaded model {model_name}", {"model": model_name})
+            return success_response({"model": model_name}, f"Unloaded model {model_name}")
         else:
             return error_response(f"Failed to unload model {model_name}", 500, "UNLOAD_FAILED")
     else:
@@ -310,11 +307,11 @@ def list_vision_models():
         vision_models = get_available_vision_models()
         
         logger.info(f"Returning {len(vision_models)} vision models")
-        return success_response("Vision models retrieved", {
+        return success_response({
             "vision_models": vision_models,
             "count": len(vision_models),
             "cache_refreshed": force_refresh
-        })
+        }, "Vision models retrieved")
         
     except Exception as e:
         logger.error(f"Error listing vision models: {e}", exc_info=True)
@@ -330,10 +327,10 @@ def check_vision_capability(model_name):
         is_vision_capable = is_vision_model(model_name)
         
         logger.debug(f"Vision capability check for '{model_name}': {is_vision_capable}")
-        return success_response("Vision capability checked", {
+        return success_response({
             "model_name": model_name,
             "is_vision_capable": is_vision_capable
-        })
+        }, "Vision capability checked")
         
     except Exception as e:
         logger.error(f"Error checking vision capability for '{model_name}': {e}", exc_info=True)
@@ -353,7 +350,7 @@ def get_current_model():
             logger.info(
                 f"Returning current active model from LlamaIndex Settings: {model_name}"
             )
-            return success_response("Current model retrieved", {"model": model_name})
+            return success_response({"model": model_name}, "Current model retrieved")
         else:
             llm_from_config = current_app.config.get("LLAMA_INDEX_LLM")
             if llm_from_config and hasattr(llm_from_config, "model"):
@@ -361,7 +358,7 @@ def get_current_model():
                 logger.warning(
                     f"LLM not found in Settings, returning model from app config: {model_name}"
                 )
-                return success_response("Current model retrieved", {"model": model_name})
+                return success_response({"model": model_name}, "Current model retrieved")
             else:
                 logger.error(
                     "Could not determine active model from Settings or app config."
@@ -390,7 +387,7 @@ def model_health():
     except requests.RequestException as e:
         logger.error("Model health check failed: %s", e)
         return error_response(str(e), 503, "HEALTH_CHECK_FAILED")
-    return success_response("Model health checked", {"active_model": model_name, "available": available})
+    return success_response({"active_model": model_name, "available": available}, "Model health checked")
 
 
 @model_bp.route("/status", methods=["GET"])
@@ -474,7 +471,7 @@ def model_status():
         }
 
         logger.info(f"Model status: {status_data}")
-        return success_response("Model status retrieved", status_data)
+        return success_response(status_data, "Model status retrieved")
 
     except Exception as e:
         logger.error(f"Error getting model status: {e}", exc_info=True)
@@ -568,7 +565,7 @@ def get_resources():
         pass
     logger.debug("RESOURCES: router check done (stats=%s)", "present" if router_stats else "none")
 
-    return success_response("Resources retrieved", {
+    return success_response({
         "gpu": {
             "total_mb": round(gpu_total),
             "used_mb": round(gpu_used),
@@ -582,7 +579,7 @@ def get_resources():
         "loaded_models": loaded_summary,
         "embedding_model": embed_model_name,
         "embedding_router": router_stats,
-    })
+    }, "Resources retrieved")
 
 
 @model_bp.route("/embedding/list", methods=["GET"])
@@ -637,13 +634,57 @@ def list_embedding_models():
     }, "Embedding models retrieved")
 
 
+def _embed_dim_of(embed_model) -> "int | None":
+    """Vector width of an embed model already bound in app config, or None.
+
+    RouterEmbeddingAdapter exposes ``embed_dim`` (backed by ``_cached_embed_dim``);
+    a bare OllamaEmbedding has no stored width, so it is probed with one short
+    string. The caller compares this with the incoming model's width to decide
+    whether the index survives the switch.
+    """
+    if embed_model is None:
+        return None
+    # Stored widths first. The adapter's ``embed_dim`` property is consulted
+    # last because it answers 4096 when nothing is cached, which would mask a
+    # real change.
+    for attr in ("_cached_embed_dim", "_embed_dim"):
+        try:
+            value = getattr(embed_model, attr, None)
+        except Exception:
+            value = None
+        if isinstance(value, int) and value > 0:
+            return value
+    router = getattr(embed_model, "_router", None)
+    if router is not None:
+        try:
+            value = router.embed_dim
+            if isinstance(value, int) and value > 0:
+                return value
+        except Exception:
+            pass
+    try:
+        return len(embed_model.get_text_embedding("dimension probe"))
+    except Exception:
+        pass
+    try:
+        value = getattr(embed_model, "embed_dim", None)
+        if isinstance(value, int) and value > 0:
+            return value
+    except Exception:
+        pass
+    return None
+
+
 @model_bp.route("/embedding/set", methods=["POST"])
 def set_embedding_model():
     """Switch the active embedding model at runtime.
 
-    This reinitializes the EmbeddingRouter singleton and updates the
-    LlamaIndex embed model stored in app config. Existing indexes
-    keep their vectors — only new embeddings use the new model.
+    Reinitializes the EmbeddingRouter singleton and the LlamaIndex embed model
+    in app config. If the new model's vector width differs from the previous
+    one the existing index is unusable: the JSON store is deleted (simple
+    backend) and the in-memory index is reset so pgvector binds a fresh table
+    for the new width. Either way the caller must re-index. Same width keeps
+    the index.
     """
     data = request.get_json() or {}
     model_name = data.get("model")
@@ -674,6 +715,10 @@ def set_embedding_model():
         embed_dim = len(test_vec)
         logger.info(f"Embedding model '{model_name}' produces {embed_dim}-dim vectors")
 
+        # Read the outgoing model's width BEFORE anything below replaces it in
+        # app config; reading it afterwards compares the new model with itself.
+        prev_dim = _embed_dim_of(current_app.config.get("LLAMA_INDEX_EMBED_MODEL"))
+
         # Reset the EmbeddingRouter singleton so it picks up the new model
         try:
             from backend.utils.embedding_router import EmbeddingRouter, RouterEmbeddingAdapter
@@ -695,21 +740,9 @@ def set_embedding_model():
         except Exception:
             pass
 
-        # Only clear vector store if embedding dimension actually changed
-        # Models with the same dimension are interchangeable without reindexing
-        prev_dim = None
-        try:
-            prev_embed = current_app.config.get("LLAMA_INDEX_EMBED_MODEL")
-            if prev_embed:
-                prev_dim = getattr(prev_embed, '_embed_dim', None)
-                if prev_dim is None:
-                    # Try to get from router
-                    router_obj = getattr(prev_embed, '_router', None)
-                    if router_obj:
-                        prev_dim = getattr(router_obj, '_embed_dim', None)
-        except Exception:
-            pass
-
+        # Models with the same width are interchangeable without reindexing.
+        # An unknown previous width is treated as changed: keeping an index of
+        # unknown width would be the mixed-dimension store this guards against.
         dimension_changed = prev_dim is None or prev_dim != embed_dim
         if dimension_changed:
             try:
@@ -724,15 +757,18 @@ def set_embedding_model():
                         cleared_files.append(fname)
                 if cleared_files:
                     logger.info(f"Cleared vector store files — dimension changed: {prev_dim} → {embed_dim}: {cleared_files}")
-                    # Reset in-memory index so it rebuilds fresh on next use
-                    try:
-                        import backend.services.indexing_service as idx_svc
-                        idx_svc.index = None
-                        idx_svc.storage_context = None
-                    except Exception:
-                        pass
             except Exception as vs_err:
                 logger.warning(f"Failed to clear vector store: {vs_err}")
+            # Drop the in-memory index whatever the backend. pgvector names its
+            # table by width, so a live index would keep writing to the old
+            # table with the old width until the next process start.
+            try:
+                import backend.services.indexing_service as idx_svc
+                idx_svc.index = None
+                idx_svc.storage_context = None
+            except Exception:
+                pass
+            logger.info(f"Embedding dimension changed {prev_dim} → {embed_dim}: index reset, re-index required")
         else:
             logger.info(f"Embedding dimension unchanged ({embed_dim}d) — keeping existing index")
 
@@ -748,11 +784,12 @@ def set_embedding_model():
         except Exception as e:
             logger.warning(f"Failed to persist embedding model to DB: {e}")
 
-        return success_response(f"Embedding model switched to {model_name}", {
+        return success_response({
             "model": model_name,
             "dimensions": embed_dim,
+            "previous_dimensions": prev_dim,
             "index_cleared": dimension_changed,
-        })
+        }, f"Embedding model switched to {model_name}")
 
     except Exception as e:
         logger.error(f"Failed to switch embedding model: {e}", exc_info=True)
@@ -799,13 +836,15 @@ def switch_active_model(new_model_name: str):
 
     # Load NEW model FIRST — old model stays as fallback until new one is confirmed
     logger.info(f"Creating new Ollama instance for model: {new_model_name} (num_ctx={num_ctx})")
+    from backend.utils.ollama_resource_manager import thinking_kwargs
     new_llm = Ollama(
         model=new_model_name,
         base_url=OLLAMA_BASE_URL,
         request_timeout=120.0,
         temperature=0.4,
         context_window=num_ctx,
-        additional_kwargs={"num_ctx": num_ctx, "top_p": 0.8, "top_k": 30}
+        additional_kwargs={"num_ctx": num_ctx, "top_p": 0.8, "top_k": 30},
+        **thinking_kwargs(new_model_name),
     )
     new_llm.complete("Test.")
     logger.info(f"Successfully created and tested Ollama instance for {new_model_name}")
@@ -1011,13 +1050,15 @@ def _switch_model_background(app, new_model_name: str):
 
             # --- Load NEW model FIRST (old model stays as fallback) ---
             logger.info(f"Creating new Ollama instance for model: {new_model_name} (num_ctx={num_ctx})")
+            from backend.utils.ollama_resource_manager import thinking_kwargs
             new_llm = Ollama(
                 model=new_model_name,
                 base_url=OLLAMA_BASE_URL,
                 request_timeout=300.0,
                 temperature=0.4,
                 context_window=num_ctx,
-                additional_kwargs={"num_ctx": num_ctx, "top_p": 0.8, "top_k": 30}
+                additional_kwargs={"num_ctx": num_ctx, "top_p": 0.8, "top_k": 30},
+                **thinking_kwargs(new_model_name),
             )
 
             socketio.emit("model_switch", {

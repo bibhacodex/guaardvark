@@ -406,6 +406,7 @@ class BrainState:
         from backend.utils.llm_service import get_default_llm
         from backend.utils.ollama_resource_manager import (
             is_vision_model,
+            model_supports_thinking,
             model_supports_tools,
         )
 
@@ -413,14 +414,10 @@ class BrainState:
         model_name = getattr(self.llm, "model", "unknown")
         self.active_model = model_name
 
-        # Thinking model detection (matches unified_chat_engine.py patterns)
-        thinking_patterns = ["deepseek-r1", "thinking", "gemma4", "gemma-4"]
-        is_thinking = any(p in model_name.lower() for p in thinking_patterns)
-
         self.model_caps = ModelCapabilities(
             name=model_name,
             supports_native_tools=model_supports_tools(model_name),
-            is_thinking_model=is_thinking,
+            is_thinking_model=model_supports_thinking(model_name),
             is_vision_model=is_vision_model(model_name),
             context_window=getattr(self.llm, "context_window", 8192),
         )
@@ -445,9 +442,11 @@ class BrainState:
         """Pre-render system prompt prefix templates (live blocks filled at request time)."""
 
         persona = ""
+        self.persona_rule_id = None
         try:
-            from backend.utils.chat_utils import get_active_system_prompt
-            persona = get_active_system_prompt() or ""
+            from backend.utils import chat_utils
+            persona = chat_utils.get_active_system_prompt() or ""
+            self.persona_rule_id = chat_utils.LAST_PERSONA_RULE_ID if persona else None
         except Exception:
             pass
 
@@ -532,10 +531,15 @@ class BrainState:
 
         desktop_block = ""
         try:
-            from backend.services.agent_control_service import AgentControlService
-            desktop = AgentControlService._get_desktop_state()
-            if desktop:
-                desktop_block = f"Agent virtual screen state:\n{desktop}\n\n"
+            from backend.utils.platform import screen_agent_available
+
+            # Off Linux there is no agent screen; querying it only puts
+            # "query failed" in the prompt, which small models repeat back.
+            if screen_agent_available():
+                from backend.services.agent_control_service import AgentControlService
+                desktop = AgentControlService._get_desktop_state()
+                if desktop:
+                    desktop_block = f"Agent virtual screen state:\n{desktop}\n\n"
         except Exception:
             pass
 
@@ -663,6 +667,7 @@ class BrainState:
             try:
                 import requests
                 from backend.config import OLLAMA_BASE_URL
+                from backend.utils.ollama_resource_manager import request_options
                 # Use Ollama's canonical warmup primitive instead of llama_index
                 # chat(): the latter's httpx stack silently timed out on slow
                 # hardware even though Ollama itself was making progress. 15-min
@@ -673,7 +678,8 @@ class BrainState:
                         "model": self.active_model,
                         "prompt": "ok",
                         "stream": False,
-                        "options": {"num_predict": 1},
+                        # Sized like the chat that follows, so this load is the one that serves it.
+                        "options": request_options(self.active_model, num_predict=1),
                         "keep_alive": "30m",
                     },
                     timeout=(10.0, 900.0),

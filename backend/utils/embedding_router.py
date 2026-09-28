@@ -48,7 +48,9 @@ class LatencyTracker:
         self.window_size = window_size
         self.gpu_latencies = deque(maxlen=window_size)
         self.cpu_latencies = deque(maxlen=window_size)
-        self.lock = threading.Lock()
+        # Reentrant: get_stats() holds this and calls get_optimal_split_ratio(),
+        # which takes it again.
+        self.lock = threading.RLock()
 
     def record(self, backend: str, latency_ms: float):
         with self.lock:
@@ -320,6 +322,18 @@ class EmbeddingRouter:
                         if key in model or model in key:
                             self._embed_dim = info["dimensions"]
                             break
+                except Exception:
+                    pass
+
+            # What Ollama reports for the model (<arch>.embedding_length),
+            # for one the table above does not list (mxbai-embed-large: 1024).
+            if self._embed_dim is None:
+                try:
+                    from backend.config import get_active_embedding_model
+                    from backend.services.model_capabilities import capabilities_for
+                    dim = capabilities_for(get_active_embedding_model(), with_vision=False).embedding_dim
+                    if dim > 0:
+                        self._embed_dim = dim
                 except Exception:
                     pass
 

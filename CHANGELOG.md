@@ -1,0 +1,789 @@
+# Changelog
+
+## 2.9.1 — Local-only chat, feedback that teaches, and a start that works offline
+
+- **Chat is local-only again.** The dormant Mistral cloud provider, the `cloud_models_enabled`
+  switch behind it and the `/api/llm/*` endpoints are removed. The switch was off by default and
+  no page rendered it, but the routes were live and unauthenticated, so an install with
+  `MISTRAL_API_KEY` in its environment could be pointed at Mistral by any client that reached the
+  API. Local Mistral-family models served by Ollama are unaffected. Hosted models reach Guaardvark
+  through the MCP server or the opt-in Uncle Claude escalation, neither of which changes chat routing.
+- **`./start.sh` starts offline.** A requirements or lockfile change since the last install no
+  longer makes a working environment count as broken: with no route to the package index the
+  backend starts on the installed packages, and the frontend keeps its `node_modules` instead of
+  letting `npm ci` delete them. The next start with a connection applies the update.
+  `GUAARDVARK_OFFLINE=1` forces the offline path.
+- **Faster launches when nothing changed.** Python bytecode is cleared and the frontend rebuilt
+  only when a fingerprint of the checkout (commit, uncommitted edits, untracked sources, lockfile,
+  build-time `VITE_*` env) changed since the last launch; `./start.sh --clean` forces both. The
+  clear no longer reaches environments named `venv-*` or `.venv`, so Audio Foundry's music
+  environment keeps its library bytecode between launches.
+- **Thumbs teach, and can be taken back.** Every assistant reply records its provenance (request
+  id, tier, model, persona rule, the memories and retrieval sources its prompt used, the recipe a
+  screen task ran, tools). A thumb names its reply by message id; it adjusts the confidence of
+  those memories, counts against the recipe, and records corrections and lessons; a second click
+  withdraws the verdict and reverses what it taught. The caption under the reply says what it
+  taught. Tool cards carry their own thumbs.
+- **Any model can drive the screen.** One resolver answers what a model can do by asking Ollama,
+  not by matching names (10 of the 23 models on the reference box had at least one detector wrong).
+  The user's active model is the brain; when it cannot see, the resolver lends the most accurate
+  measured eye. Each eye's axis order is measured on a known board instead of assumed, calibration
+  and accuracy live in one store, and eyes are ranked by measured accuracy. A correction loop,
+  armed only when the eye's measured accuracy is coarser than the target, re-checks the estimate
+  with a marker before clicking. Offline benchmarking, truth-labelled frame capture and a
+  calibration page back the measurements.
+- **Agent desktop.** Firefox launches on the virtual display with the snap build and its private
+  bus; the floating card is square and chat bubbles have a half-opaque background.
+- **Dependencies.** beautifulsoup4 4.15.0, Flask-Migrate 4.1.0, mss >= 10.2.0, anthropic >= 1.7.0,
+  lucide-react 1.47.0.
+
+- **ComfyUI and the GPU, seven truths.** The plugin's health probe proves the process on :8188 is
+  ours (a stranger's ComfyUI on the port used to read as "running" while every Wan batch failed).
+  Image-batch bookings release through their generator and a video render books the model's
+  VRAM estimate and waits for it before queuing, instead of loading with 1 GB usable and 9.6 GB
+  offloaded. The ComfyUI VRAM reserve is declared per model in the registry (MiniMax H3 5.0 GB,
+  Wan 2.2 14B 1.0 GB, both measured 2026-09-12); the first render of the other family after a
+  launch restarts ComfyUI once with the right reserve, and an explicit
+  `GUAARDVARK_COMFYUI_RESERVE_VRAM` still wins. The plugin start re-reads the
+  `GUAARDVARK_COMFYUI_*` keys from `.env` every time, so a reserve or attention change needs a
+  plugin restart, not a backend restart. A chosen canvas under 1024 on a text-intent prompt is
+  kept and batch metadata records the file's real size. A stop/start cycle brings the ComfyUI
+  plugin back the way it was. The dead-probe limit is a named constant with its reason.
+- **RAG: the index tells the truth.** The unified index manager loads onto the configured pgvector
+  store or refuses, never a fresh empty index over the real one. Repository "architectural
+  summaries" come only from the model: the old import target was an empty stub, so every summary
+  indexed to date was a template; a repository whose model call fails is marked pending, not
+  summarised. Purges report a count and a reason; `list_documents` reports an unavailable count
+  instead of the page length. The context expander is project-scoped. `read_logs` over MCP scrubs
+  machine paths from log lines. (Two audit items were already fixed and are now pinned by tests.)
+- **Attachments are answered, not dropped.** A chat attachment over the declared
+  `CHAT_ATTACHMENT_MAX_BYTES` (16 MB) gets HTTP 413 or a `chat:error` instead of vanishing at the
+  socket buffer; `GET /api/chat/config` reports the limit; the chat page downscales photos before
+  sending (longest edge 2048, JPEG 0.9) and shows the size.
+- **A self-improvement scan can be cancelled.** `POST /api/self-improvement/scans/<id>/cancel`,
+  a `cancelled` status the worker honours at its checkpoints, and a Cancel button that waits for
+  it.
+- **Building a plugin manager no longer builds a second one.** The status snapshot emitter used
+  the process singleton, so any privately constructed manager (a test, a tool) spawned a real-
+  registry manager that probed every install port and ran orphan cleanup; one such run under
+  pytest took down this checkout's ComfyUI. The emitter now uses the manager that broadcasts, and
+  the port-kill path refuses to run under a test.
+- **Docs.** HARDWARE.md and INSTALL.md say the same thing about Apple Silicon (stills and LoRA
+  training verified; ComfyUI video on Metal has no evidence on file); `--fast` is documented as
+  what it gates.
+- **Chat asks before it uses a face.** Putting an attached photo's person into a new scene
+  (`generate_identity`) now pauses on a consent card: approving records consent next to the photo
+  (and under `outputs/consent/` by content hash, so the same image does not ask again), declining
+  ends the turn with a refusal and no render. The chat intercepts no longer grant consent on the
+  user's behalf, and MCP or CLI callers need a recorded consent for the reference image.
+- **Code questions search the code before they read the docs.** When a question mentions the
+  source and `search_codebase` is available, the first prompt carries the code tools and holds the
+  knowledge-base passages back; they are added, labelled secondary, once a code search has run or
+  returned nothing. Other questions are unchanged.
+- **The answer says when it was assembled from tool results.** A reply produced after the tool
+  budget ran out carries an "Assembled from tool results" chip and its own step row.
+- **`guaardvark mcp serve`.** The pip-installed CLI can start the MCP server (stdio, or `--http`)
+  from the checkout it finds; with no checkout it says what it looked for. The README's PyPI
+  paragraph now says what the package does, the package carries keywords, and the README ends with
+  the MCP Registry ownership marker.
+- **The identity tool is on by default.** `generate_identity`, its `/identity` command and the PuLID
+  pack row no longer wait behind `GUAARDVARK_IDENTITY_TOOL=1`; the consent card and the recorded
+  consent are the gate. (Operator-approved 2026-09-19.)
+- **Identity renders keep the face again.** PuLID on FLUX had been contributing nothing: the
+  pinned node stored its face embedding on the model and deleted it in the node's `__del__`,
+  which current ComfyUI fires before the sampler runs, so every render silently ignored the
+  reference at any weight. The shipped patch (`plugins/comfyui/custom_nodes.patches/`) moves the
+  data onto the cloned patcher's `transformer_options`, where the forward reads it on every step.
+  Measured on a synthetic reference (late sixties, white hair, full grey beard): before the fix,
+  weights 1.0, 1.5 and 5.0 gave the same clean-shaven man in his thirties; after it, the default
+  (fp8, weight 1.0, start 0) renders the reference's hair, beard, age and eyes.
+  `generate_with_identity` also takes `weight`, `start_at`, `end_at` and the UNET dtype, and
+  `scripts/experiments/pulid_matrix.py` renders a likeness matrix through the product path.
+- **Small truths.** The maintenance handler's progress-job cleanup runs the real script instead of
+  importing a function that never existed; folder create, upload and document copy answer HTTP 201
+  with a message instead of 200 with `"message": 201`; a Setting's repr redacts secret values; a
+  chat attachment is served at `/api/outputs/edit_inputs/<name>` so the consent card can show it.
+- **The server tells the truth about what it did.** Deleting one image or video batch now removes
+  its document, folder and job-history rows and vectors, not just its folder. Starting a service
+  plugin whose process died no longer answers "already running": the manager probes the health
+  endpoint first and starts it. The Plugins page shows the code-search plugin as running when it
+  runs (it answers `/healthz`, not `/health`). `list_documents` over MCP no longer counts RAPTOR
+  summary nodes as documents. The progress-job cleanup script that three callers invoked, and the
+  health check reported missing, now exists (dry run by default, `--execute` to clean).
+- **A chat turn that runs out of tool iterations answers from what it found.** The engine makes one
+  more call with tools off and marks the reply `synthesized` instead of emitting an empty response.
+- **Credentials stay out of the log.** A failed read or write of a `*_key`, `*_token`, `*_secret` or
+  password setting logs the exception type only; SQLAlchemy would otherwise print the bound value.
+- **File Manager copies files and folders.** New `POST /api/files/folder/<id>/copy` deep-copies a
+  folder into a target (or the root) with `(Copy)` naming; the context-menu actions use it.
+- **Settings and Images page say what they do.** Slash commands defined as rules load again (the
+  rules endpoint returns a bare array). On Z-Image and Krea 2 Turbo the negative prompt and
+  "enhance anatomy" controls are disabled with a note, since those models ignore them, and the
+  auto preset's caption says it stuffs quality tags rather than detecting settings. RAG debug shows
+  the performance metrics it fetched; LoRA strength saves on blur or Enter; the scan dialog can be
+  closed with the scan continuing; the memory merge target is picked from a list, not a prompt.
+- **Tests.** `run_tests.py` runs the whole suite by default (4,077 tests) with `--quick` for the old
+  filter, and its migration check points at the script that exists. `backend/mcp/tests` collects
+  from both the repo root and `backend/`. Twenty-one September test files that had never been run
+  now pass; the image generator exposes `get_status()` with the GPU fault the API reports.
+- **Web pages are read at the passage the question is about.** `fetch_url` and `analyze_website`
+  take an optional `query`; with it, the 2,000-character excerpt is the stretch of the page that
+  holds the most of the question's terms (`backend/utils/text_focus.py`) instead of the top of the
+  page, which on most sites is the navigation. On the Wikipedia page for the aardvark, "what does
+  an aardvark eat" used to return the language menu; it now returns the feeding passage. Without a
+  query nothing changes.
+- **Chat edits photos: Qwen-Image-Edit, inpaint, outpaint, background removal, and a face
+  carried into a new scene.** With a picture attached, chat has `edit_image` (prefers
+  Qwen-Image-Edit 2509 FP8 when installed, then FLUX.1 Kontext, then img2img), `inpaint_image`,
+  `outpaint_image` (grows the canvas and fills it) and `remove_background` (an alpha cut-out),
+  plus `/inpaint`, `/outpaint` and `/removebg`. Plain phrasings route on their own ("remove the
+  background", "extend the picture to the left"); "put a hat on this person" stays an edit.
+  `generate_identity` (PuLID on FLUX.1-dev: one face photo, a new scene) is built but off by
+  default: on the reference 16 GB card it returned a younger, dark-haired man for a grey-bearded
+  reference at identity weights 1.0 and 1.5, so it waits behind `GUAARDVARK_IDENTITY_TOOL=1`
+  until the likeness is right. Everything they need installs from **Manage Image Models →
+  Image editing**: one table declares which pack each tool needs, the modal lists the packs with
+  per-row Install and Install all, and a tool without its pack answers one sentence naming that
+  modal. Nothing downloads on its own: the PuLID pack now carries the EVA02-CLIP and facexlib
+  files its ComfyUI node used to fetch at first use (the plugin patches the pinned node so it
+  runs on ComfyUI 0.33; its pack is listed only with the flag), and background removal runs the rembg project's u2net / BiRefNet ONNX
+  files through the onnxruntime already shipped, without the rembg package. Measured on a 16 GB
+  card: a 20-step Qwen edit in 108 s (ComfyUI keeps 11.2 GB of the FP8 weights resident and
+  offloads 8.2 GB), a PuLID render in 28 s, a u2net cut-out in 1 s on CPU; the registry's VRAM
+  estimates are those measurements, since the earlier 14 GB guess plus admission headroom
+  refused every edit on that card. Model entries: `qwen-image-edit`, `qwen-image-clip`,
+  `qwen-image-vae`, `pulid-flux`, `pulid-antelopev2`, `eva02-clip`, `facexlib-face`,
+  `bgremove-birefnet`, `bgremove-u2net`. A finished image download is no longer re-announced
+  each time the Image Models modal opens after a restart.
+- **Add new model is a declared family table, and the server checks the paste.** Which
+  architectures a Hugging Face paste can join is now one table (`user_model_families.py`)
+  shared by the Image and Video Add dialogs: Z-Image, Krea 2, SDXL, SD 1.5 and FLUX stills for
+  images (FLUX UNETs and SDXL/FLUX LoRAs install into ComfyUI), Wan, MiniMax, LTX, Hunyuan and
+  CogVideoX for video. A repo the product cannot load (Qwen-Image, SD3, HiDream) is refused by
+  name instead of being filed under SDXL. Look-up reads the licence, gated state, pipeline tag
+  and `model_index.json` class; `hf.co` and `refs/pr/N` revisions parse; dataset and Space
+  URLs are refused. Registering re-inspects the repo on the server (the client's
+  `has_model_index` and file list are no longer trusted, and a file path cannot leave the
+  repo), the same repo and files twice answers 409 with the existing id, and a catalog add
+  succeeds even when the Install could not start. Image installs gained the video downloader's
+  behaviour: persisted status, stall detection that keeps its lock, progress from the real
+  destination folder, already-installed short-circuit. The dialogs share one look-up hook,
+  clear a stale preview when the paste changes, use a radio for a single file, offer a filter
+  for long file lists, show name, family, size and licence before Install, and can add without
+  installing. Remove asks whether to delete the files on both modals; Batch Image has Manage
+  models.
+- **Audio Studio has a Manage models modal, and Generate never downloads weights.** Audio
+  Studio's first Generate used to fetch weights from Hugging Face on its own (ACE-Step 8 GB,
+  the gated Stable Audio Open). Weights now install only from Audio Studio → Manage models
+  (voice, music, FX rows with sizes, per-row Install and Install all missing; the plugin can be
+  started from there), listed and downloaded by the backend so the modal works with the sidecar
+  stopped. The loaders refuse a cache miss and name the modal instead of downloading.
+  Installs fetch only the files the loaders read: Chatterbox is five files (3.3 GB) out of a
+  13.9 GB repo, Stable Audio Open skips its duplicate root checkpoints (5.3 GB of 15.7). MiniMax
+  Music 3 keeps installing into ComfyUI through the same button. Routes:
+  `GET /api/audio-foundry/models`, `POST .../models/download`, `GET .../models/download-status`.
+
+## 2.9.0 — Agent skills, a Claude Code plugin, and MiniMax H3 at its ceiling
+
+229 commits since 2.8.1. A coding agent can drive Guaardvark through fifteen Agent Skills, a
+Claude Code plugin installable from this repository, and an MCP server that behaves the way its
+tools are described. MiniMax H3 is wired through the product, users can add their own Hugging
+Face models, and the Settings page, chat defaults and retrieval were rebuilt or fixed.
+**No database migration.** Python and frontend dependencies changed; the next `./start.sh` sees
+the edited requirement files and reinstalls, and the frontend installs from its lockfile.
+Interconnector clients: Update Now, restart, and rebuild the frontend bundle.
+
+- **Wan 2.2 14B no longer renders black rectangles under ComfyUI's ck attention.** ComfyUI's ck
+  (Comfy Kitchen INT8) attention left NaN patch tokens in Wan 2.2 14B image-to-video latents,
+  which decode as black rectangles: 6 of 9 Lightning renders at 960x544 with the same seed. The
+  same graphs with PyTorch attention had no NaN. The Wan 14B registry entries now declare
+  `attention: "pytorch"`, and the graph adds a `ModelAttentionBackend` after the LoRAs when
+  `GUAARDVARK_COMFYUI_ATTENTION` asks for ck, sage or auto and ComfyUI offers the node; a default
+  launch builds the same graph as before. MiniMax H3, where ck was measured faster with identical
+  frames, keeps it. A failed `/object_info` fetch is no longer cached, so a ComfyUI stopped for
+  another GPU job no longer reads as every node missing until the backend restarts.
+- **Adjust & Retry keeps the speed profile; a profile's LoRAs are not free adapters.** A batch
+  saved its step count but not its speed profile, so reloading a 4-step Lightning batch came back
+  as Standard at 4 steps, and the reload counted those steps as typed, which bypassed Wan's
+  20-step floor. Batches now save `speed_profile` and `style_embedding`, and the reload keeps the
+  stored steps only when `steps_explicit` says a person typed them. The Video Gen page no longer
+  lists a speed profile's LoRAs as adapters, and the backend refuses them with a message naming
+  the profile (`speed_profile_loras` in the registry). Tests: `backend/tests/services/test_wan_speed_profiles.py`.
+- **MCP tools that need the backend reach it over HTTP.** The MCP server has no Flask app, so any
+  tool that touched `db.session`, `current_app` or `flask.request` failed with "Working outside of
+  application context". Those tools now hand their work to the running backend
+  (`backend/utils/backend_http.py`, `POST /api/tools/execute`, two new GET routes for the
+  repository map and dependency graph); Film Crew, music video, bulk CSV, video and animation run
+  in the backend process, and `backend.app` refuses to import inside the MCP server.
+- **The MCP adapter behaves the way its tools are described.** Guard state is per client session;
+  an identical call is refused only while the first is still running, and a tool that keeps
+  failing pauses for 60 s instead of staying blocked. Every tool declares read-only (and
+  destructive where it can discard something), published schemas carry defaults, enums and
+  bounds and arguments are validated before a tool runs, a state-changing call accepts an
+  `idempotency_key`, `resources/list` pages with a cursor, the `/outputs/<path>` download route
+  registers again, and `doctor --call` makes one real read-only call per tool family.
+- **Verbatim prompts shows what the server saved.** The Settings toggle flipped before the save
+  and swallowed a failure; it now disables itself while saving, takes `enabled` and
+  `forced_by_env` from the response, and reports a failed save.
+- **Bring your own Hugging Face models.** Manage Video Models adds a model, LoRA or text encoder
+  from a pasted Hugging Face URL, a text encoder can be picked per generation, and user LoRAs and
+  encoders work on LTX and Hunyuan as well as Wan and MiniMax. The Images page adds Hugging Face
+  image models and LoRAs the same way.
+- **Settings.** The page was rebuilt around what each control does, five settings that reported
+  the wrong state were fixed, the Rules page filters learned rules, each retrieval profile has an
+  editor, and the Workspaces navigation choice writes the value the layout checks for.
+- **Ollama.** Only what `start.sh` started is stopped (`--keep-ollama`, `--all`,
+  `--external-ollama`, with matching Settings switches), and every request carries a context size
+  instead of inheriting the chat model's Modelfile window.
+- **Chat.** A host can hand the engine its conversation and hooks, so an embedded assistant runs
+  the engine's tool loop; Floating Chat messages have a copy-text icon.
+- **Video fixes.** The H3 Turbo 4-step profile no longer refuses the default canvas, the
+  effective-settings chip names the model that will run, the end-frame control says what it does,
+  and a failed task shows its reason instead of sitting at 0 %.
+- **macOS.** AppleDouble sidecar files are stripped, the LoRA venv is created, the backend
+  defaults to port 5055 away from AirPlay Receiver, pgvector builds from source when Homebrew's
+  formula skips the running Postgres major, and Stable Audio Open may try Apple Silicon when
+  opted in.
+- **Interconnector.** `frontend/public`, `VERSION` and `celery_beat_gates.py` now reach clients,
+  with the allowlist guard running in CI.
+- **Dependencies.** OpenCV is locked to 4.11.0.86 across its three distributions (the last line
+  that accepts numpy 1.x; numpy stays on 1.x) and the unused CV stack is gone; Vite 8, Vitest 5,
+  react-grid-layout 2 and zustand 5 on the frontend; `mcp>=2.1.1`, `peft>=0.20.0`,
+  `llama-index-vector-stores-postgres>=0.9.0` and `numba` in the backend.
+
+- **MCP calls no longer hang on a busy GPU, and the MCP server no longer renders.** The MCP server is its own process, and `generate_image` used to load a diffusion pipeline inside it, next to the backend's; a failed result then reached the client as `(no output)` because the adapter dropped `ToolResult.error`. Now the adapter tags calls with `transport=mcp`, and `generate_image` in that context hands the prompt to the backend over its HTTP API (queued by default, returning the batch id in ~10 ms; `wait_for_result=true` polls the backend and returns the file), `get_generation_status` reads any image or video batch back with file URLs (idempotent, so polling is not blocked by the duplicate-call guard), and failed results carry their error text. Inside the backend (chat) the inline render is unchanged. The MCP adapter now runs every tool on a worker thread under the configured timeout (default raised from a never-enforced 30 s to an enforced 120 s; 30 min for a call that asked to wait), answers a timeout with a message that the work is still running, and per-tool argument defaults live in `data/config/mcp.json` `server.tools.argument_defaults`. Tests: `backend/mcp/tests/test_smoke.py`, `backend/tests/unit/test_image_tool_queue.py`.
+- **AGENT_GUIDE.md.** The operating contract for a coding agent that uses Guaardvark: first-interaction rules, Rule Zero (every job goes through a skill), a mandatory preflight that turns the hardware tier into what this box can do, the announce-before-spend / ask-before-switch / no-silent-downgrade contract, the human checkpoints with the route that releases each, how the tools behave over MCP, prompting rules per model family, a quick lookup, what not to do, and a contributor section. `AGENTS.md` becomes the router that points at it.
+- **Claude Code plugin + marketplace.** `.claude-plugin/plugin.json` and `marketplace.json` make the repository installable with `/plugin marketplace add guaardvark/guaardvark` and `/plugin install guaardvark@guaardvark`: the skills load as `/guaardvark:<skill>` and the MCP server starts from the checkout path the install asks for.
+- **Agent skills pack.** `.agents/skills/` carries fifteen Agent Skills (`setup`, `-image`, `-video`, `-music-video`, `-film-crew`, `-voice`, `-music`, `-upscale`, `-cast`, `-models`, `-swarm`, `-knowledge`, `-code`, `-outreach`, `-ops`), each naming the exact MCP tool or REST route for its flow, so a coding agent (Claude Code, Cursor, Codex, OpenClaw) can drive a running Guaardvark without guessing endpoints. `python -m backend.mcp install --skills` links them into `~/.claude/skills`; the pack README is `.agents/skills/README.md`.
+- **Z-Image gets prompts as prose, never as SD-era tags.** A plain sentence such as
+  "a man and woman watching a movie on a couch, her head on his shoulder" was leaving the
+  Images page with 22 phrases appended ("full body shot, realistic stance, correct anatomy,
+  anatomically correct, ..."), boilerplate written for CLIP-captioned SD 1.5. Z-Image's
+  encoder is an LLM and reads those as scene content: on this box the stuffed prompt gave
+  posed, camera-facing figures with tangled legs on four of four seeds, while the bare
+  sentence or a prose rewrite on the same seeds was clean. The 1,400-character anatomy
+  negative was never reaching the model at all (CFG-distilled, guidance 0). Each stills
+  family now declares a `prompt_style` in `backend/services/stills_defaults.py`; for
+  "natural" families the offline enhancer sends the sentence as written (plus one prose
+  clause for a non-photo style), and the default enhance rung becomes the media director's
+  new prose contract, a port of the prompt-enhancer template the model's authors ship with
+  their demo, which falls back to the exact sentence when no chat model answers. Chat and
+  batch share the change; the Images page's prompt preview now resolves "auto" to the
+  default model so it shows the policy that actually runs. Krea 2 keeps tags until it is
+  measured the same way.
+- **The Director asks the active chat model first.** Every Director call (stills rewrite,
+  storyboards, edit refinement, video and music video planning) was hard-wired to
+  `gemma4:e4b`, then any gemma, then whatever was installed, ignoring the model made active
+  on the Settings page. The ladder is now: an explicit per-job model, then the Settings-page
+  model, then any installed gemma, then any installed qwen, then the rest, matched anywhere
+  in the tag so a custom build such as `someone/Gemma-4-custom` counts. Embedding models
+  never qualify. The stills rewrite tries up to three rungs, so a model that errors or hands
+  back the wrong number of prompts is skipped rather than silently dropping to the raw
+  sentence.
+- **The chat can search the code.** `search_codebase` is one tool name for "search this
+  project's source": by meaning or by symbol, returning files, line numbers and the code. With
+  the new zvec-grep plugin (`plugins/zvec_grep`, off by default, Node 22, CPU, everything on
+  the machine) it runs a local vector-plus-keyword index of the checkout; without it, the
+  repository's regex search. Questions about the source keep the tool in the prompt and get
+  one system line saying the code is already indexed. Measured 2026-09-08 on eight questions
+  about this repository with document retrieval off: baseline made no tool calls and
+  answered three with hedges; with the tool every question called it and seven came back
+  naming the right file and function. Four engine fixes came out of the trial and apply to
+  every tool: the result a tool hands back to the model is capped by a budget the tool
+  declares (`BaseTool.observation_chars`) instead of a flat 500 characters that left a search
+  with a header and no code; a tool call written in signature form
+  (`search_codebase(query:string='x')`) is normalised instead of failing as an unknown tool;
+  an MCP server's error result is a failure, not output; and the request's `project_root`
+  reaches tools that need it. Known: with document retrieval on, the model still prefers the
+  documents and rarely reaches for the tool.
+- **Thinking is off unless someone asks for it, everywhere the product talks to Ollama.**
+  The Chat page's "Chat thinking" setting was documented as off by default while the stored
+  value said on, so every reply on this box and on a client's box paid for gemma4's hidden reasoning:
+  the same question measured at 1,163 generated tokens and about 40 s for a 554-character
+  answer with thinking on, 183 tokens and about 10 s for an 858-character answer with it off.
+  Outside the Chat page nothing set the flag at all, and a thinking model given a token cap
+  can spend the whole cap reasoning and hand back an empty answer (the agent's narration
+  fallback, an 800-token call, did exactly that). One predicate now decides which models
+  reason, `model_supports_thinking` in `backend/utils/ollama_resource_manager.py`, by name
+  pattern and then by Ollama's own capabilities list, so qwen3 is covered and a family the
+  list has not met is still caught. `build_ollama` turns thinking off for those models unless
+  the caller passes `thinking` itself; `get_llm_instance(model=...)` accepts `thinking`,
+  `request_timeout`, `json_mode`, `num_ctx` and `num_predict` like a white-label build already
+  did; the model-switch and startup instances, the brain's capability probe, the diagnostics
+  ping and the agent's narration fallback all go through the same helper. The Chat page's
+  per-chat `/thinking on` still wins, and the retry after an Ollama serializer crash now keeps
+  that choice instead of silently reasoning again. Retrieved context handed to the chat model
+  is cut on whitespace (`backend/utils/text_cut.py`): a 500-character slice through "4:12"
+  left "4:1" in a prompt and the model repeated it as fact.
+- **The same answer-only default for every direct Ollama call.** The film crew's
+  screenwriting and consensus calls, the character generator, the video, media and music video
+  directors, the animation steering prompt, the video quality review, the H3 prompt polish, the
+  outreach persona and grader, the natural-language control plane, the lesson distiller, image
+  OCR and the music prompt rewriter each built their own request without a `think` field, so a
+  thinking model could spend a 150- or 400-token cap on reasoning and return nothing to parse.
+  Every one of them now spreads `think_payload(model)`, which is `{"think": false}` for a model
+  that reasons and nothing for any other.
+- **Three chat defects seen on camera 2026-09-05.** A thinking model is prompted with
+  `[tool_call]` markup, but the stream only held back the angle-bracket form, so the raw
+  markup typed into the bubble for a second before the parser consumed it; both forms are
+  held back now, and neither reaches saved history. A reply that echoed the tool list
+  (`search_knowledge_base(query:string, top_k:int?)...`) was non-empty, so the empty-answer
+  retry never fired and the echo became the answer; the turn is now repeated once with
+  thinking off and says plainly if the model echoes again. On the legacy agent-loop and
+  file-generation paths the page appended a second user bubble after the optimistic one and
+  read a `final_answer` that `tool_result` and `file_generation` replies never carry, so a
+  finished CSV was reported as "Agent execution completed with no response"; the bubble is
+  reused and the server now returns the `display_content` it already persisted.
+- **Chat retrieval had been failing on every turn.** The hybrid retriever ran its vector and
+  keyword legs through a nested event loop; inside a request thread the first call died with
+  "Detected nested async" and every later one with asyncpg's "another operation is in
+  progress", so the model answered from memory and told people nothing was indexed while 18
+  documents were. The two legs now run in sequence on the store's synchronous engine
+  (`use_async=False` in `backend/services/indexing_service.py`); a question about the indexed
+  README comes back citing it.
+- **One active video model for every pipeline.** Chat `/video`, `videos generate` in the CLI,
+  batch requests that omit a model, the music video and Film Crew all pick their model through
+  one resolver: an explicit id, else a per-pipeline override, else the global setting at
+  `/api/settings/active_video_model`, else the largest installed model the card can hold. An id
+  that cannot run is refused in one sentence; families are never swapped silently. Omitted fps,
+  frames, steps and canvas fill from the model's declared native values, so the CogVideoX
+  low-VRAM path no longer cuts steps below the model's floor. Note: where the music video and
+  Film Crew editor used to hard-code Wan 2.2 14B I2V, the default now follows the registry,
+  which has been Wan 2.2 5B TI2V since July; pick 14B in the picker or the setting to keep it.
+- **Music video and Film Crew start from chat, the CLI and MCP.** "Make a music video from
+  song.mp3, neon noir" and "film this script …" create the project and start analysis or the
+  screenwriter, then stop at the Studio gate: nothing is approved and no GPU render starts
+  outside Studio. A song path or script path given to those tools must sit under the uploads or
+  outputs directory or the install root. Frame counts snap to each model's declared grid,
+  MiniMax's 17k+5 included.
+- **Paths from a request stay inside the directory they belong to.** One helper,
+  `backend/utils/path_guard.py`, joins caller-supplied names under a server-chosen root and
+  refuses anything that lands outside it; forty call sites (batch video, files, backups,
+  outputs, jobs, uploads, the interconnector, the swarm and video-editor sidecars) now go
+  through it instead of their own `resolve()`/`startswith` checks. Vector-store table names
+  are quoted through psycopg2's `Identifier`, the self-test category is allow-listed before
+  it reaches a subprocess, Audio Foundry proxy replies are always JSON, and the system map
+  and `/build` accept roots inside the running codebase or the uploads directory only.
+  Closes the 280 open code-scanning alerts except the 21 that describe operator-directed
+  browsing of the server's own filesystem, which are dismissed with reasons.
+- **GPU faults are reported as GPU faults.** A CUDA error that kills the context (launch
+  timeout, illegal memory access, device-side assert, uncorrectable ECC and kin) is now
+  recognised in one place. The backend records it, refuses further GPU work immediately
+  instead of retrying it, fails the rest of a running batch without trying each prompt, and
+  tells the user the backend needs a restart. Before this, one driver watchdog reset left
+  every later image request failing for hours with "pipeline failed to load — usually VRAM
+  pressure or an incomplete download". Status reports the fault under `gpu_fault`.
+
+- **Capability contract.** Every video model entry can declare modes (text, first frame,
+  last frame, first+last, reference), audio in and out, whether it samples with CFG, its
+  frame rule and rate, clip bounds, a step floor and default, speed profiles, style
+  embeddings, reference limits, per-VRAM-class starting settings and its license.
+  `model_capabilities()` fills family defaults for older entries; `/api/batch-video/models`
+  exposes the record; the Video Generator, `generate_video`, Film Crew and the music video
+  pipeline read it instead of testing a family name. The step floor now lives in the
+  registry, so API and MCP callers get it too; a value a person typed still wins.
+- **MiniMax H3.** Reference build, unpruned Int8 (24GB) and BF16 (48GB) rungs, the three
+  turbo LoRAs as optional companions behind speed profiles, ten style embeddings, all six
+  aspect ratios, last-frame and first+last-frame modes, image and audio anchors at any
+  frame, and the reference graph (9 images, 3 clips, 3 audio files) with references named
+  in the prompt in wiring order. A prompt compiler renders Guaardvark's structured intent
+  into the model's format (numbered shots with cut times that add up to the clip, speaker
+  ids, tagged dialogue in the model card's eleven languages), with an optional polish pass
+  by the local director model that is discarded if it touches the dialogue. Eight authored
+  prompt presets ship in `plugins/comfyui/scripts/prompt_bundles/minimax_h3`.
+- **Film Crew on H3.** A production can name its video model; on a native-audio model each
+  scene renders as windows of at most fifteen seconds with the cast's lines spoken by the
+  model, joined on the storyboard stills, no voiceover laid over them, the score mixed
+  under the window's own soundtrack. Cast reference images go in as references when the
+  reference build is installed.
+- **Music video on H3.** The clip profile (rate, frame bounds, native audio) comes from the
+  registry; on a native-audio model each cut renders in one pass with the song slice
+  anchored at frame 0 so the motion follows its beats, the song staying the master track.
+- **Chat and MCP.** `generate_video` takes model, aspect ratio, seconds, first and last
+  image, references, audio and a speed profile, each checked against the model's record;
+  the assistant is told the H3 prompt format on video pages. Publishing adds a
+  "Generated with MiniMax H3 on Guaardvark" line to posts that carry H3 clips (opt-out per
+  connection) and enforces a per-platform clip-length cap declared in data.
+- **ComfyUI launch.** `GUAARDVARK_COMFYUI_ATTENTION=auto|ck|sage|pytorch` selects an
+  attention backend (Comfy Kitchen int8 ships in the venv; SageAttention is never
+  installed for you); `GUAARDVARK_COMFYUI_RESERVE_VRAM` raises the reserve a partially
+  loaded model needs. The plugin restart route no longer fails on a missing attribute.
+- **Measured** on a 16 GB RTX 40-series card with 64 GB-class RAM, pruned Int8, 864x480, 124
+  frames (5 s), 20 steps, PyTorch attention: 6.5 minutes wall, about 17 s per step, VRAM
+  peak 14.5 GB with most of the transformer offloaded, ComfyUI resident memory peak 27 GB;
+  the clip was clean. The first attempt ran out of memory at 1 GB of reserve; 3 GB
+  finished. Same seed and canvas: the 8-step turbo profile 186 s with the subject,
+  motion and background intact and slightly softer fur (now the 16 GB starting
+  profile); Comfy Kitchen int8 attention 339 s at 15 s per step with frames
+  indistinguishable from PyTorch (opt-in until the other families are compared). On the
+  turbo profile the 10 s clip took 237 s and the 15 s clip 372 s, both coherent to the
+  end at 480p; those tiers now appear as duration presets. The 1344x768 canvas ran out
+  of memory at a 3 GB reserve and rendered at 5 GB (`GUAARDVARK_COMFYUI_RESERVE_VRAM=5.0`):
+  171 s on the 4-step 768p profile with the transformer fully offloaded. An audio anchor works as a
+  performance track: a 4 s narration anchored at frame 0 came back in the clip's
+  soundtrack with a 0.91 waveform correlation (0.99 on the envelope), rendered in 138 s
+  on the turbo profile.
+
+### CLI
+
+The `guaardvark` command is now a peer of the web UI, not a subset.
+
+- **One command catalog.** Slash router, tab completion, `/help`, and the contract tests
+  share `COMMAND_TREE`. `/imagine`, `/video`, `/voice`, `/ingest`, `/agent`, `/web`,
+  `/load`, `/skills`, and `recipes` complete. Unknown commands get “Did you mean…?”.
+  Completion works without a leading `/`.
+- **Theme-true prompt.** REPL colors follow `/theme` (including `day` and `auto`). Compact
+  banner on short terminals so the 30-row aardvark art does not overflow. Chat prefix is
+  the brand mark, not a llama. `/clear` uses Rich. Config lives in `~/.guaardvark/cli.json`
+  (legacy `~/.llx` still read). `/web` uses the real frontend port from runtime.json.
+- **Studio commands.** `plugins`, `gpu`, `mcp`, `audio`, `swarm`, `lessons` wrap the
+  existing APIs. `guaardvark completion bash|zsh|fish` prints a shell script.
+  `guaardvark doctor --cli` reports terminal graphics / tmux passthrough.
+- **Show the artifact.** `/imagine` previews inline (Kitty / iTerm / chafa). `/voice`
+  plays locally. `/agent shot` dumps the agent desktop. Jobs notify on complete.
+
+## 2.8.1 — Profiles, extensions, and a bootstrap that converges offline
+
+16 commits since 2.8.0. Two product-shaping features — a profile switch and a client
+extension seam — and a set of installer fixes from watching a client box with a flapping
+resolver fail to finish bootstrap for an evening. Nothing in this release changes the
+database or the knowledge index; upgrading is a pull and a restart.
+
+- `start_postgres.sh` takes the role, database, host and port from `DATABASE_URL` and never
+  re-provisions a role it did not create; before this a fork with its own role on the same
+  machine had its password reset and its URL rewritten to the stock database. `start.sh` and
+  the agent display kill only a port's listener, not a process holding a client socket to it.
+  The DSN is logged with its password masked. ComfyUI's liveness probe tolerates ~2 minutes of
+  silence while a 20 GB+ model loads on a 16 GB card (measured downstream), instead of 20 s.
+- **Profiles.** One switch sets the product shape: `GUAARDVARK_PROFILE=<name>` in `.env` or
+  `./start.sh --profile <name>`. `workstation` is today's product and sets nothing;
+  `creator` is the media workflow (image, video, audio, Film Crew, LoRA, upscaling) with the
+  agent, knowledge-index, outreach and automation subsystems left installed but unlisted and
+  off by default; an extension can ship its own. An explicit `.env` value, flag, plugin toggle
+  or DB setting always wins over a profile, and hidden means unlisted, never removed. See
+  `backend/profiles/README.md`. The sidebar lists what the profile lists, `/` lands where it
+  says, Settings → Product Profile switches profiles (applies on restart), and a fresh
+  install asks once — Creator or Workstation — before anything else.
+- **Extensions.** A client vertical lives in `extensions/<id>/` — blueprints, models, Celery
+  tasks, column migrations, seeds, a profile, an optional sidecar plugin — and core loads it
+  through fixed hook points without any core file naming it. A broken extension is reported
+  by id while the others still load, and a declared URL prefix with no mounted route is an
+  error rather than a silent 404. Extensions register handlers for their own task types
+  instead of editing the unified task executor. `extensions/_template/` is the starting point;
+  see `extensions/README.md`. On the frontend, `extensions/<id>/frontend/index.jsx` contributes
+  routes, nav groups, themes, page context, chat surfaces, store state, a header bar and a
+  logo; core merges them at build time and imports for the extension resolve through core's
+  dependencies and the `@` alias.
+- Settings → Maintenance gains **Delete History**, next to Clear Cache: removes every
+  batch-image, batch-video and audio generation — the media directories and files, their
+  `documents`/`folders` rows and `job_history` entries — and logs each purge to
+  `retention_audit`. Batches still generating are skipped. Film Crew productions, video
+  editor projects, the cast library and LoRAs, and chat history are not touched. The audio
+  sidecar gains `DELETE /jobs` so its in-memory job list and its `.jobs` files stay in step.
+- **Bootstrap converges offline.** Every step that contacted a package index even when
+  nothing needed to change is gone or gated: `install_pytorch.sh` probes the venv first
+  and skips the 3 GB torch re-stage when the exact build is already installed
+  (`GUAARDVARK_TORCH_FORCE=1` restores always-reinstall); the torch channel comes from the
+  hardware policy instead of a second table that disagreed with it (cu121 vs cu124 on
+  Ampere/Ada made the reconciler and `start.sh` swap the CUDA stack back and forth); the
+  numpy/setuptools re-pin probes offline (`scripts/lib/venv_pins.sh`) and only reinstalls
+  a violated spec; the cli reconciler skips when the editable install already points at
+  `cli/`; and `system-manager` never creates a venv from a non-3.12 interpreter (Ubuntu
+  26.04's `python3` is 3.14, whose venv compiled numpy from source and failed).
+- Every bootstrap pip pass runs under `backend/constraints.txt` (`PIP_CONSTRAINT`, operator
+  value wins), which now caps `opencv-contrib-python`, `tifffile` and `ml-dtypes` at their
+  last numpy<2 lines. Before this the unconstrained CV pass upgraded numpy to 2.x on every
+  boot and the torch pass dragged it back, looping through a full torch re-stage each time.
+- The CV / face-restoration stack (gfpgan, realesrgan, basicsr, facexlib, controlnet-aux,
+  mediapipe — hundreds of MB) is opt-in with `GUAARDVARK_INSTALL_CV=1` instead of
+  installing on every GPU box. Both consumers import lazily and degrade when it is absent.
+- Two installs on one machine no longer see each other's Celery workers: `start_celery.sh`
+  and `start.sh` count a worker only when its working directory is under this checkout,
+  the same confinement `stop.sh` already applies. The pgvector step distinguishes a
+  missing package from a missing superuser, names the package for the major actually
+  serving, and reads the same configured URL as the role and database do.
+- **Interconnector sync ships every `backend/` package.** The sync allowlist named
+  `backend/` packages one by one, so `backend/profiles` and `backend/extensions` never
+  reached a client while the synced `config.py` / `app.py` already imported them — every
+  client boot after Update Now died with `cannot import name 'extensions' from 'backend'`.
+  The nine missing entries are listed and a test walks the real `backend/` directory so
+  the next new package fails in CI, not on a client.
+- The PyPI project page shows the README again. `setup.py` read `long_description` from the
+  repo root, which the wheel build cannot see; the 2.8.0 wheel published with an empty
+  page. The release build now copies `README.md` into `cli/` the way it already does
+  `VERSION`.
+
+## 2.8.0 — MiniMax H3, a rebuilt knowledge index, and a cleaner clean install
+
+367 commits since 2.7.0. The largest single change is the knowledge index, which was
+rebuilt from the storage layout up and needs one re-index (see the note below). Around
+it: three new video model families, an overnight self-improvement director, Discord
+through the same chat engine as the UI, a privacy audit of every path that could reach
+the network, a platform layer with macOS in CI, and the clean-install bugs a tester
+found on a fresh Windows 11 / WSL2 box.
+
+**This release requires a full re-index of your knowledge base.** Existing vectors were
+built with different chunking and are not migrated. Nothing is lost — your documents are
+the source of truth and are re-read from disk — but plan for the corpus to be
+unavailable while it rebuilds. See *Upgrading the knowledge index* below.
+
+### Clean-install fixes
+
+All three were reported against a fresh install on 2026-08-29 and all three were real:
+
+- **Film Crew failed with `model 'gemma4:e4b' not found`.** The installer's hardware
+  policy pulls `gemma4:e2b` on most machines; the swarm agents hard-coded `e4b`. A chat
+  model name is now a preference resolved against what Ollama actually has — same
+  family first, then the saved active model, then the policy's tier model
+  (`backend/services/ollama_chat_model.py`).
+- **pgvector was never installed.** `start_postgres.sh` provisioned PostgreSQL but not
+  the `vector` extension the index stores into, and enabling it needs a superuser the
+  app role is not. Provisioning now installs `postgresql-<major>-pgvector` (Homebrew
+  `pgvector` on macOS) and runs `CREATE EXTENSION`; existing installs get it on the next
+  start, with one sudo prompt.
+- **LoRA training stopped at `No module named 'peft'`.** Z-Image training runs in the
+  backend venv, which never listed it. It does now.
+
+### Video generation
+
+- **MiniMax H3** — download plan in the video model registry and generation through
+  ComfyUI. It fits a 16 GB card at the template's settings; see *Known limitations*
+  for the speed caveat.
+- **LTX-2.5 distilled** as a local ComfyUI family, with I2V/T2V aligned to the official
+  pipeline for identity preservation, a preflight file check, and the audio VAE
+  registered where the loader actually looks.
+- **HunyuanVideo 13B** T2V/I2V (GGUF Q5_K_M) in the downloader and generator.
+- **Wan 2.2** — quality presets can no longer hand Wan a step count it cannot render
+  (`minSteps` on the model entry, measured against the smearing that 10 steps produced);
+  the 14B's trained sampler shift is fixed at 8.0 by default instead of scaled by pixel
+  area; 1:1 is back; a sampler profile toggle for the 5B (adaptive euler or official
+  uni_pc); 24 fps presets and a Motion preset that reaches the model; guidance comes
+  from the model's own workflow.
+- **Live latent preview** while ComfyUI renders.
+- Long renders survive: VRAM-wait admission, staged progress, a real start budget for
+  the ComfyUI launcher with a loud fallback, and a ComfyUI interrupt scoped to the
+  prompts we queued rather than everything in its queue.
+- A per-family pixel-area clamp prevents hangs; an unsupported aspect ratio is clamped
+  server-side as well as in the UI.
+- The chosen model animates its own keyframe; a failed director pass no longer switches
+  the prompt enhancer off.
+- Video from inline chat (`generate_video` tool), a fullscreen player with prev/next,
+  and a VLM temporal-quality reviewer (MiniCPM-V 4.5).
+
+### Images and the media workspace
+
+- One tabbed media workspace, a route per tab.
+- **Image upscaling**, single and batch.
+- Batch images: clear completed batches from the queue, Adjust & Retry no longer
+  multiplies the prompt by the quantity, prompt auto-detect no longer silently
+  overrides steps (and has a toggle), Z-Image keeps its CFG-free defaults.
+- The hidden SD-1.5 fallback is gone; img2img goes through the same guards as txt2img;
+  large canvases no longer take the desktop down with them; the seed generator builds
+  on CPU when CUDA cannot initialise.
+- Documents: opt-in media gallery, fast streaming PDF viewing and an in-app DOCX viewer.
+
+### Knowledge index
+
+Vectors moved to pgvector, hybrid search is back, and ingest is roughly an order of
+magnitude faster. Measured on the same machine and the same model, ingesting the same
+corpus:
+
+Measured on the same machine and the same model, ingesting the same corpus:
+
+| | before | after |
+|---|---|---|
+| Fixed cost per document | ~3.5 s | **0.02–0.07 s** |
+| Characters embedded per chunk | ~2,230 | **~800** |
+| A 151 KB document | 19.3 s | **6.1 s** |
+| A 2 KB note | 9.3 s | **0.1 s** |
+
+Four things account for most of it:
+
+- **Every chunk was being embedded twice.** The text kept for citations was stored in
+  metadata, and metadata is concatenated ahead of the chunk before embedding — so each
+  chunk was sent to the model as both its text and its own metadata. Roughly half of all
+  embedding work was duplication.
+- **Chunks are sized by what is embedded**, not by what they carry. Chunk size is
+  computed as `size - len(metadata)`, and that metadata is now excluded before splitting
+  rather than after, so a document with a long path and tags no longer loses most of its
+  chunk to text it was never going to embed.
+- **The index no longer rewrites itself on every document.** It kept a JSON copy of every
+  node and rewrote the whole file each time a document was added, so adding one document
+  got slower as the corpus grew. That file is gone.
+- **Garbage collection is amortised** rather than run twice per document. In a process
+  holding the ML stack a full collection costs ~250 ms, which on a small file exceeded
+  parsing, chunking and embedding combined.
+
+Ingest cost is now flat in corpus size: one constant pair of coefficients predicts it
+across a corpus growing from 0 to 703 documents and 36,000 chunks.
+
+#### Keyword search moved into PostgreSQL
+
+The keyword half of hybrid search now queries the full-text index PostgreSQL was already
+maintaining, instead of an in-memory index rebuilt from a JSON file. Retrieval behaviour
+is unchanged in shape — same fusion, same adaptive weighting, same reranking — but it no
+longer depends on a file that had to be rewritten constantly, and it can filter by project
+in SQL rather than after the fact.
+
+Ranking is tuned for how people actually search. Rare words now decide a query: asking for
+a specific name, identifier or error code puts the passage containing it first, instead of
+letting common words in the rest of the question outvote it.
+
+#### Also fixed in the index
+
+- **Client, project and job metadata was never indexed.** Both metadata indexers passed
+  their metadata in a form the indexing layer rejects, so every attempt failed and logged a
+  message that read like a transient problem. They now work.
+- **Uploads went through a lesser pipeline than everything else.** Files uploaded through
+  the UI were read as plain text — a PDF or DOCX arrived as mojibake, markdown was never
+  sectioned, and re-indexing appended a second copy instead of replacing the first.
+- **Re-indexing generated text left the old copy behind.** A repository summary, client
+  profile or extracted relationship stayed in the index after being regenerated, competing
+  with the current version at query time.
+- Re-indexing a document is no longer slower on a large corpus than a small one.
+- Documents with no headings no longer explode into tens of thousands of fragments.
+- Audio and video files are no longer fed to a text reader. They are not yet indexed;
+  they are simply left alone until transcription lands.
+
+- Deleting a document now actually removes it from the knowledge base; documents left
+  PENDING by an interrupted run are requeued; auto-resume defers to an Ollama outage
+  instead of condemning documents to it.
+- Corpus sensemaking and a document navigation surface; index profiles (one registry,
+  several derived projections); a staged document archive with filter, dedup and
+  chronology; a `docling` dependency declared so PDF and Word files can be indexed at all.
+- The knowledge tools work inside the MCP subprocess.
+
+#### Upgrading the knowledge index
+
+1. Back up if you want a fallback: `pg_dump` your database, and keep `data/docstore.json`
+   until you are satisfied.
+2. Upgrade and restart.
+3. Re-index. The knowledge base rebuilds from your documents; the background catch-up job
+   will work through them on its own, or drive it directly for a bulk rebuild.
+4. `data/docstore.json` and `data/index_store.json` are no longer used and can be deleted
+   once the rebuild finishes.
+
+If you run PostgreSQL with default memory settings, `scripts/tune_postgres_for_rag.sh`
+raises the two that matter for a vector index of any size. It prints what it would change
+with `--dry-run` and needs root only to apply.
+
+### Chat
+
+- The floating chat keeps its thread across a refresh and names the page it is
+  looking at; a distribution can declare which pages are chat surfaces.
+- Pluggable per-turn context providers, and a knowledge-source registry on the RAG
+  retrieval step; facts supplied by a provider are not treated as a web-search question.
+- Markdown tables render as tables; a pasted description no longer triggers image
+  generation; explicit "remember this" intents are captured.
+- Rule bundles apply by name (`flask load-rules`), and Guaardvark ships its own voice as
+  one; lesson bundles load into agent memories.
+- The Ollama context window is bounded on every call that was leaving it unset.
+- `list_documents` joins the core tools.
+
+### Self-improvement and autoresearch
+
+- Autoresearch rebuilt as a research system: live parameters, honest evals, bounded
+  overnight runs with two-fidelity evaluation, a real kill switch.
+- One overnight director schedules retrieval tuning, code tuning and Auto Improve.
+- Proposals and research runs bind to the saved active model in the worker; a directed
+  run only counts as a success when it staged a fix; bulk approve/reject/apply in the
+  fixes dialog with progress and a result banner.
+
+### Film Crew and training
+
+- A `training_director` engine for procedure-guide videos: Kokoro or a cloned narrator,
+  per-shot control over whether people appear, image-to-video that actually renders.
+- Before Create, the LoRA trainer says whether the base model will be downloaded.
+
+### Discord
+
+- `/ask`, channel chat and voice all go through the unified chat engine, so the bot
+  answers the way the UI does; the bot listens and talks in voice channels; `/video`
+  delivers the finished clip to the channel.
+
+### Privacy and security
+
+- **Generation never leaves the machine**: backend model loads read local registry
+  files only and never reach Hugging Face on their own; downloads happen only behind
+  an explicit Install.
+- ComfyUI binds to loopback and stops pinning host memory.
+- Exact host matching and an explicit URL regex in the scout; an arithmetic-only
+  calculator tool; batch-image names resolved through `safe_join`; cast-library deletes
+  and other destructive media and GPU routes require localhost or the API key.
+- Pillow floor raised to 12.3.0 and torch stopped silently undoing it;
+  `socket.io-parser` overridden to 4.2.7; the Dependabot queue cleared again (av 18,
+  safetensors 0.8, pydantic 2.13, psutil 7, typer 0.27, and the rest).
+- CodeQL runs on every push; pull requests need a signed CLA; a pre-commit, commit-msg
+  and pre-push guard keeps machine-specific content out of the repository.
+
+### GPU and resources
+
+- Resident models are reclaimable, so admission can free VRAM instead of refusing.
+- Cross-process training leases; heartbeat leases under `flock`; eviction only when it
+  helps; the GPU power limit is left alone by default.
+- The job reaper tolerates ComfyUI probe blips and never steals a live worker's gate.
+- The default image model is no longer refused on 32 GB machines, and a RAM-gate
+  refusal now says "system RAM (not VRAM)".
+
+### Install, platform and operations
+
+- A curl-able bootstrap installer: `curl -fsSL https://guaardvark.com/install.sh | bash`.
+- A platform layer (`scripts/platform/`) that says in one place what this machine can
+  do, with macOS in CI; macOS honours the ComfyUI port override, finds a font, and names
+  the reconciler that failed.
+- Fresh Ubuntu 24.04 installs: Python dev headers before pip, the setuptools pin that
+  made PyTorch uninstallable is gone, PyTorch wheels are staged before the working ones
+  are removed, the Node major version is verified, the Postgres sudo gate no longer
+  needs a tty, and bootstrap survives tmpfs `ENOSPC`, half-installed venvs and
+  proxy-only boxes.
+- `scripts/heal_backend_venv.sh` re-runs every reconciler the failure sentinel names,
+  not only the venv ones (#41).
+- Plugins ship disabled by default, with Ollama the exception; `plugin.local.json`
+  per-install overrides survive updates; plugin config actually saves; restart waits out
+  the cooldown instead of failing half-way.
+- Backups dump only the database and install the app is using, and stop following
+  plugin symlinks out of the project.
+- Redis broker URL and Celery beat heal on stop/start; an abandoned `start.sh` is reaped
+  without killing a new boot; the Intel e1000e NIC hang is detected and mitigated before
+  heavy downloads.
+
+### Interconnector and connections
+
+- Stable, IP-independent node identity and a server-side client heartbeat daemon.
+- Outbound connections with a credential store, publishing, and a publish approval queue.
+
+### MCP and CLI
+
+- `python -m backend.mcp install` writes the server entry into the configs of the agent
+  clients it detects; `python -m backend.mcp doctor` self-tests the server and flags stale
+  client configs. The server is on the 2.x MCP SDK.
+- `/abort` for a wedged chat and stream timeouts that end one; offline recipe
+  inspection commands (`recipes list / show / validate`).
+- The CLI test suite runs in CI; the `release` workflow publishes to PyPI on tag and
+  refuses a tag that disagrees with `VERSION` or a version PyPI already has.
+
+### Desktop agent
+
+- DOM-based verification fast path (fixes 60 s task-timeout blowouts); a window
+  fast path for launch gates; the DOM element inventory feeds the decision prompt.
+- Servo calibration restored with a live Gemma4 fit; truth injection and
+  validation-gated calibration in the learning stack.
+- Basic browser-navigation recipes and a YouTube-comment recipe.
+
+### Documentation
+
+- `docs/HARDWARE.md` — what runs CPU-only, on 8–12 GB, on the 16 GB target, and beyond.
+- `AGENT_MENTAL_MODEL.md` — chat versus agent versus Swarm.
+- The README repositioned around the whole platform, with the walkthrough series;
+  `CONTRIBUTING.md` carries the comment and portability standards.
+- The knowledge index documented, with the claims that were aspirational corrected.
+
+### Known limitations
+
+- Python 3.12 only; the ML wheels for 3.13/3.14 are still missing upstream.
+- MiniMax H3 on a 16 GB card is correct but slow: it runs at the template's 20 steps
+  with no distilled speed LoRA and no SageAttention path, and a tester measured about
+  12 minutes for a 3 s clip on an RTX 5060 Ti. Both accelerations are tracked for the
+  next release.
+- The Creator profile (#114) — the media-creation workflow with the agent, index,
+  outreach and automation subsystems one setting away — is designed and not yet built.

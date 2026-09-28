@@ -78,16 +78,12 @@ def _make_proxy_class(server: str, mcp_tool: Dict[str, Any]) -> type:
         description = mcp_description[:300]
 
         def execute(self, **kwargs: Any) -> ToolResult:
-            from backend.services.mcp_client_service import (
-                MCP_ENABLED,
-                get_mcp_service,
-                run_mcp_async,
-            )
+            from backend.services.mcp_client_service import MCP_ENABLED, get_mcp_service
             if not MCP_ENABLED:
                 return ToolResult(success=False, error="MCP is disabled")
             try:
                 service = get_mcp_service()
-                result = run_mcp_async(service.call_tool(_server, _mcp_name, kwargs))
+                result = service.call_tool(_server, _mcp_name, kwargs)
             except Exception as exc:
                 return ToolResult(
                     success=False,
@@ -98,6 +94,15 @@ def _make_proxy_class(server: str, mcp_tool: Dict[str, Any]) -> type:
 
             # MCP tool results are typically {"content": [{"type": "text", "text": "..."}, ...]}
             tool_result = result.get("result", {})
+            if isinstance(tool_result, dict) and tool_result.get("isError"):
+                # The server answered, but with an error (bad arguments, missing
+                # root, ...). Report it as a failure so the loop retries or
+                # explains instead of quoting the message as a result.
+                err_text = " ".join(
+                    item.get("text", "") for item in (tool_result.get("content") or [])
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ).strip() or "MCP tool reported an error"
+                return ToolResult(success=False, error=err_text[:500], metadata=result)
             if isinstance(tool_result, dict):
                 content = tool_result.get("content", [])
                 if isinstance(content, list) and content:

@@ -47,6 +47,7 @@ from backend.utils.unified_progress_system import ProcessStatus, ProcessType
 
 # Import professional file processor for high-quality CSV writing
 from backend.tools.file_processor import write_csv
+from backend.utils.path_guard import PathEscapesRoot, contained, contained_path
 
 logger = logging.getLogger(__name__)
 
@@ -399,15 +400,20 @@ class BulkCSVGenerator:
         try:
             if model_name:
                 # Use the specified model instead of default
-                from llama_index.llms.ollama import Ollama
+                from backend.utils.ollama_resource_manager import build_ollama
                 from backend.config import OLLAMA_BASE_URL, LLM_REQUEST_TIMEOUT
                 timeout_value = min(LLM_REQUEST_TIMEOUT, 180.0)
-                self.llm = Ollama(
-                    model=model_name,
+                # 8192 was already pinned here via additional_kwargs, which
+                # happened to mask the unbounded default — pass it as the context
+                # window proper so it is the stated intent rather than a side
+                # effect of dict-merge order.
+                self.llm = build_ollama(
+                    model_name,
                     base_url=OLLAMA_BASE_URL,
                     request_timeout=timeout_value,
                     temperature=0.4,
-                    additional_kwargs={"num_ctx": 8192, "top_p": 0.8, "top_k": 30}
+                    context_window=8192,
+                    additional_kwargs={"top_p": 0.8, "top_k": 30},
                 )
                 self._log_info(f"LLM initialized with specified model: {model_name}")
             else:
@@ -2198,7 +2204,7 @@ Generate the CSV row now:"""
 
     def _write_enhanced_csv(self, content_rows: List[ContentRow], output_filename: str) -> Tuple[str, Dict]:
         """Write enhanced CSV with comprehensive metadata"""
-        output_path = os.path.join(self.output_dir, output_filename)
+        output_path = contained_path(self.output_dir, output_filename)
         
         # Convert ContentRow objects to dictionaries for Enfold format
         csv_data = []
@@ -2255,7 +2261,7 @@ Generate the CSV row now:"""
         thread_name = threading.current_thread().name
         logger.debug(f"generate_bulk_csv started in thread '{thread_name}' with {len(tasks)} tasks")
 
-        output_path = os.path.join(self.output_dir, output_filename)
+        output_path = contained_path(self.output_dir, output_filename)
         target_count = len(tasks)
 
         logger.debug(f"Bulk CSV output prepared (target_count={target_count})")

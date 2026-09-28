@@ -8,13 +8,21 @@ import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
+from backend.utils.backend_http import backend_base_url as _backend_base_url
+from backend.utils.backend_http import http_json as _http_json
+from backend.utils.backend_http import is_mcp_transport, run_tool_in_backend
+from backend.services.job_types import RenderErrorKind, batch_failure, describe_failure, failure_kind, failure_text
 
 logger = logging.getLogger(__name__)
 
 _KONTEXT_MODEL_IDS = frozenset({
     "kontext", "flux-kontext", "flux-kontext-dev", "flux.kontext",
+})
+_QWEN_EDIT_MODEL_IDS = frozenset({
+    "qwen", "qwen-image-edit", "qwen-edit", "qwenimage-edit",
 })
 
 
@@ -82,6 +90,30 @@ def _normalize_subject_ids(raw) -> list[int]:
     return out
 
 
+def _match_cast_subjects(candidates: list[str], subjects: list[dict]) -> list[int]:
+    """Ids of subjects whose trigger word or name matches a prompt token, in prompt order."""
+    by_trigger = {}
+    by_name = {}
+    for s in subjects:
+        tw = (s.get("trigger_word") or "").strip().lower()
+        nm = (s.get("name") or "").strip().lower()
+        if tw:
+            by_trigger[tw] = s["id"]
+            by_trigger[tw.replace(" ", "_")] = s["id"]
+        if nm:
+            by_name[nm] = s["id"]
+            by_name[nm.replace(" ", "_")] = s["id"]
+    found: list[int] = []
+    seen: set[int] = set()
+    for c in candidates:
+        key = c.strip().lower()
+        sid = by_trigger.get(key) or by_name.get(key)
+        if sid and sid not in seen:
+            seen.add(sid)
+            found.append(sid)
+    return found
+
+
 def _resolve_cast_from_prompt(prompt: str) -> list[int]:
     """Match [trigger], trigger_word, or cast name tokens in the prompt to trained Subjects."""
     text = prompt or ""
@@ -101,8 +133,6 @@ def _resolve_cast_from_prompt(prompt: str) -> list[int]:
         from backend.models import Subject, db
 
         def _lookup() -> list[int]:
-            found: list[int] = []
-            seen: set[int] = set()
             rows = (
                 Subject.query.filter(
                     Subject.kind == "character",
@@ -110,27 +140,19 @@ def _resolve_cast_from_prompt(prompt: str) -> list[int]:
                     Subject.lora_path != "",
                 ).all()
             )
-            by_trigger = {}
-            by_name = {}
-            for s in rows:
-                tw = (s.trigger_word or "").strip().lower()
-                nm = (s.name or "").strip().lower()
-                if tw:
-                    by_trigger[tw] = s.id
-                    by_trigger[tw.replace(" ", "_")] = s.id
-                if nm:
-                    by_name[nm] = s.id
-                    by_name[nm.replace(" ", "_")] = s.id
-            for c in candidates:
-                key = c.strip().lower()
-                sid = by_trigger.get(key) or by_name.get(key)
-                if sid and sid not in seen:
-                    seen.add(sid)
-                    found.append(sid)
-            return found
+            return _match_cast_subjects(
+                candidates, [{"id": s.id, "trigger_word": s.trigger_word, "name": s.name} for s in rows],
+            )
 
         if has_app_context():
             return _lookup()
+        from backend.utils.backend_http import in_mcp_process, request_json
+        if in_mcp_process():
+            # The MCP server has no Flask app; the Cast Library route lists the subjects.
+            subjects = (request_json("GET", "/api/cast-library").data or {}).get("subjects") or []
+            return _match_cast_subjects(
+                candidates, [s for s in subjects if s.get("kind") == "character" and s.get("lora_path")],
+            )
         from backend.app import get_or_create_app
         app = get_or_create_app()
         with app.app_context():
@@ -163,6 +185,8 @@ class ImageGeneratorTool(BaseTool):
     """
 
     name = "generate_image"
+    read_only = False
+    destructive = False
     description = (
         "Generate an image from a text prompt. Returns the URL of the generated image. "
         "Use when the user asks to create, generate, draw, or visualize an image. "
@@ -215,6 +239,13 @@ class ImageGeneratorTool(BaseTool):
             required=False,
             default=1024,
         ),
+        "steps": ToolParameter(
+            name="steps",
+            type="int",
+            description="Optional sampling steps. The server may raise it to the model's minimum and will say so.",
+            required=False,
+            default=None,
+        ),
         "model": ToolParameter(
             name="model",
             type="string",
@@ -228,15 +259,36 @@ class ImageGeneratorTool(BaseTool):
             required=False,
             default="auto",
         ),
+        "wait_for_result": ToolParameter(
+            name="wait_for_result",
+            type="bool",
+            description=(
+                "True (the default in chat): render now and return the image inline. "
+                "False: queue the render as an image batch and return its batch id at once; "
+                "poll get_generation_status for the file. Use False from a remote agent or "
+                "when the GPU may be busy."
+            ),
+            required=False,
+            default=True,
+        ),
     }
+
+    STUDIO_URL = "/images"
 
     def __init__(self):
         super().__init__()
 
     def execute(self, prompt: str, style: str = "realistic",
                 width: int = 1024, height: int = 1024,
-                model: str = "auto", subject_ids=None, **kwargs) -> ToolResult:
-        """Chat/CLI stills — cast LoRA path when subject_ids resolve; else stills_pipeline."""
+                model: str = "auto", subject_ids=None, wait_for_result: bool = True,
+                **kwargs) -> ToolResult:
+        """Chat/CLI stills — cast LoRA path when subject_ids resolve; else stills_pipeline.
+
+        With ``wait_for_result=False`` the prompt goes through the batch image
+        generator instead (the same queue the Images page uses) and the call
+        returns the batch id without touching the GPU."""
+        wait_for_result = str(wait_for_result).lower() in ("1", "true", "yes")
+        remote = self._context.get("transport") == "mcp"
         # Unwrap LLM mistakes: entire JSON stuffed into prompt=
         prompt, nested_ids = _unwrap_nested_prompt_json(prompt or "")
         # Explicit kwargs win, then nested JSON, then kwargs aliases
@@ -275,9 +327,19 @@ class ImageGeneratorTool(BaseTool):
                 seed = None
 
         logger.info(
-            "ImageGeneratorTool: %sx%s model=%s subject_ids=%s prompt=%r",
-            width, height, model, sid_list, (prompt or "")[:100],
+            "ImageGeneratorTool: %sx%s model=%s subject_ids=%s wait=%s prompt=%r",
+            width, height, model, sid_list, wait_for_result, (prompt or "")[:100],
         )
+        if remote or not wait_for_result:
+            # Outside the backend process (an MCP server) the render must not
+            # happen here: hand it to the backend over HTTP, and wait there if asked.
+            return self._queue(
+                prompt, style=style, width=width, height=height, model=model,
+                subject_ids=sid_list, negative_prompt=negative,
+                steps=kwargs.get("steps"),
+                guidance=kwargs.get("guidance") or kwargs.get("guidance_scale"),
+                via_http=remote, wait=wait_for_result and remote,
+            )
 
         try:
             if sid_list:
@@ -357,6 +419,7 @@ class ImageGeneratorTool(BaseTool):
                         "\nCast LoRA: OFF (no subject_ids — base model only; "
                         "pass subject_ids=[id] for trained cast characters)"
                     )
+                notice_line = f"{meta['steps_notice']}\n" if meta.get("steps_notice") else ""
                 return ToolResult(
                     success=True,
                     output=(
@@ -365,7 +428,9 @@ class ImageGeneratorTool(BaseTool):
                         f"Prompt used: {still.prompt_used}\n"
                         f"Style: {style}\n"
                         f"Size: {still.width}x{still.height}\n"
-                        f"Steps/CFG: {still.steps}/{still.guidance}\n"
+                        f"Steps: {still.steps}\n"
+                        f"{notice_line}"
+                        f"CFG: {still.guidance}\n"
                         f"Enhance: {still.enhance_mode}\n"
                         f"Model: {still.model_used or model}\n"
                         f"Seed: {still.seed_used}"
@@ -380,6 +445,8 @@ class ImageGeneratorTool(BaseTool):
                         "width": still.width,
                         "height": still.height,
                         "steps": still.steps,
+                        "steps_requested": meta.get("steps_requested"),
+                        "steps_notice": meta.get("steps_notice"),
                         "guidance": still.guidance,
                         "enhance_mode": still.enhance_mode,
                         "model": still.model_used or model,
@@ -413,19 +480,359 @@ class ImageGeneratorTool(BaseTool):
             return ToolResult(success=False, error=f"Image generation failed: {e}")
 
 
+    MAX_WAIT_S = 20 * 60
+    POLL_INTERVAL_S = 3.0
+
+    def _queue(self, prompt: str, *, style: str, width: int, height: int, model: str,
+               subject_ids: list, negative_prompt: str, steps=None, guidance=None,
+               via_http: bool = False, wait: bool = False) -> ToolResult:
+        """Enqueue one prompt on the batch image generator: in-process inside the
+        backend, over HTTP from anywhere else. Returns at once unless ``wait``."""
+        from backend.services.stills_defaults import resolve_stills_defaults
+        sampling = resolve_stills_defaults(model, width=width, height=height, steps=steps, guidance=guidance)
+        params = {
+            "model": model or "auto",
+            "steps_explicit": False,
+            "style": style,
+            "width": width,
+            "height": height,
+            "negative_prompt": negative_prompt or "",
+            "ui_config": {"source": "chat", "tool": self.name},
+        }
+        if steps is not None:
+            params["steps"] = steps
+        if guidance is not None:
+            params["guidance"] = guidance
+        if subject_ids:
+            params["subject_ids"] = list(subject_ids)
+        try:
+            if via_http:
+                data = _http_json("POST", "/api/batch-image/generate/prompts",
+                                  {"prompts": [prompt], **params})
+                batch_id = data["batch_id"]
+                sampling.update({k: v for k, v in (data.get("parameters") or {}).items()
+                                 if k in ("steps", "steps_requested", "steps_notice")})
+            else:
+                from backend.services.batch_image_generator import start_batch_from_prompts
+                batch_id = start_batch_from_prompts([prompt], **params)
+        except ImportError:
+            return ToolResult(success=False, error="Batch image generation is not available.")
+        except Exception as e:
+            logger.error("ImageGeneratorTool queue failed: %s", e, exc_info=True)
+            return ToolResult(success=False, error=f"Could not queue the image: {e}")
+        if wait:
+            return self._wait_http(batch_id, prompt, sampling)
+        cast_line = (
+            f"Cast LoRA: ON subject_ids={list(subject_ids)}" if subject_ids
+            else "Cast LoRA: OFF (pass subject_ids=[id] for trained cast characters)"
+        )
+        return ToolResult(
+            success=True,
+            output="\n".join([
+                f"Image queued as batch {batch_id}.",
+                f"Prompt: {prompt}",
+                f"Size: {width}x{height} | Model: {model or 'auto'} | Style: {style}",
+                f"Steps: {sampling['steps']} (planned)",
+                *([sampling["steps_notice"]] if sampling.get("steps_notice") else []),
+                cast_line,
+                f"Poll: get_generation_status(batch_id=\"{batch_id}\")",
+                f"Open Images: {self.STUDIO_URL}",
+            ]),
+            metadata={
+                "prompt": prompt,
+                "batch_id": batch_id,
+                "queued": True,
+                "steps": sampling["steps"],
+                "steps_requested": sampling.get("steps_requested"),
+                "steps_notice": sampling.get("steps_notice"),
+                "studio_url": self.STUDIO_URL,
+                "status_tool": "get_generation_status",
+                "width": width,
+                "height": height,
+                "model": model or "auto",
+                "subject_ids": list(subject_ids or []),
+            },
+        )
+
+
+    def _wait_http(self, batch_id: str, prompt: str, sampling: dict | None = None) -> ToolResult:
+        """Poll the backend for a queued batch and return the finished file."""
+        import time as _time
+        deadline = _time.monotonic() + self.MAX_WAIT_S
+        status_tool = GenerationStatusTool()
+        status_tool.set_context(dict(self._context))
+        while _time.monotonic() < deadline:
+            _time.sleep(self.POLL_INTERVAL_S)
+            result = status_tool.execute(batch_id=batch_id)
+            if not result.success:
+                return result
+            info = result.metadata or {}
+            if info.get("status") == "completed" and info.get("files"):
+                f = info["files"][0]
+                return ToolResult(
+                    success=True,
+                    output="\n".join([
+                        "Image generated successfully"
+                        + (f" in {f['generation_time']:.1f}s." if f.get("generation_time") else "."),
+                        f"Image URL: {f['url']}",
+                        f"Prompt used: {prompt}",
+                        f"Model: {f.get('model') or 'auto'}",
+                        f"Steps: {f.get('steps') if f.get('steps') is not None else 'unknown'}",
+                        *([f["steps_notice"]] if f.get("steps_notice") else []),
+                        f"Batch: {batch_id}",
+                    ]),
+                    metadata={"image_url": f["url"], "batch_id": batch_id, "prompt": prompt,
+                              "model": f.get("model"), "generation_time": f.get("generation_time"),
+                              "steps": f.get("steps"), "steps_requested": f.get("steps_requested"),
+                              "steps_notice": f.get("steps_notice")},
+                )
+            if info.get("status") in ("error", "cancelled") or (
+                info.get("status") == "completed" and not info.get("files")
+            ):
+                err = info.get("error") or "; ".join(info.get("errors") or []) or info.get("status")
+                return ToolResult(success=False, error=f"Image generation failed: {err}")
+        return ToolResult(
+            success=True,
+            output=f"Image still rendering after {self.MAX_WAIT_S // 60} minutes (batch {batch_id}). "
+                   f"Poll get_generation_status(batch_id=\"{batch_id}\"); it is not a failure.\n"
+                   f"Steps: {(sampling or {}).get('steps', 'unknown')} (planned)"
+                   + (f"\n{sampling['steps_notice']}" if (sampling or {}).get("steps_notice") else ""),
+            metadata={"batch_id": batch_id, "queued": True, "still_running": True, "prompt": prompt},
+        )
+
+
+def _quality_summary(quality) -> Optional[dict]:
+    """The flags a finished clip carries, for status readers."""
+    if not isinstance(quality, dict):
+        return None
+    flags = [f for f in quality.get("flags") or [] if isinstance(f, dict) and f.get("message")]
+    return {"checked": bool((quality.get("frames") or {}).get("readable")) or bool(flags), "flags": flags}
+
+
+class GenerationStatusTool(BaseTool):
+    """Read the state of a queued image or video batch by id."""
+
+    name = "get_generation_status"
+    read_only = True
+    idempotent = True
+    description = (
+        "Report the state of a queued generation: an image batch (ImageBatch_...) from "
+        "generate_image with wait_for_result=false or the batch image route, or a video batch "
+        "from generate_video. Returns status, progress, and the URL of each finished file. "
+        "Use after a queued generate call, or when the user asks whether a render is done."
+    )
+    parameters = {
+        "batch_id": ToolParameter(
+            name="batch_id",
+            type="string",
+            description="The batch id a generate tool returned (e.g. ImageBatch_09-11-2026_132620_013).",
+            required=True,
+        ),
+    }
+
+    def __init__(self):
+        super().__init__()
+
+    @staticmethod
+    def _image_status(batch_id: str):
+        from backend.services.batch_image_generator import get_batch_image_generator
+        generator = get_batch_image_generator()
+        status = generator.find_batch_status(batch_id, include_results=True)
+        if status is None:
+            return None
+        files = []
+        for r in status.results or []:
+            if r.success and r.image_path:
+                name = os.path.basename(r.image_path)
+                files.append({
+                    "url": f"/api/batch-image/image/{batch_id}/{name}",
+                    "path": r.image_path,
+                    "model": (r.metadata or {}).get("model_used"),
+                    **{k: (r.metadata or {}).get(k) for k in ("steps", "steps_requested", "steps_notice")},
+                    "generation_time": r.generation_time,
+                })
+        failed = [r.error for r in (status.results or []) if not r.success and r.error]
+        return {
+            "kind": "image",
+            "batch_id": batch_id,
+            "status": status.status,
+            "completed": status.completed_images,
+            "failed": status.failed_images,
+            "total": status.total_images,
+            "error": status.error,
+            "errors": failed,
+            "files": files,
+            "studio_url": ImageGeneratorTool.STUDIO_URL,
+        }
+
+    @staticmethod
+    def _image_status_http(batch_id: str):
+        try:
+            d = _http_json("GET", f"/api/batch-image/status/{batch_id}?include_results=true")
+        except RuntimeError as e:
+            if "not found" in str(e).lower() or "404" in str(e):
+                return None
+            raise
+        if not d or not d.get("status"):
+            return None
+        files = []
+        for r in d.get("results") or []:
+            if r.get("success") and r.get("image_path"):
+                name = os.path.basename(r["image_path"])
+                files.append({
+                    "url": f"/api/batch-image/image/{batch_id}/{name}",
+                    "path": r["image_path"],
+                    "model": (r.get("metadata") or {}).get("model_used"),
+                    **{k: (r.get("metadata") or {}).get(k) for k in ("steps", "steps_requested", "steps_notice")},
+                    "generation_time": r.get("generation_time"),
+                })
+        failed = [r.get("error") for r in (d.get("results") or []) if not r.get("success") and r.get("error")]
+        return {
+            "kind": "image", "batch_id": batch_id, "status": d.get("status"),
+            "completed": d.get("completed_images"), "failed": d.get("failed_images"),
+            "total": d.get("total_images"), "error": d.get("error"), "errors": failed,
+            "files": files, "studio_url": ImageGeneratorTool.STUDIO_URL,
+        }
+
+    @staticmethod
+    def _video_status_http(batch_id: str):
+        try:
+            d = _http_json("GET", f"/api/batch-video/status/{batch_id}")
+        except RuntimeError as e:
+            if "not found" in str(e).lower() or "404" in str(e):
+                return None
+            raise
+        if not d or not d.get("status"):
+            return None
+        files = []
+        for r in d.get("results") or []:
+            if r.get("success") and r.get("video_path"):
+                entry = {"url": f"/api/batch-video/video/{batch_id}/{r['video_path']}"}
+                if r.get("thumbnail_path"):
+                    entry["thumbnail_url"] = f"/api/batch-video/video/{batch_id}/{r['thumbnail_path']}"
+                entry["quality"] = _quality_summary((r.get("metadata") or {}).get("quality"))
+                files.append(entry)
+        failed = [r.get("error") for r in (d.get("results") or []) if not r.get("success") and r.get("error")]
+        failures = [r.get("failure") or describe_failure(r.get("error_kind"), r.get("error"))
+                    for r in (d.get("results") or []) if not r.get("success")]
+        return {
+            "kind": "video", "batch_id": batch_id, "status": d.get("status"), "stage": d.get("stage"),
+            "completed": d.get("completed_videos"), "failed": len(failed), "total": d.get("total_videos"),
+            "error": d.get("error"), "errors": failed, "files": files,
+            "failure": d.get("failure"), "failures": failures,
+            "studio_url": f"/video?batch={batch_id}",
+        }
+
+    @staticmethod
+    def _video_status(batch_id: str):
+        from backend.services.batch_video_generator import get_batch_video_generator
+        generator = get_batch_video_generator()
+        status = generator.get_batch_status(batch_id)
+        if status is None:
+            return None
+        files = []
+        for r in status.results or []:
+            if r.success and r.video_path:
+                entry = {"url": f"/api/batch-video/video/{batch_id}/{r.video_path}"}
+                if r.thumbnail_path:
+                    entry["thumbnail_url"] = f"/api/batch-video/video/{batch_id}/{r.thumbnail_path}"
+                entry["quality"] = _quality_summary((getattr(r, "metadata", None) or {}).get("quality"))
+                files.append(entry)
+        failed = [r.error for r in (status.results or []) if not r.success and r.error]
+        failures = [describe_failure(getattr(r, "error_kind", None), r.error)
+                    for r in (status.results or []) if not r.success]
+        completed = sum(1 for r in (status.results or []) if r.success)
+        return {
+            "kind": "video",
+            "batch_id": batch_id,
+            "status": status.status,
+            "stage": getattr(status, "stage", None),
+            "completed": completed,
+            "failed": len(failed),
+            "total": getattr(status, "total_videos", None),
+            "error": getattr(status, "error", None),
+            "errors": failed,
+            "files": files,
+            "failure": batch_failure(status),
+            "failures": failures,
+            "studio_url": f"/video?batch={batch_id}",
+        }
+
+    def execute(self, batch_id: str, **kwargs) -> ToolResult:
+        batch_id = (batch_id or "").strip()
+        if not batch_id:
+            return ToolResult(success=False, error="batch_id is required")
+        info = None
+        remote = self._context.get("transport") == "mcp"
+        readers = (self._image_status_http, self._video_status_http) if remote else (
+            self._image_status, self._video_status)
+        for reader in readers:
+            try:
+                info = reader(batch_id)
+            except ImportError:
+                continue
+            except Exception as e:
+                logger.warning("get_generation_status %s via %s: %s", batch_id, reader.__name__, e)
+                continue
+            if info is not None:
+                break
+        if info is None:
+            return ToolResult(success=False, error=f"No image or video batch named {batch_id}")
+        total = info.get("total")
+        done = info.get("completed") or 0
+        head = f"{info['kind'].title()} batch {batch_id}: {info['status']}"
+        if total:
+            head += f" ({done}/{total} finished"
+            if info.get("failed"):
+                head += f", {info['failed']} failed"
+            head += ")"
+        lines = [head]
+        for f in info["files"]:
+            lines.append(f"File: {f['url']}")
+            if info["kind"] == "image":
+                lines.append(f"Steps: {f.get('steps') if f.get('steps') is not None else 'unknown'}")
+                if f.get("steps_notice"):
+                    lines.append(f["steps_notice"])
+            quality = f.get("quality")
+            if quality and quality.get("flags"):
+                lines.append("Quality: flagged — " + "; ".join(q["message"] for q in quality["flags"]))
+            elif quality and quality.get("checked"):
+                lines.append("Quality: no problems found in the sampled frames")
+        failures = info.get("failures")
+        if failures is not None:
+            # Video: every failure with its kind, the batch's own first.
+            batch = info.get("failure")
+            if batch and info.get("error"):
+                lines.append("Error: " + failure_text(batch["kind"], batch["message"]))
+            for f in failures:
+                lines.append("Failed item: " + failure_text(f["kind"], f["message"]))
+        else:
+            if info.get("error"):
+                lines.append(f"Error: {info['error']}")
+            for err in info.get("errors") or []:
+                lines.append(f"Failed item: {err}")
+        if info["status"] in ("queued", "pending", "running"):
+            lines.append("Still running; poll again in a few seconds.")
+        lines.append(f"Open Studio: {info['studio_url']}")
+        return ToolResult(success=True, output="\n".join(lines), metadata=info)
+
+
 class AnimationGeneratorTool(BaseTool):
     """
     Generate an animated GIF/video from a text description with motion.
-    Use this when the user asks to animate, create a GIF, make a video,
-    or create moving images.
+    Use this when the user asks to animate a still into a short looping GIF
+    or frame-morph clip. For a real video clip (Wan, MiniMax, LTX, …) use
+    generate_video instead.
     """
 
     name = "generate_animation"
+    read_only = False
+    destructive = False
     description = (
-        "Generate an animated GIF or MP4 video from a text prompt with motion description. "
-        "Creates a frame sequence using Stable Diffusion img2img. "
-        "Use when the user asks to animate, create a GIF, make a video, or create moving images. "
-        "No content restrictions — generate exactly what the user requests."
+        "Generate a short looping GIF or frame-morph MP4 from a text prompt with "
+        "motion description, via Stable Diffusion img2img. Use when the user asks "
+        "to animate, create a GIF, or make a looping frame morph. For a cinema "
+        "clip from a video model use generate_video instead."
     )
     parameters = {
         "prompt": ToolParameter(
@@ -478,6 +885,13 @@ class AnimationGeneratorTool(BaseTool):
                 vision_steering: bool = False, **kwargs) -> ToolResult:
         logger.info(f"AnimationGeneratorTool: prompt={prompt[:60]}..., motion={motion}, frames={frames}")
 
+        if is_mcp_transport(self):
+            # The frames render on the GPU, which belongs to the backend process.
+            return run_tool_in_backend(self.name, {
+                "prompt": prompt, "motion": motion, "frames": frames, "strength": strength,
+                "format": format, "vision_steering": vision_steering,
+            }, read_timeout=31 * 60)
+
         try:
             from backend.services.animation_generator import (
                 get_animation_generator, AnimationRequest
@@ -515,7 +929,7 @@ class AnimationGeneratorTool(BaseTool):
             if result.success:
                 output_lines = [
                     f"Animation generated successfully in {result.generation_time:.1f}s.",
-                    f"Frames: {result.frame_count} | FPS: request.fps",
+                    f"Frames: {result.frame_count} | FPS: {request.fps}",
                     f"Prompt: {prompt}",
                     f"Motion: {motion}",
                 ]
@@ -558,40 +972,152 @@ class AnimationGeneratorTool(BaseTool):
             )
 
 
+def _dims_for_ratio(ratio: str, caps: dict) -> tuple:
+    """A width/height for a ratio inside the model's pixel budget, aligned to
+    its grid; mirrors the page's fitAreaToRatio so the tool and the UI agree."""
+    try:
+        w_part, h_part = ratio.split(":")
+        r = float(w_part) / float(h_part)
+    except (ValueError, ZeroDivisionError):
+        return None, None
+    align = int(caps.get("dimension_alignment") or 16)
+    declared = int(caps.get("max_pixel_area") or 0)
+    # The usual 16 GB working budget, never above the declared cap.
+    budget = min(declared, 864 * 480) if declared else 832 * 480
+    width = (budget * r) ** 0.5
+    height = width / r
+    width = max(align, int(round(width / align) * align))
+    height = max(align, int(round(height / align) * align))
+    return width, height
+
+
+def _media_path(ref: Optional[str]) -> Optional[str]:
+    """A local path for a Document id or a path the caller already has."""
+    if ref is None:
+        return None
+    text = str(ref).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        try:
+            from backend.models import Document
+            from backend.services.document_path_resolver import resolve_document_path
+            doc = Document.query.get(int(text))
+            path = resolve_document_path(doc) if doc else None
+            return str(path) if path else None
+        except Exception as e:  # noqa: BLE001 — a missing row is a plain "not found"
+            logger.info("document %s did not resolve: %s", text, e)
+            return None
+    return text if os.path.exists(text) else None
+
+
 class VideoGeneratorTool(BaseTool):
-    """Generate a real text-to-video clip via the batch video pipeline (Wan et al.).
+    """Generate a real video clip via the batch video pipeline.
 
     Use when the user asks to create/generate/make a video from a description.
-    (Contrast generate_animation, which produces short frame-morph GIF loops.)"""
+    (Contrast generate_animation, which produces short frame-morph GIF loops.)
+    Every knob is checked against the capability record the model declares in
+    the video model registry, so an ask the model cannot honour (sound from a
+    silent family, references on a build without them, a length past its
+    longest clip) fails with one sentence instead of a wrong clip."""
 
     name = "generate_video"
+    read_only = False
+    destructive = False
     description = (
-        "Queue a video clip from a text prompt using the local video model "
-        "(Wan text-to-video). Returns immediately with a batch id and Studio "
-        "deep-link so long cinema/Wan jobs are not false-timeouted. Use when the "
-        "user asks to create, generate, or make a video. For short looping "
+        "Queue a video clip from a text prompt using a local video model. Returns "
+        "immediately with a batch id and Studio deep-link so long jobs are not "
+        "false-timeouted. Use when the user asks to create, generate, or make a "
+        "video. Pick model='minimax-h3-int8' (or audio=true) for a clip with its "
+        "own soundtrack and spoken dialogue; give first_image / last_image to "
+        "animate between frames; reference_images and reference_audio lock a "
+        "person, look or voice on the reference build. For short looping "
         "frame-morph animations use generate_animation instead."
     )
     parameters = {
         "prompt": ToolParameter(
             name="prompt",
             type="string",
-            description="Description of the video to generate (scene, subject, motion, style).",
+            description="Description of the video to generate (scene, subject, motion, style, any spoken lines).",
             required=True,
+        ),
+        "model": ToolParameter(
+            name="model",
+            type="string",
+            description="Video model id from the registry (e.g. wan22-5b, minimax-h3-int8). Default: the installed default.",
+            required=False,
+        ),
+        "aspect_ratio": ToolParameter(
+            name="aspect_ratio",
+            type="string",
+            description="16:9, 9:16, 1:1, 4:3, 3:2, 21:9 or 3:4; must be one the model declares.",
+            required=False,
+        ),
+        "duration_s": ToolParameter(
+            name="duration_s",
+            type="float",
+            description="Clip length in seconds; clamped to the model's declared range. Overrides duration_frames.",
+            required=False,
         ),
         "duration_frames": ToolParameter(
             name="duration_frames",
             type="int",
-            description="Number of frames. Default 49 (~2s at 24fps). Max 121.",
+            description="Number of frames (legacy). Default 49. Clamped to the model's longest clip.",
             required=False,
             default=49,
         ),
         "num_inference_steps": ToolParameter(
             name="num_inference_steps",
             type="int",
-            description="Inference steps. Default 25. Higher = better quality, slower.",
+            description="Inference steps. Omit to use the model's default; a value below the model's floor is raised to it.",
             required=False,
-            default=25,
+        ),
+        "audio": ToolParameter(
+            name="audio",
+            type="boolean",
+            description="Require a model that generates its own soundtrack (MiniMax H3). Fails on a silent family.",
+            required=False,
+            default=False,
+        ),
+        "first_image": ToolParameter(
+            name="first_image",
+            type="string",
+            description="Document id or path of the first frame (image-to-video).",
+            required=False,
+        ),
+        "last_image": ToolParameter(
+            name="last_image",
+            type="string",
+            description="Document id or path of the last frame; needs a model with first+last-frame mode.",
+            required=False,
+        ),
+        "reference_images": ToolParameter(
+            name="reference_images",
+            type="list",
+            description="Document ids or paths of reference images (identity, look); needs the reference build.",
+            required=False,
+        ),
+        "reference_audio": ToolParameter(
+            name="reference_audio",
+            type="string",
+            description="Document id or path of a voice or music reference; needs the reference build.",
+            required=False,
+        ),
+        "speed_profile": ToolParameter(
+            name="speed_profile",
+            type="string",
+            description="A speed profile the model declares (e.g. turbo-8).",
+            required=False,
+        ),
+        "style": ToolParameter(
+            name="style",
+            type="string",
+            description=(
+                "Prompt style: cinematic, realistic, artistic, anime, 3d_animation, stop_motion, "
+                "hand_drawn, western_cartoon, none. A model may not offer every style; its "
+                "capability record lists prompt_styles."
+            ),
+            required=False,
         ),
         "wait_for_result": ToolParameter(
             name="wait_for_result",
@@ -612,48 +1138,203 @@ class VideoGeneratorTool(BaseTool):
     def __init__(self):
         super().__init__()
 
+    @staticmethod
+    def resolve_request(prompt: str, *, model: Optional[str] = None, aspect_ratio: Optional[str] = None,
+                        duration_s: Optional[float] = None, duration_frames: Optional[int] = None,
+                        num_inference_steps: Optional[int] = None, audio: bool = False,
+                        first_image: Optional[str] = None, last_image: Optional[str] = None,
+                        reference_images: Optional[list] = None, reference_audio: Optional[str] = None,
+                        speed_profile: Optional[str] = None, style: Optional[str] = None) -> tuple:
+        """Turn the tool's arguments into batch parameters checked against the
+        model's capability record. Returns (params, None) or (None, message).
+        Pure: no service is touched, so the rules are testable."""
+        from backend.services.video_model_registry import (
+            DEFAULT_T2V_MODEL, VIDEO_MODEL_REGISTRY, model_capabilities, i2v_model_for,
+            resolve_active_video_model,
+        )
+        model_id = (model or "").strip()
+        if not model_id:
+            role = "i2v" if first_image else "t2v"
+            picked, _resolve_err = resolve_active_video_model(role)
+            model_id = picked or DEFAULT_T2V_MODEL
+        entry = VIDEO_MODEL_REGISTRY.get(model_id)
+        if not entry:
+            known = ", ".join(k for k in VIDEO_MODEL_REGISTRY if model_capabilities(k))
+            return None, f"Unknown video model '{model_id}'. Known: {known}."
+        caps = model_capabilities(model_id)
+        if not caps:
+            return None, f"'{model_id}' is a companion file, not a video model."
+        if audio and not caps.get("audio_out"):
+            return None, (
+                f"{entry['name']} renders silent clips. For a clip with its own soundtrack use "
+                f"a model that declares audio, such as minimax-h3-int8."
+            )
+        refs = [str(r) for r in (reference_images or []) if str(r).strip()]
+        if (refs or reference_audio) and "ref2v" not in caps["modes"]:
+            return None, (
+                f"{entry['name']} takes no reference images or audio; use the reference build "
+                f"(minimax-h3-ref2va-int8) for identity, look or voice references."
+            )
+        if last_image and "flf2v" not in caps["modes"] and "l2v" not in caps["modes"]:
+            return None, f"{entry['name']} has no last-frame mode; drop last_image or pick minimax-h3-int8."
+        if first_image and not caps.get("supports_i2v") and "ref2v" not in caps["modes"]:
+            sibling = i2v_model_for(model_id)
+            if sibling != model_id and sibling in VIDEO_MODEL_REGISTRY:
+                model_id, entry, caps = sibling, VIDEO_MODEL_REGISTRY[sibling], model_capabilities(sibling)
+            else:
+                return None, f"{entry['name']} cannot animate a first frame."
+
+        fps = int(caps.get("native_fps") or 24)
+        max_frames = int(caps.get("max_frames") or 121)
+        if duration_s is not None:
+            try:
+                frames = int(round(float(duration_s) * fps))
+            except (TypeError, ValueError):
+                return None, f"duration_s must be a number, got {duration_s!r}"
+        else:
+            try:
+                frames = int(duration_frames or 49)
+            except (TypeError, ValueError):
+                frames = 49
+        min_clip = caps.get("min_clip_s")
+        frames = max(int(round((min_clip or 0) * fps)) or 9, min(frames, max_frames))
+
+        steps = None
+        if num_inference_steps not in (None, ""):
+            try:
+                steps = max(1, min(int(num_inference_steps), 100))
+            except (TypeError, ValueError):
+                return None, f"num_inference_steps must be a number, got {num_inference_steps!r}"
+            floor = int(caps.get("min_steps") or 0)
+            if floor and steps < floor:
+                steps = floor
+        if speed_profile and speed_profile not in (caps.get("speed_profiles") or {}):
+            declared = ", ".join(caps.get("speed_profiles") or {}) or "none"
+            return None, f"{entry['name']} declares no speed profile '{speed_profile}' (declared: {declared})."
+
+        ratios = caps.get("aspect_ratios") or []
+        ratio = (aspect_ratio or "").strip()
+        if ratio and ratios and ratio not in ratios:
+            return None, f"{entry['name']} renders {', '.join(ratios)}; {ratio} is not one of them."
+        params = {
+            "model": model_id,
+            "duration_frames": frames,
+            "fps": fps,
+            "metadata": {"source": "chat"},
+        }
+        if ratio:
+            params["metadata"]["aspect_ratio"] = ratio
+            w, h = _dims_for_ratio(ratio, caps)
+            if w and h:
+                params["width"], params["height"] = w, h
+        if steps is not None:
+            params["num_inference_steps"] = steps
+            params["metadata"]["steps_explicit"] = True
+        elif caps.get("default_steps"):
+            params["num_inference_steps"] = int(caps["default_steps"])
+        if speed_profile:
+            params["speed_profile"] = speed_profile
+        if style:
+            style = str(style).strip().lower()
+            if style not in (caps.get("prompt_styles") or []):
+                from backend.services.video_render_limits import withheld_style
+                return None, withheld_style(model_id, style) or (
+                    f"Unknown style '{style}'. {entry['name']} offers: "
+                    f"{', '.join(caps.get('prompt_styles') or [])}."
+                )
+            params["prompt_style"] = style
+            if style == "none":
+                params["enhance_prompt"] = False
+        return params, None
+
     def execute(self, prompt: str, duration_frames: int = 49,
-                num_inference_steps: int = 25, wait_for_result: bool = False,
-                **kwargs) -> ToolResult:
+                num_inference_steps=None, wait_for_result: bool = False,
+                model: Optional[str] = None, aspect_ratio: Optional[str] = None,
+                duration_s=None, audio: bool = False, first_image: Optional[str] = None,
+                last_image: Optional[str] = None, reference_images=None,
+                reference_audio: Optional[str] = None, speed_profile: Optional[str] = None,
+                style: Optional[str] = None, **kwargs) -> ToolResult:
         import time as _time
 
         prompt = (prompt or "").strip()
         if not prompt:
             return ToolResult(success=False, error="Empty video prompt")
-        try:
-            duration_frames = max(9, min(int(duration_frames), 121))
-        except (TypeError, ValueError):
-            duration_frames = 49
-        try:
-            num_inference_steps = max(4, min(int(num_inference_steps), 50))
-        except (TypeError, ValueError):
-            num_inference_steps = 25
 
+        if is_mcp_transport(self):
+            # Model preflight, document lookups and the batch queue belong to the backend process.
+            arguments = {
+                "prompt": prompt, "duration_frames": duration_frames,
+                "num_inference_steps": num_inference_steps, "wait_for_result": wait_for_result,
+                "model": model, "aspect_ratio": aspect_ratio, "duration_s": duration_s, "audio": audio,
+                "first_image": first_image, "last_image": last_image, "reference_images": reference_images,
+                "reference_audio": reference_audio, "speed_profile": speed_profile, "style": style,
+            }
+            return run_tool_in_backend(
+                self.name, {k: v for k, v in arguments.items() if v is not None},
+                read_timeout=self.MAX_WAIT_S + 60,
+            )
         wait_for_result = str(wait_for_result).lower() in ("1", "true", "yes")
+        audio = str(audio).lower() in ("1", "true", "yes")
+        if isinstance(reference_images, str):
+            reference_images = [x.strip() for x in reference_images.split(",") if x.strip()]
 
-        logger.info("VideoGeneratorTool: frames=%s steps=%s wait=%s prompt=%r",
-                    duration_frames, num_inference_steps, wait_for_result, prompt[:100])
+        params, err = self.resolve_request(
+            prompt, model=model, aspect_ratio=aspect_ratio, duration_s=duration_s,
+            duration_frames=duration_frames, num_inference_steps=num_inference_steps, audio=audio,
+            first_image=first_image, last_image=last_image, reference_images=reference_images,
+            reference_audio=reference_audio, speed_profile=speed_profile, style=style,
+        )
+        if err:
+            return ToolResult(success=False, error=err)
+        model_id = params["model"]
+        duration_frames = params["duration_frames"]
+        num_inference_steps = params.get("num_inference_steps")
+
+        logger.info("VideoGeneratorTool: model=%s frames=%s steps=%s wait=%s prompt=%r",
+                    model_id, duration_frames, num_inference_steps, wait_for_result, prompt[:100])
         try:
             from backend.services.batch_video_generator import get_batch_video_generator
-            from backend.services.video_model_registry import (
-                DEFAULT_T2V_MODEL, preflight_video_model,
-            )
+            from backend.services.video_model_registry import prepare_video_model
 
-            ready, preflight_err = preflight_video_model(DEFAULT_T2V_MODEL)
+            ready, preflight_err = prepare_video_model(model_id)
             if not ready:
-                return ToolResult(success=False, error=f"Video model not ready: {preflight_err}")
+                kind = failure_kind(preflight_err, RenderErrorKind.MODEL_NOT_INSTALLED)
+                return ToolResult(success=False, error=failure_text(kind, preflight_err),
+                                  metadata={"failure": describe_failure(kind, preflight_err)})
 
             generator = get_batch_video_generator()
             if not generator.service_available:
                 return ToolResult(success=False, error="Video generation service not available")
 
-            status = generator.start_batch_from_prompts(
-                prompts=[prompt],
-                model=DEFAULT_T2V_MODEL,
-                duration_frames=duration_frames,
-                num_inference_steps=num_inference_steps,
-                metadata={"source": "chat"},
-            )
+            first_path = _media_path(first_image) if first_image else None
+            if first_image and not first_path:
+                return ToolResult(success=False, error=f"first_image not found: {first_image}")
+            last_path = _media_path(last_image) if last_image else None
+            if last_image and not last_path:
+                return ToolResult(success=False, error=f"last_image not found: {last_image}")
+            ref_paths = [_media_path(r) for r in (reference_images or [])]
+            if any(p is None for p in ref_paths):
+                return ToolResult(success=False, error="A reference image was not found")
+            ref_audio_path = _media_path(reference_audio) if reference_audio else None
+            if reference_audio and not ref_audio_path:
+                return ToolResult(success=False, error=f"reference_audio not found: {reference_audio}")
+
+            if ref_paths or ref_audio_path:
+                # The reference build reads the references from the batch
+                # metadata; the prompt names them as <Picture N> / <Audio N>
+                # in wiring order.
+                params["metadata"].update({
+                    "ref_images": ref_paths,
+                    "ref_audios": [ref_audio_path] if ref_audio_path else [],
+                })
+                status = generator.start_batch_from_prompts(prompts=[prompt], **params)
+            elif first_path:
+                status = generator.start_batch_from_images(
+                    image_paths=[first_path], prompt=prompt,
+                    last_frame_paths=[last_path] if last_path else [], **params,
+                )
+            else:
+                status = generator.start_batch_from_prompts(prompts=[prompt], **params)
             batch_id = status.batch_id
             studio_url = f"/video?batch={batch_id}"
             jobs_url = "/tasks"
@@ -692,11 +1373,9 @@ class VideoGeneratorTool(BaseTool):
                 if status.status == "completed":
                     break
                 if status.status in ("error", "cancelled"):
-                    err = status.error or (
-                        status.results[0].error if status.results and status.results[0].error
-                        else status.status
-                    )
-                    return ToolResult(success=False, error=f"Video generation failed: {err}")
+                    failure = batch_failure(status) or describe_failure(None, status.status)
+                    return ToolResult(success=False, error=failure_text(failure["kind"], failure["message"]),
+                                      metadata={"batch_id": batch_id, "failure": failure})
             else:
                 return ToolResult(
                     success=True,
@@ -717,8 +1396,10 @@ class VideoGeneratorTool(BaseTool):
 
             result = next((r for r in status.results if r.success and r.video_path), None)
             if not result:
-                err = status.results[0].error if status.results else "no results"
-                return ToolResult(success=False, error=f"Video generation failed: {err}")
+                failure = batch_failure(status) or describe_failure(
+                    RenderErrorKind.OUTPUT_MISSING, "The batch finished without a video.")
+                return ToolResult(success=False, error=failure_text(failure["kind"], failure["message"]),
+                                  metadata={"batch_id": batch_id, "failure": failure})
 
             # video_path is batch-relative; the serving route accepts it verbatim.
             video_url = f"/api/batch-video/video/{batch_id}/{result.video_path}"
@@ -751,22 +1432,26 @@ class VideoGeneratorTool(BaseTool):
 
 
 class EditImageTool(BaseTool):
-    """Edit an EXISTING image from a natural-language instruction (FLUX.1 Kontext).
+    """Edit an EXISTING image from a natural-language instruction.
 
+    Prefers Qwen-Image-Edit when installed, else FLUX.1 Kontext, else img2img.
     Use when the user SUPPLIES or ATTACHES an image and asks to add/remove/change
     something in it — e.g. 'put a cowboy hat on this character', 'make it night',
-    'remove the sign'. Preserves the original's identity/composition and applies
-    only the requested change. (Contrast generate_image, which makes a brand-new
-    image from text with no input picture.)"""
+    'remove the sign'. Same canvas, same pose. For a brand-new scene of a face
+    use generate_identity; for a brand-new picture with no reference use
+    generate_image."""
 
     name = "edit_image"
+    read_only = False
+    destructive = False
     description = (
         "Edit an existing image using a natural-language instruction. Use this when "
         "the user has attached/uploaded an image (or names one) and asks to add, "
         "remove, or change something in it, e.g. 'put a cowboy hat on this character'. "
         "Preserves the original subject and only applies the requested edit. If the "
         "user did not attach an image, ask them to attach one. Do NOT use this to make "
-        "a brand-new image from scratch — use generate_image for that."
+        "a brand-new image from scratch — use generate_image. For a new scene that "
+        "keeps a face from an attached photo, use generate_identity."
     )
     parameters = {
         "instruction": ToolParameter(
@@ -789,25 +1474,46 @@ class EditImageTool(BaseTool):
             name="model", type="string",
             description=(
                 "Image model/backend. Default follows /imagemodel (Settings). "
-                "'kontext' or 'auto' uses FLUX.1 Kontext instruction editing when installed; "
-                "other downloaded models (sd-xl, zimage-turbo, …) use img2img."
+                "'qwen-image-edit' or 'auto' uses Qwen-Image-Edit when installed; "
+                "'kontext' uses FLUX.1 Kontext; other downloaded models use img2img."
             ),
             required=False, default="auto",
+        ),
+        "reference_image_2": ToolParameter(
+            name="reference_image_2", type="string",
+            description="Optional second reference (another person or style). Qwen-Image-Edit only.",
+            required=False, default="",
+        ),
+        "reference_image_3": ToolParameter(
+            name="reference_image_3", type="string",
+            description="Optional third reference. Qwen-Image-Edit only.",
+            required=False, default="",
         ),
     }
 
     @staticmethod
-    def _uses_kontext_backend(model: str) -> bool:
+    def _pick_edit_backend(model: str) -> str:
         m = (model or "auto").strip().lower()
+        if m in _QWEN_EDIT_MODEL_IDS:
+            return "qwen"
         if m in _KONTEXT_MODEL_IDS:
-            return True
-        if m == "auto":
-            try:
-                from backend.services.comfyui_image_generator import ComfyUIImageGenerator
-                return ComfyUIImageGenerator()._kontext_installed()
-            except Exception:
-                return False
-        return False
+            return "kontext"
+        if m != "auto":
+            return "img2img"
+        try:
+            from backend.services.comfyui_image_generator import ComfyUIImageGenerator
+            gen = ComfyUIImageGenerator()
+            if gen.qwen_edit_installed():
+                return "qwen"
+            if gen._kontext_installed():
+                return "kontext"
+        except Exception:
+            pass
+        return "img2img"
+
+    @staticmethod
+    def _uses_kontext_backend(model: str) -> bool:
+        return EditImageTool._pick_edit_backend(model) == "kontext"
 
     def _edit_via_img2img(
         self, *, src: str, instruction: str, model: str, output_path: str,
@@ -912,13 +1618,20 @@ class EditImageTool(BaseTool):
         return None
 
     def execute(self, instruction: str, image: str = "", steps: int = 28,
-                model: str = "auto", **kwargs) -> ToolResult:
+                model: str = "auto", reference_image_2: str = "",
+                reference_image_3: str = "", **kwargs) -> ToolResult:
         src = self._resolve_image(image)
         if not src:
             return ToolResult(
                 success=False,
                 error="No image to edit. Ask the user to attach the image they want edited.",
             )
+        extra = []
+        for raw in (reference_image_2, reference_image_3):
+            if raw:
+                p = self._resolve_image(raw)
+                if p:
+                    extra.append(p)
         try:
             from backend.config import OUTPUT_DIR
             from backend.services.comfyui_image_generator import ComfyUIImageGenerator
@@ -929,13 +1642,19 @@ class EditImageTool(BaseTool):
             os.makedirs(output_dir, exist_ok=True)
             filename = f"edit_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.png"
             output_path = os.path.join(output_dir, filename)
+            backend = self._pick_edit_backend(effective_model)
+            gen = ComfyUIImageGenerator()
 
-            if self._uses_kontext_backend(effective_model):
-                ComfyUIImageGenerator().edit_image(
+            if backend == "qwen":
+                gen.edit_image_qwen(
+                    image_paths=[src, *extra], instruction=instruction,
+                    output_path=output_path, steps=int(steps) or 20,
+                )
+            elif backend == "kontext":
+                gen.edit_image(
                     image_path=src, instruction=instruction,
                     output_path=output_path, steps=int(steps),
                 )
-                backend = "kontext"
             else:
                 img2img_result = self._edit_via_img2img(
                     src=src, instruction=instruction,
@@ -943,7 +1662,6 @@ class EditImageTool(BaseTool):
                 )
                 if not img2img_result.success:
                     return img2img_result
-                image_url = (img2img_result.metadata or {}).get("image_url")
                 return ToolResult(
                     success=True,
                     output=img2img_result.output,
@@ -954,7 +1672,7 @@ class EditImageTool(BaseTool):
             return ToolResult(
                 success=True,
                 output=(
-                    f"Image edited successfully (kontext).\n"
+                    f"Image edited successfully ({backend}).\n"
                     f"Image URL: {image_url}\nEdit: {instruction}"
                 ),
                 metadata={
@@ -968,3 +1686,307 @@ class EditImageTool(BaseTool):
         except Exception as e:
             logger.error(f"EditImageTool error: {e}", exc_info=True)
             return ToolResult(success=False, error=f"Image edit failed: {str(e)}")
+
+
+def _chat_png_path(prefix: str) -> tuple[str, str]:
+    from backend.config import OUTPUT_DIR
+    output_dir = os.path.join(OUTPUT_DIR, "generated_images")
+    os.makedirs(output_dir, exist_ok=True)
+    filename = f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.png"
+    return os.path.join(output_dir, filename), filename
+
+
+class RemoveBackgroundTool(BaseTool):
+    """Cut the subject out of an attached photo (transparent PNG)."""
+
+    name = "remove_background"
+    read_only = False
+    destructive = False
+    description = (
+        "Remove the background from an attached photo and return a transparent PNG. "
+        "Use for product shots, stickers, and cut-outs. Does not invent a new scene — "
+        "use generate_identity or edit_image for that. The attached image is used "
+        "automatically if `image` is omitted."
+    )
+    parameters = {
+        "image": ToolParameter(
+            name="image", type="string",
+            description="Path of the photo. Usually omit — the attached image is used.",
+            required=False, default="",
+        ),
+    }
+
+    def execute(self, image: str = "", **kwargs) -> ToolResult:
+        src = EditImageTool()._resolve_image(image)
+        if not src:
+            return ToolResult(success=False, error="Attach the photo to cut out.")
+        from PIL import Image
+        from backend.services.background_removal import (
+            BackgroundRemovalNotInstalled, installed_model, remove_background,
+        )
+        try:
+            model_id = installed_model()
+            with Image.open(src) as im:
+                out = remove_background(im, model_id)
+            output_path, filename = _chat_png_path("nobg")
+            out.save(output_path)
+            image_url = f"/api/outputs/generated_images/{filename}"
+            return ToolResult(
+                success=True,
+                output=f"Background removed.\nImage URL: {image_url}",
+                metadata={"image_url": image_url, "filename": filename, "backend": model_id},
+            )
+        except BackgroundRemovalNotInstalled as e:
+            return ToolResult(success=False, error=str(e))
+        except Exception as e:
+            logger.error("remove_background failed: %s", e, exc_info=True)
+            return ToolResult(success=False, error=f"Background removal failed: {e}")
+
+
+class InpaintImageTool(BaseTool):
+    """Describe what to change or remove in an attached photo."""
+
+    name = "inpaint_image"
+    read_only = False
+    destructive = False
+    description = (
+        "Change or remove something in an attached photo from a natural-language "
+        "instruction ('remove the coffee cup', 'replace the sky with sunset'). "
+        "Uses Qwen-Image-Edit when installed, else FLUX Kontext. For extending the "
+        "canvas use outpaint_image. For a brand-new scene of a person's face use "
+        "generate_identity."
+    )
+    parameters = {
+        "instruction": ToolParameter(
+            name="instruction", type="string",
+            description="What to change or remove.",
+            required=True,
+        ),
+        "image": ToolParameter(
+            name="image", type="string",
+            description="Path of the photo. Usually omit — the attached image is used.",
+            required=False, default="",
+        ),
+        "steps": ToolParameter(
+            name="steps", type="int",
+            description="Diffusion steps. Default 20.",
+            required=False, default=20,
+        ),
+    }
+
+    def execute(self, instruction: str, image: str = "", steps: int = 20, **kwargs) -> ToolResult:
+        model = kwargs.get("model") or "auto"
+        return EditImageTool().execute(
+            instruction=instruction, image=image, steps=int(steps) or 20, model=model,
+        )
+
+
+class OutpaintImageTool(BaseTool):
+    """Extend the canvas and fill the new area."""
+
+    name = "outpaint_image"
+    read_only = False
+    destructive = False
+    description = (
+        "Expand an attached photo in one or more directions and fill the new area "
+        "so it matches the scene. Use when the user says extend, expand the canvas, "
+        "or outpaint. Prefer Qwen-Image-Edit when installed."
+    )
+    parameters = {
+        "image": ToolParameter(
+            name="image", type="string",
+            description="Path of the photo. Usually omit — the attached image is used.",
+            required=False, default="",
+        ),
+        "instruction": ToolParameter(
+            name="instruction", type="string",
+            description="Optional fill direction, e.g. 'continue the forest to the left'.",
+            required=False, default="",
+        ),
+        "left": ToolParameter(name="left", type="int", description="Pixels to add on the left (multiples of 8).", required=False, default=0),
+        "right": ToolParameter(name="right", type="int", description="Pixels to add on the right.", required=False, default=0),
+        "top": ToolParameter(name="top", type="int", description="Pixels to add on the top.", required=False, default=0),
+        "bottom": ToolParameter(name="bottom", type="int", description="Pixels to add on the bottom.", required=False, default=0),
+        "steps": ToolParameter(name="steps", type="int", description="Diffusion steps. Default 20.", required=False, default=20),
+    }
+
+    def execute(self, image: str = "", instruction: str = "", left: int = 0, right: int = 0,
+                top: int = 0, bottom: int = 0, steps: int = 20, **kwargs) -> ToolResult:
+        src = EditImageTool()._resolve_image(image)
+        if not src:
+            return ToolResult(success=False, error="Attach the photo to extend.")
+        pad = {
+            "left": max(0, int(left) or 0),
+            "right": max(0, int(right) or 0),
+            "top": max(0, int(top) or 0),
+            "bottom": max(0, int(bottom) or 0),
+            "feathering": 40,
+        }
+        if not any(pad[k] for k in ("left", "right", "top", "bottom")):
+            # Default: grow 256 px on every side when the user didn't specify.
+            pad.update({"left": 256, "right": 256, "top": 256, "bottom": 256})
+        fill = (instruction or "").strip() or (
+            "Fill the extended canvas so it continues the original scene, matching lighting, "
+            "perspective and style. Do not change the original subject."
+        )
+        try:
+            from backend.services.comfyui_image_generator import ComfyUIImageGenerator
+            gen = ComfyUIImageGenerator()
+            output_path, filename = _chat_png_path("outpaint")
+            if gen.qwen_edit_installed():
+                gen.edit_image_qwen(
+                    image_paths=[src], instruction=fill, output_path=output_path,
+                    steps=int(steps) or 20, pad=pad,
+                )
+                backend = "qwen"
+            elif gen._kontext_installed():
+                # Kontext has no pad node in its graph; instruct it instead.
+                gen.edit_image(
+                    image_path=src,
+                    instruction=f"Outpaint: {fill}",
+                    output_path=output_path, steps=max(int(steps) or 20, 20),
+                )
+                backend = "kontext"
+            else:
+                from backend.services.image_editing_packs import missing_message
+                return ToolResult(success=False, error=missing_message("outpaint_image"))
+            image_url = f"/api/outputs/generated_images/{filename}"
+            return ToolResult(
+                success=True,
+                output=f"Canvas extended ({backend}).\nImage URL: {image_url}",
+                metadata={"image_url": image_url, "filename": filename, "backend": backend, "pad": pad},
+            )
+        except Exception as e:
+            logger.error("outpaint_image failed: %s", e, exc_info=True)
+            return ToolResult(success=False, error=f"Outpaint failed: {e}")
+
+
+class GenerateIdentityTool(BaseTool):
+    """New scene from a face photo (PuLID-FLUX). Consent is a stored record.
+
+    The likeness gate is a ``.consent`` sidecar next to the resolved reference
+    image (``backend.services.consent_records``), written only by the chat
+    consent card or a UI upload. A ``consented`` argument from a caller is
+    validated but is not proof: without the record the tool refuses with
+    ``needs_consent`` in its metadata so the caller can obtain one.
+    """
+
+    name = "generate_identity"
+    read_only = False
+    destructive = False
+    # The chat engine pauses on this tool and shows a consent card; on approval
+    # it records consent for the reference image and then runs the tool.
+    requires_approval = True
+    consent_gate = True
+    approval_prompt = (
+        "Confirm you have the right to use this person's likeness: it is your "
+        "own photo, or a Cast subject you uploaded. Guaardvark keeps a record "
+        "next to the photo so it will not ask again for the same image."
+    )
+    description = (
+        "Generate a brand-new image that keeps the face from an attached photo. "
+        "Use when the user wants this person in a new scene, outfit, or era "
+        "('this person as a 1940s detective'). Runs only for a likeness the user "
+        "has confirmed they may use (their own photo or a Cast subject they "
+        "uploaded); the chat asks for that confirmation. Not a face swap onto an "
+        "existing poster; not an instruction edit of the same photo (use edit_image "
+        "for that). Needs pulid-flux + flux-dev."
+    )
+    parameters = {
+        "prompt": ToolParameter(
+            name="prompt", type="string",
+            description="The new scene, in prose. Do not repeat the person's name; identity comes from the photo.",
+            required=True,
+        ),
+        "image": ToolParameter(
+            name="image", type="string",
+            description="Face reference. Usually omit — the attached image is used.",
+            required=False, default="",
+        ),
+        "consented": ToolParameter(
+            name="consented", type="bool",
+            description=(
+                "Caller's statement that the user may use this likeness. Not proof on "
+                "its own: the tool runs only when a consent record exists for the image."
+            ),
+            required=False, default=True,
+        ),
+        "width": ToolParameter(name="width", type="int", required=False, default=768),
+        "height": ToolParameter(name="height", type="int", required=False, default=1024),
+        "steps": ToolParameter(name="steps", type="int", required=False, default=20),
+        # Likeness experiment switches; omitted = the generator's defaults.
+        "weight": ToolParameter(
+            name="weight", type="float", required=False,
+            description="PuLID identity weight; default from the pulid-flux registry entry (1.0, measured 2026-09-19).",
+        ),
+        "start_at": ToolParameter(
+            name="start_at", type="float", required=False,
+            description="Fraction of the denoise at which identity starts applying; default from the registry (0.2: keeps the scene, then the face).",
+        ),
+        "end_at": ToolParameter(
+            name="end_at", type="float", required=False,
+            description="Fraction of the denoise at which identity stops applying (default 1.0).",
+        ),
+        "unet_dtype": ToolParameter(
+            name="unet_dtype", type="string", required=False,
+            description="FLUX UNET load dtype: fp8_e4m3fn, bf16 or default (default: the configured fp8).",
+        ),
+        "node_variant": ToolParameter(
+            name="node_variant", type="string", required=False,
+            description="PuLID apply node: pulid_flux (default) or pulid_classic.",
+        ),
+    }
+
+    _PASSTHROUGH = ("weight", "start_at", "end_at", "unet_dtype", "node_variant")
+
+    def execute(self, prompt: str, consented: bool = True, image: str = "",
+                width: int = 768, height: int = 1024, steps: int = 20, **kwargs) -> ToolResult:
+        from backend.services.consent_records import has_consent
+        consented = str(consented).lower() in ("1", "true", "yes")
+        if not consented:
+            return ToolResult(
+                success=False,
+                error="generate_identity was called with consented=false. Only run it for a "
+                      "likeness the user has the right to use (their photo or a Cast subject "
+                      "they uploaded).",
+            )
+        src = EditImageTool()._resolve_image(image)
+        if not src:
+            return ToolResult(success=False, error="Attach a face photo, then describe the new scene.")
+        if not has_consent(src):
+            return ToolResult(
+                success=False,
+                error=(
+                    "No consent record for this reference image. The user must confirm "
+                    "they have the right to use this likeness (in chat, approve the consent "
+                    "card; the record is stored next to the photo)."
+                ),
+                metadata={"needs_consent": True, "reference_image": src},
+            )
+        try:
+            from backend.services.comfyui_image_generator import ComfyUIImageGenerator
+            output_path, filename = _chat_png_path("identity")
+            overrides = {
+                k: kwargs[k] for k in self._PASSTHROUGH
+                if kwargs.get(k) is not None and kwargs.get(k) != ""
+            }
+            ComfyUIImageGenerator().generate_with_identity(
+                image_path=src, prompt=prompt, output_path=output_path,
+                width=int(width) or 768, height=int(height) or 1024,
+                steps=int(steps) or 20, **overrides,
+            )
+            image_url = f"/api/outputs/generated_images/{filename}"
+            return ToolResult(
+                success=True,
+                output=(
+                    f"New image generated from the face reference (PuLID-FLUX).\n"
+                    f"Image URL: {image_url}\nPrompt: {prompt}"
+                ),
+                metadata={
+                    "image_url": image_url, "filename": filename,
+                    "backend": "pulid-flux", "prompt": prompt,
+                },
+            )
+        except Exception as e:
+            logger.error("generate_identity failed: %s", e, exc_info=True)
+            return ToolResult(success=False, error=f"Identity generate failed: {e}")

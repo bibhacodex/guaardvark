@@ -34,6 +34,9 @@ def spy(monkeypatch, gen):
     import backend.services.gpu_memory_orchestrator as gmo
     monkeypatch.setattr(gmo, "get_orchestrator", lambda: _Orch())
     monkeypatch.setattr(gen, "_device", "cuda")
+    # The probe runs only when torch reports CUDA; stub it so the eviction
+    # tests exercise the same branch on a CPU-only or Apple Silicon box.
+    monkeypatch.setattr(oig.torch.cuda, "is_available", lambda: True)
     return calls
 
 
@@ -147,7 +150,10 @@ def test_estimate_sd_family_default(gen):
 
 
 def test_ram_estimate_zimage(gen):
-    assert gen._ram_estimate_gb("Tongyi-MAI/Z-Image-Turbo") == 24.0
+    # The base is the family constant, not a number copied into the test:
+    # 2f0f522 lowered it 24 -> 21 (measured after the ladder/unload leak fixes)
+    # and this assertion kept saying 24 for weeks.
+    assert gen._ram_estimate_gb("Tongyi-MAI/Z-Image-Turbo") == oig.OfflineImageGenerator._FAMILY_RAM_GB["zimage"]
 
 
 def test_ram_estimate_sdxl(gen):
@@ -203,11 +209,14 @@ def test_cpu_device_skips_vram_check_but_still_registers(gen, spy, monkeypatch):
     assert spy["requests"] == [("sd:pipeline", 4000, 85)]
 
 
-def test_admission_failure_never_raises(gen, monkeypatch):
-    # Orchestrator down, CUDA query exploding — generation must still proceed.
-    monkeypatch.setattr(gen, "_device", "cuda")
+def test_admission_failure_never_raises(gen, spy, monkeypatch):
+    # A CUDA query exploding must not kill the request: the probe/evict step is
+    # best-effort and the orchestrator is still consulted. (Only the
+    # orchestrator's own hard_fit refusal may raise, so it is stubbed here;
+    # against the real one the outcome would depend on the card's free VRAM.)
     monkeypatch.setattr(oig.torch.cuda, "mem_get_info", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
     gen._ensure_vram_for_pipeline("Tongyi-MAI/Z-Image-Turbo")  # must not raise
+    assert len(spy["requests"]) == 1
 
 
 # --- img2img pipeline family routing (Z-Image uses transformer, not unet) ---
@@ -287,18 +296,23 @@ def test_build_img2img_sd_uses_unet(gen, monkeypatch):
 
 def test_estimate_dims_none_matches_constants(gen):
     assert gen._vram_estimate_mb("Tongyi-MAI/Z-Image-Turbo") == 11000
-    assert gen._ram_estimate_gb("Tongyi-MAI/Z-Image-Turbo") == 24.0
+    # The base is the family constant, not a number copied into the test:
+    # 2f0f522 lowered it 24 -> 21 (measured after the ladder/unload leak fixes)
+    # and this assertion kept saying 24 for weeks.
+    assert gen._ram_estimate_gb("Tongyi-MAI/Z-Image-Turbo") == oig.OfflineImageGenerator._FAMILY_RAM_GB["zimage"]
 
 
 def test_estimate_1mp_matches_constants(gen):
     assert gen._vram_estimate_mb("Tongyi-MAI/Z-Image-Turbo", 1024, 1024) == 11000
-    assert gen._ram_estimate_gb("Tongyi-MAI/Z-Image-Turbo", 1024, 1024) == 24.0
+    assert gen._ram_estimate_gb("Tongyi-MAI/Z-Image-Turbo", 1024, 1024) == oig.OfflineImageGenerator._FAMILY_RAM_GB["zimage"]
 
 
 def test_estimate_2048_adds_slope(gen):
     # 2048² = 4MP ⇒ 3 extra MP above the calibration point.
     assert gen._vram_estimate_mb("Tongyi-MAI/Z-Image-Turbo", 2048, 2048) == 11000 + 3 * 500
-    assert gen._ram_estimate_gb("Tongyi-MAI/Z-Image-Turbo", 2048, 2048) == 24.0 + 3 * 1.0
+    base = oig.OfflineImageGenerator._FAMILY_RAM_GB["zimage"]
+    slope = oig.OfflineImageGenerator._FAMILY_RAM_SLOPE_GB_PER_MP.get("zimage", 1.0)
+    assert gen._ram_estimate_gb("Tongyi-MAI/Z-Image-Turbo", 2048, 2048) == base + 3 * slope
 
 
 def test_estimate_monotonic_in_resolution(gen):

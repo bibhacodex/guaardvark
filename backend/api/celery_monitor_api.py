@@ -13,11 +13,11 @@ def list_tasks():
         # Use delayed import to avoid circular dependency
         from backend.celery_app import celery
         insp = celery.control.inspect()
-        return success_response("Celery tasks retrieved", {
+        return success_response({
             "active": insp.active() or {},
             "reserved": insp.reserved() or {},
             "scheduled": insp.scheduled() or {},
-        })
+        }, "Celery tasks retrieved")
     except ImportError as e:
         return error_response(f"Celery not available: {str(e)}", 503, "CELERY_UNAVAILABLE")
     except Exception as e:

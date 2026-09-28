@@ -21,6 +21,34 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIDS_DIR="$SCRIPT_DIR/pids"
 # shellcheck source=scripts/lib/start_lock.sh
 . "$SCRIPT_DIR/scripts/lib/start_lock.sh"
+# shellcheck source=scripts/lib/ollama_lifecycle.sh
+. "$SCRIPT_DIR/scripts/lib/ollama_lifecycle.sh"
+
+# Flags. Ollama policy: by default only the instance start.sh launched is stopped;
+# --keep-ollama (or GUAARDVARK_OLLAMA_KEEP_RUNNING=1 in .env) touches nothing;
+# --all also stops user-owned serves, the systemd service and a dead port holder.
+STOP_ALL=0
+KEEP_OLLAMA=0
+for arg in "$@"; do
+    case "$arg" in
+        --all) STOP_ALL=1 ;;
+        --keep-ollama) KEEP_OLLAMA=1 ;;
+        --help|-h)
+            echo "Usage: ./stop.sh [--keep-ollama] [--all]"
+            echo "  --keep-ollama   leave Ollama running even if start.sh launched it"
+            echo "  --all           also stop user-owned ollama serve processes and the systemd service"
+            exit 0 ;;
+        *) echo "Unknown option: $arg (see --help)" >&2; exit 1 ;;
+    esac
+done
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    _keep_line=$(grep -E '^GUAARDVARK_OLLAMA_KEEP_RUNNING=' "$SCRIPT_DIR/.env" | tail -1)
+    [ -n "$_keep_line" ] && export "$_keep_line"
+    _ext_line=$(grep -E '^GUAARDVARK_OLLAMA_EXTERNAL=' "$SCRIPT_DIR/.env" | tail -1)
+    [ -n "$_ext_line" ] && export "$_ext_line"
+fi
+# An external Ollama is never ours to stop.
+[ "${GUAARDVARK_OLLAMA_EXTERNAL:-0}" = 1 ] && KEEP_OLLAMA=1
 
 vader_header "Guaardvark Stop Script"
 
@@ -79,14 +107,45 @@ _proc_cwd() {
     printf '%s' "$cwd"
 }
 
-# ── Helper: check if a plugin is enabled in its plugin.json ──
+# ── Helper: is a plugin enabled? data/plugin_state.json (user choice) wins over
+# the manifest's default_enabled (plugin.local.json overrides plugin.json). ──
 _plugin_enabled() {
-    local plugin_json="$SCRIPT_DIR/plugins/$1/plugin.json"
-    if [ -f "$plugin_json" ] && command -v python3 >/dev/null 2>&1; then
-        python3 -c "import json; print(json.load(open('$plugin_json')).get('config',{}).get('enabled',False))" 2>/dev/null
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$SCRIPT_DIR" "$1" <<'PY' 2>/dev/null || echo "False"
+import json, sys
+root, pid = sys.argv[1], sys.argv[2]
+try:
+    state = json.load(open(f"{root}/data/plugin_state.json")).get("user_enabled", {})
+    if pid in state:
+        print(bool(state[pid])); sys.exit(0)
+except Exception:
+    pass
+for name in ("plugin.local.json", "plugin.json"):
+    try:
+        cfg = json.load(open(f"{root}/plugins/{pid}/{name}")).get("config", {})
+        if "default_enabled" in cfg:
+            print(bool(cfg["default_enabled"])); sys.exit(0)
+    except Exception:
+        continue
+print(False)
+PY
     else
         echo "False"
     fi
+}
+
+# ── Helper: a plugin's port from plugin.local.json / plugin.json ──
+_plugin_port() {
+    python3 - "$SCRIPT_DIR" "$1" "$2" <<'PY' 2>/dev/null || echo "$2"
+import json, sys
+root, pid, fallback = sys.argv[1], sys.argv[2], sys.argv[3]
+for name in ("plugin.local.json", "plugin.json"):
+    try:
+        print(int(json.load(open(f"{root}/plugins/{pid}/{name}"))["port"])); sys.exit(0)
+    except Exception:
+        continue
+print(fallback)
+PY
 }
 
 # ── Helper: check if a plugin is actually running (PID file + process alive) ──
@@ -119,6 +178,8 @@ comfyui_running=false
 _plugin_running "comfyui" && comfyui_running=true
 
 comfyui_stopped=false
+
+COMFYUI_PORT=$(_plugin_port comfyui 8188)
 
 if [ "$comfyui_enabled" = "False" ] && [ "$comfyui_running" = false ]; then
     vader_info "ComfyUI: not enabled, skipping."
@@ -153,22 +214,6 @@ else
         rm -f "$PIDS_DIR/comfyui.pid"
     fi
 
-    # 3. Kill any remaining process on port 8188 (ComfyUI default)
-    if command -v lsof >/dev/null 2>&1; then
-        port_8188_pids=$(lsof -i TCP:8188 -sTCP:LISTEN -t 2>/dev/null)
-        if [ -n "$port_8188_pids" ]; then
-            for pid in $port_8188_pids; do
-                vader_info "Killing orphaned ComfyUI process on port 8188 (PID: $pid)..."
-                kill -TERM "$pid" 2>/dev/null
-                sleep 1
-                if kill -0 "$pid" 2>/dev/null; then
-                    kill -KILL "$pid" 2>/dev/null
-                fi
-                comfyui_stopped=true
-            done
-        fi
-    fi
-
 if [ "$comfyui_stopped" = true ]; then
     vader_success "ComfyUI shutdown complete."
 else
@@ -176,79 +221,28 @@ else
 fi
 fi  # end comfyui_enabled/running check
 
-# ── Stop Ollama (PID file → user processes → systemd → port cleanup) ──
-vader_info "Stopping Ollama..."
-ollama_killed=0
-
-# 1. Kill by PID file first
-OLLAMA_PID_FILE="$PIDS_DIR/ollama.pid"
-if [ -f "$OLLAMA_PID_FILE" ]; then
-    OLLAMA_PID=$(cat "$OLLAMA_PID_FILE" 2>/dev/null)
-    if [ -n "$OLLAMA_PID" ] && kill -0 "$OLLAMA_PID" 2>/dev/null; then
-        vader_info "Stopping Ollama via PID file (PID: $OLLAMA_PID)..."
-        kill -TERM "$OLLAMA_PID" 2>/dev/null
-        sleep 2
-        if kill -0 "$OLLAMA_PID" 2>/dev/null; then
-            kill -KILL "$OLLAMA_PID" 2>/dev/null
-            sleep 1
-        fi
-        if ! kill -0 "$OLLAMA_PID" 2>/dev/null; then
-            ollama_killed=$((ollama_killed + 1))
-        fi
-    fi
-    rm -f "$OLLAMA_PID_FILE"
-fi
-
-# 2. Kill any 'ollama serve' process owned by the current user (NOT the systemd 'ollama' user)
-CURRENT_USER=$(whoami)
-ollama_serve_pids=$(pgrep -f "ollama serve" 2>/dev/null)
-if [ -n "$ollama_serve_pids" ]; then
-    for pid in $ollama_serve_pids; do
-        # Check process owner — only kill our own user's processes
-        proc_owner=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
-        if [ "$proc_owner" = "$CURRENT_USER" ]; then
-            vader_info "Killing user-owned ollama serve (PID: $pid, owner: $proc_owner)..."
+# 3. Orphaned listener on the ComfyUI port — always swept, because a router
+#    direct-launch or a crashed plugin leaves no PID file.
+if command -v lsof >/dev/null 2>&1; then
+    port_pids=$(lsof -i TCP:"$COMFYUI_PORT" -sTCP:LISTEN -t 2>/dev/null)
+    if [ -n "$port_pids" ]; then
+        for pid in $port_pids; do
+            vader_info "Killing orphaned ComfyUI process on port $COMFYUI_PORT (PID: $pid)..."
             kill -TERM "$pid" 2>/dev/null
             sleep 1
             if kill -0 "$pid" 2>/dev/null; then
                 kill -KILL "$pid" 2>/dev/null
             fi
-            ollama_killed=$((ollama_killed + 1))
-        fi
-    done
-fi
-
-# 3. Try stopping the systemd service (passwordless if sudoers rule exists)
-if command -v systemctl >/dev/null 2>&1; then
-    if sudo -n systemctl stop ollama 2>/dev/null; then
-        vader_info "Stopped Ollama systemd service"
-        ollama_killed=$((ollama_killed + 1))
-    fi
-fi
-
-# 4. Final check — if port 11434 is still occupied, kill whatever is holding it
-if command -v lsof >/dev/null 2>&1; then
-    port_11434_pids=$(lsof -i TCP:11434 -sTCP:LISTEN -t 2>/dev/null)
-    if [ -n "$port_11434_pids" ]; then
-        for pid in $port_11434_pids; do
-            # Only kill if it doesn't respond to health check (zombie)
-            if ! curl -sf --max-time 2 http://127.0.0.1:11434/ >/dev/null 2>&1; then
-                vader_info "Killing unresponsive process on port 11434 (PID: $pid)..."
-                kill -TERM "$pid" 2>/dev/null
-                sleep 1
-                if kill -0 "$pid" 2>/dev/null; then
-                    kill -KILL "$pid" 2>/dev/null
-                fi
-                ollama_killed=$((ollama_killed + 1))
-            fi
         done
     fi
 fi
 
+# ── Stop Ollama (policy in scripts/lib/ollama_lifecycle.sh) ──
+OLLAMA_STOP_MODE=$(ollama_stop_mode "$STOP_ALL" "$KEEP_OLLAMA")
+vader_info "Ollama: $OLLAMA_STOP_MODE"
+stop_ollama "$OLLAMA_STOP_MODE" "$PIDS_DIR/ollama.pid"
 if [ "$ollama_killed" -gt 0 ]; then
     vader_success "Ollama stopped ($ollama_killed action(s) taken)."
-else
-    vader_info "Ollama was not running (or managed externally)."
 fi
 
 # ── Stop Guaardvark-owned alt Redis (sidecar on 6380–6399 only) ──
@@ -285,10 +279,13 @@ fi
 kill_and_cleanup "backend"
 kill_and_cleanup "frontend"
 kill_and_cleanup "celery"
+# Optional external whisper.cpp server started by start.sh when
+# GUAARDVARK_USE_WHISPER_SERVER=1.
+kill_and_cleanup "whisper_server"
 
 # Clear Python bytecode cache so stale .pyc files never load old code
-find "$SCRIPT_DIR/backend" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
-find "$SCRIPT_DIR/backend" -name "*.pyc" -delete 2>/dev/null
+find "$SCRIPT_DIR/backend" -path "*/venv" -prune -o -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
+find "$SCRIPT_DIR/backend" -path "*/venv" -prune -o -name "*.pyc" -type f -exec rm -f {} + 2>/dev/null
 
 vader_info "Cleaning up any remaining processes from this environment..."
 

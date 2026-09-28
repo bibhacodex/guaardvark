@@ -1,6 +1,8 @@
 import logging
 import os
 
+from typing import Optional
+
 from flask import current_app, has_app_context
 
 try:
@@ -16,6 +18,20 @@ logger = logging.getLogger(__name__)
 def get_chat_image_model() -> str:
     """Chat image model for /imagine, generate_image, and edit_image (default: auto)."""
     return get_setting("chat_image_model", default="auto") or "auto"
+
+
+def get_active_video_model() -> str:
+    """Persisted global video model id, or empty to use hardware fallback."""
+    return (get_setting("active_video_model", default="") or "").strip()
+
+
+def get_active_video_model_overrides() -> dict:
+    """Optional per-role / per-pipeline video model overrides (empty = inherit)."""
+    return {
+        "i2v": (get_setting("active_video_model_i2v", default="") or "").strip(),
+        "music_video": (get_setting("active_video_model_music_video", default="") or "").strip(),
+        "film_crew": (get_setting("active_video_model_film_crew", default="") or "").strip(),
+    }
 
 
 def get_web_access() -> bool:
@@ -94,7 +110,6 @@ SYSTEM_SETTING_KEYS = {
 ENV_VAR_MAP = {
     "enhanced_context_enabled": "GUAARDVARK_ENHANCED_CONTEXT",
     "advanced_rag_enabled": "GUAARDVARK_ADVANCED_RAG",
-    "rag_debug_enabled": "GUAARDVARK_RAG_DEBUG",
     "claude_escalation_mode": "GUAARDVARK_CLAUDE_ESCALATION_MODE",
     "claude_monthly_budget": "GUAARDVARK_CLAUDE_TOKEN_BUDGET",
     "vision_pipeline_enabled": "GUAARDVARK_VISION_PIPELINE",
@@ -104,6 +119,8 @@ ENV_VAR_MAP = {
     "vision_pipeline_monitor_model": "GUAARDVARK_VISION_MONITOR_MODEL",
     "vision_pipeline_escalation_model": "GUAARDVARK_VISION_ESCALATION_MODEL",
     "vision_pipeline_auto_select": "GUAARDVARK_VISION_AUTO_SELECT",
+    "eye_ranking": "GUAARDVARK_EYE_RANKING",
+    "servo_correction": "GUAARDVARK_SERVO_CORRECTION",
     "gpu_quality_tier": "GUAARDVARK_GPU_QUALITY_TIER",
     "gpu_eviction_grace": "GUAARDVARK_GPU_EVICTION_GRACE",
     "gpu_idle_timeout": "GUAARDVARK_GPU_IDLE_TIMEOUT",
@@ -113,9 +130,35 @@ ENV_VAR_MAP = {
     "media_stills_model": "GUAARDVARK_STILLS_MODEL",
     "media_cast_train_base": "GUAARDVARK_CAST_TRAIN_BASE",
     "media_max_quality_model": "GUAARDVARK_MAX_QUALITY_MODEL",
+    "confine_tool_paths": "GUAARDVARK_CONFINE_TOOL_PATHS",
 }
 
 _BOOL_TRUTHY = {"true", "1", "yes"}
+
+_SECRET_KEY_SUFFIXES = ("_key", "_token", "_secret")
+
+
+def is_secret_key(key: str) -> bool:
+    """True for setting keys whose value is a credential.
+
+    Suffix-matched on purpose: claude_token_usage is a counter, not a token.
+    """
+    lowered = (key or "").lower()
+    return lowered.endswith(_SECRET_KEY_SUFFIXES) or "password" in lowered
+
+
+def redact_exception(exc: BaseException, *keys: str) -> str:
+    """Exception text that is safe to log while handling *keys*.
+
+    A failed DBAPI statement stringifies with its bound parameters attached
+    ("[parameters: {'value': 'sk-live-...'}]"), so logging a write error for a
+    credential key writes the credential to the log. For those keys only the
+    exception type is reported; the type is what tells the operator whether the
+    database was down or the statement was wrong.
+    """
+    if any(is_secret_key(key) for key in keys):
+        return f"{type(exc).__name__} (details withheld: secret setting)"
+    return str(exc)
 
 
 def _cast_value(value: str, cast):
@@ -140,7 +183,7 @@ def get_setting(key: str, default=None, cast=str):
                 if row and row.value is not None:
                     return _cast_value(row.value, cast) if cast != str else row.value
         except Exception as e:
-            logger.warning(f"get_setting({key!r}) DB read failed: {e}")
+            logger.warning("get_setting(%r) DB read failed: %s", key, redact_exception(e, key))
 
     # 2. Try env var
     env_name = ENV_VAR_MAP.get(key)
@@ -178,8 +221,28 @@ def save_setting(key: str, value: str):
             db.session.add(row)
         db.session.commit()
     except Exception as e:
-        logger.error(f"save_setting({key!r}) failed: {e}")
+        logger.error("save_setting(%r) failed: %s", key, redact_exception(e, key))
         try:
             db.session.rollback()
         except Exception:
             pass
+
+
+# Tools read this from worker threads that have no app context, so the value
+# is kept for the process: loaded at startup, updated when the setting is saved.
+_confine_tool_paths: Optional[bool] = None
+
+
+def get_confine_tool_paths() -> bool:
+    """True when file-reading tools (system_command, codegen) are limited to the
+    project folder and GUAARDVARK_ALLOWED_PATHS. Off by default."""
+    global _confine_tool_paths
+    if has_app_context() or _confine_tool_paths is None:
+        _confine_tool_paths = bool(get_setting("confine_tool_paths", default=False, cast=bool))
+    return _confine_tool_paths
+
+
+def set_confine_tool_paths(enabled: bool) -> None:
+    global _confine_tool_paths
+    save_setting("confine_tool_paths", "true" if enabled else "false")
+    _confine_tool_paths = bool(enabled)

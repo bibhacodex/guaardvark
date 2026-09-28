@@ -3,6 +3,8 @@ from flask import Blueprint, jsonify, request
 from backend.services.rag_autoresearch_service import get_autoresearch_service
 from backend.models import ExperimentRun, EvalPair, ResearchConfig, Setting, db
 
+DEFAULT_START_BUDGET_HOURS = 6.0
+
 autoresearch_bp = Blueprint("autoresearch", __name__, url_prefix="/api/autoresearch")
 
 
@@ -14,26 +16,22 @@ def get_status():
 
 @autoresearch_bp.route("/start", methods=["POST"])
 def start_loop():
-    svc = get_autoresearch_service()
-    if svc.is_running():
-        return jsonify({"error": "Already running"}), 409
-    _set_kill_flag("false")
-    max_exp = request.json.get("max_experiments", 0) if request.is_json else 0
-    import threading
-    from flask import current_app
-
-    # run_loop touches the DB (corpus check, experiment logging) on every iteration,
-    # all of which needs a Flask app context. A bare thread has none, so capture the
-    # real app object here (inside the request context) and push it inside the thread.
-    app = current_app._get_current_object()
-
-    def _runner():
-        with app.app_context():
-            svc.run_loop(max_experiments=max_exp)
-
-    t = threading.Thread(target=_runner, daemon=True)
-    t.start()
-    return jsonify({"status": "started"})
+    """Alias for a bounded ResearchRun. The unbounded in-process loop is
+    how the 2026-08 runaway started; Play /start now shares kickoff()
+    with Research Tonight.
+    """
+    from backend.services.research_run_service import get_research_run_service
+    body = request.get_json(silent=True) or {}
+    hours = body.get("budget_hours")
+    if hours is None:
+        hours = DEFAULT_START_BUDGET_HOURS
+    result = get_research_run_service().kickoff(
+        mode=body.get("mode") or "unified",
+        budget_hours=hours,
+        trigger="manual",
+    )
+    status = 409 if "error" in result else 202
+    return jsonify(result), status
 
 
 def _set_kill_flag(value: str) -> None:
@@ -81,8 +79,30 @@ def get_config():
     return jsonify(config)
 
 
+# Settings rows the Settings page edits (proposer, judge, window, auto-start
+# and the older rag_autoresearch_* knobs). GET /settings fills defaults for any
+# key that has no row, so resetting means deleting the rows.
+AUTORESEARCH_SETTING_KEYS = (
+    "rag_autoresearch_idle_minutes",
+    "rag_autoresearch_auto_enabled",
+    "rag_autoresearch_max_experiments",
+    "rag_autoresearch_phase_limit",
+    "rag_autoresearch_judge_model",
+    "autoresearch_proposer_model",
+    "autoresearch_judge_model",
+    "autoresearch_nightly_window",
+)
+
+
 @autoresearch_bp.route("/config/reset", methods=["POST"])
 def reset_config():
+    """Reset everything the Settings page calls "autoresearch" to defaults.
+
+    Two stores are involved: the experiment config file (tuned params, baseline
+    score, phase progress) and the Setting rows behind the fields on the page.
+    Resetting only the file left the visible fields unchanged, so the button
+    appeared to do nothing while it had discarded the learned baseline.
+    """
     from backend.config import AUTORESEARCH_DEFAULT_PARAMS
     svc = get_autoresearch_service()
     config = {
@@ -93,7 +113,11 @@ def reset_config():
         "phase_plateau_count": 0,
     }
     svc._save_config(config)
-    return jsonify({"status": "reset", "config": config})
+    removed = Setting.query.filter(Setting.key.in_(AUTORESEARCH_SETTING_KEYS)).delete(
+        synchronize_session=False
+    )
+    db.session.commit()
+    return jsonify({"status": "reset", "config": config, "settings_reset": int(removed or 0)})
 
 
 @autoresearch_bp.route("/eval-pairs", methods=["GET"])
@@ -107,11 +131,30 @@ def regenerate_eval_pairs():
     svc = get_autoresearch_service()
     from backend.services.rag_eval_harness import LLMUnavailableError
     try:
-        pairs = svc.eval_harness.generate_eval_set()
+        body = request.get_json(silent=True) or {}
+        from backend.config import (
+            AUTORESEARCH_EVAL_PAIR_TARGET,
+            AUTORESEARCH_EVAL_PAIR_REGENERATE_MAX,
+        )
+        count = body.get("count") if isinstance(body, dict) else None
+        if count is not None:
+            try:
+                count = int(count)
+            except (TypeError, ValueError):
+                count = AUTORESEARCH_EVAL_PAIR_TARGET
+            count = max(1, min(count, AUTORESEARCH_EVAL_PAIR_REGENERATE_MAX))
+        pairs = svc.eval_harness.generate_eval_set(target_count=count)
     except LLMUnavailableError as e:
         return jsonify({"error": str(e)}), 503
     if not pairs:
-        return jsonify({"error": "No pairs generated — is the corpus indexed?"}), 400
+        from backend.config import AUTORESEARCH_MIN_CORPUS_SIZE
+        n_text = svc.eval_harness.text_document_count()
+        if n_text < AUTORESEARCH_MIN_CORPUS_SIZE:
+            return jsonify({"error": (
+                f"Only {n_text} indexed documents carry text; autoresearch needs "
+                f"{AUTORESEARCH_MIN_CORPUS_SIZE}. Images, audio and unextracted "
+                f"files do not count — index some documents first.")}), 400
+        return jsonify({"error": "No pairs generated — the LLM returned nothing usable for any document"}), 400
     # Regeneration REPLACES the active set: deactivate the old generation so
     # eval cost doesn't compound with every regenerate.
     EvalPair.query.filter(EvalPair.is_active.isnot(False)).update(
@@ -195,6 +238,28 @@ def log_experiment():
     if not body.get("parameter") or body.get("status") not in ("keep", "discard", "crash"):
         return jsonify({"error": "parameter and status(keep|discard|crash) required"}), 400
     import uuid as _uuid
+    from backend.config import AUTORESEARCH_KEEP_MIN_DELTA
+    status = body["status"]
+    source = body.get("source", "code_arm")
+    score = float(body.get("composite_score", 0.0) or 0.0)
+    baseline = float(body.get("baseline_score", 0.0) or 0.0)
+    delta = body.get("delta")
+    if delta is None:
+        delta = round(score - baseline, 4)
+    retr = body.get("retrieval_metrics") if isinstance(body.get("retrieval_metrics"), dict) else {}
+    retr = dict(retr)
+    retr.setdefault("layer", "code" if source == "code_arm" else source)
+    pytest_ok = body.get("pytest_passed", True)
+    if status == "keep" and source in ("code_arm", "heal"):
+        retr_up = (
+            (retr.get("mrr") or 0) > (retr.get("baseline_mrr") or 0)
+            or (retr.get("hit_rate_at_k") or 0) > (retr.get("baseline_hit_rate_at_k") or 0)
+        )
+        if (not pytest_ok) or score < baseline or not (
+            float(delta) >= AUTORESEARCH_KEEP_MIN_DELTA or retr_up
+        ):
+            status = "discard"
+            retr["preserve_and_extend_rejected"] = True
     row = ExperimentRun(
         id=str(_uuid.uuid4()),
         run_tag=body.get("run_tag"),
@@ -203,15 +268,16 @@ def log_experiment():
         old_value=None,
         new_value=str(body.get("new_value", ""))[:500],
         hypothesis=body.get("hypothesis"),
-        composite_score=float(body.get("composite_score", 0.0) or 0.0),
-        baseline_score=float(body.get("baseline_score", 0.0) or 0.0),
-        delta=body.get("delta"),
-        status=body["status"],
-        proposal_source=body.get("source", "code_arm"),
+        composite_score=score,
+        baseline_score=baseline,
+        delta=delta,
+        status=status,
+        proposal_source=source,
+        retrieval_metrics=retr or None,
     )
     db.session.add(row)
     db.session.commit()
-    return jsonify({"status": "logged", "id": row.id}), 201
+    return jsonify({"status": "logged", "id": row.id, "recorded_status": status}), 201
 
 
 @autoresearch_bp.route("/runs", methods=["POST"])
@@ -220,7 +286,7 @@ def create_run():
     from backend.services.research_run_service import get_research_run_service
     body = request.get_json(silent=True) or {}
     result = get_research_run_service().kickoff(
-        mode=body.get("mode", "rag_tuning"),
+        mode=body.get("mode") or "unified",
         budget_hours=body.get("budget_hours"),
         trigger="manual",
     )
@@ -282,6 +348,7 @@ def get_metrics():
                 "created_at": r.created_at.isoformat() if r.created_at else None,
                 "parameter": r.parameter_changed,
                 "new_value": r.new_value,
+                "hypothesis": r.hypothesis,
                 "status": r.status,
                 "composite_score": r.composite_score,
                 "delta": r.delta,

@@ -138,6 +138,7 @@ class ReadCodeTool(BaseTool):
     """Tool to read source code files"""
 
     name = "read_code"
+    read_only = True
     description = (
         "Read the complete contents of a source code file. "
         "Returns file content with line count and character count. "
@@ -191,6 +192,7 @@ class SearchCodeTool(BaseTool):
     """Tool to search for patterns across the codebase"""
 
     name = "search_code"
+    read_only = True
     description = (
         "Search for code patterns across the project using case-insensitive regex. "
         "Returns all matches with file paths, line numbers, and matched content. "
@@ -469,6 +471,7 @@ class ListCodeFilesTool(BaseTool):
     """Tool to list project directory structure (code-exploration)."""
 
     name = "list_code_files"
+    read_only = True
     description = (
         "List files and directories to understand project structure. "
         "Returns a formatted tree view of the directory contents. "
@@ -534,6 +537,7 @@ class VerifyChangeTool(BaseTool):
     """Tool to verify code changes were applied correctly"""
 
     name = "verify_change"
+    read_only = True
     description = (
         "Verify that a code change was successful by checking if text exists in file. "
         "Use after edit_code to confirm changes were applied correctly. "
@@ -608,10 +612,40 @@ class VerifyChangeTool(BaseTool):
             )
 
 
+def _repository_folder(tool: BaseTool, folder_id, with_physical_path: bool = False) -> tuple[dict | None, str | None]:
+    """What the repository tools need to know about a folder: is_repository,
+    parsed metadata and, when asked, its root on disk. Returns (info, None) or
+    (None, error). The MCP server has no Flask app, so there it asks the backend."""
+    from backend.utils.backend_http import BackendError, is_mcp_transport, request_json
+
+    if is_mcp_transport(tool):
+        try:
+            return request_json("GET", f"/api/files/folder/{int(folder_id)}/repository").data, None
+        except BackendError as e:
+            if e.status == 404:
+                return None, f"Folder {folder_id} not found."
+            return None, str(e)
+
+    folder = db.session.get(Folder, folder_id)
+    if not folder:
+        return None, f"Folder {folder_id} not found."
+    info = {
+        "id": folder.id,
+        "path": folder.path,
+        "is_repository": bool(folder.is_repository),
+        "metadata": json.loads(folder.repo_metadata) if folder.repo_metadata else None,
+    }
+    if with_physical_path:
+        from backend.api.files_api import get_physical_path
+        info["physical_path"] = str(get_physical_path(folder.path).resolve())
+    return info, None
+
+
 class GetRepositoryMapTool(BaseTool):
     """Tool to get the PageRank-based repository map of a Code Repository folder."""
 
     name = "get_repository_map"
+    read_only = True
     description = (
         "Retrieve the PageRank-based architectural repository map for a given folder ID. "
         "This map shows the most important functions and classes in the codebase and their relationships. "
@@ -632,18 +666,17 @@ class GetRepositoryMapTool(BaseTool):
             return ToolResult(success=False, error="Missing required parameter: folder_id")
 
         try:
-            folder = db.session.get(Folder, folder_id)
-            if not folder:
-                return ToolResult(success=False, error=f"Folder {folder_id} not found.")
+            folder, err = _repository_folder(self, folder_id)
+            if err:
+                return ToolResult(success=False, error=err)
 
-            if not folder.is_repository:
+            if not folder["is_repository"]:
                 return ToolResult(success=False, error=f"Folder {folder_id} is not marked as a Code Repository.")
 
-            if not folder.repo_metadata:
+            if not folder["metadata"]:
                 return ToolResult(success=False, error=f"Folder {folder_id} has no repository metadata generated yet.")
 
-            metadata = json.loads(folder.repo_metadata)
-            repo_map = metadata.get("repository_map")
+            repo_map = folder["metadata"].get("repository_map")
             
             if not repo_map:
                 return ToolResult(success=False, error="No repository map found in the metadata. It may still be generating.")
@@ -662,6 +695,7 @@ class GetDependencyGraphTool(BaseTool):
     """Tool to get the import dependency graph of a Code Repository folder."""
 
     name = "get_dependency_graph"
+    read_only = True
     description = (
         "Retrieve the file-level import dependency graph for a given folder ID. "
         "This returns a JSON string mapping files to the files they import. "
@@ -682,18 +716,17 @@ class GetDependencyGraphTool(BaseTool):
             return ToolResult(success=False, error="Missing required parameter: folder_id")
 
         try:
-            folder = db.session.get(Folder, folder_id)
-            if not folder:
-                return ToolResult(success=False, error=f"Folder {folder_id} not found.")
+            folder, err = _repository_folder(self, folder_id)
+            if err:
+                return ToolResult(success=False, error=err)
 
-            if not folder.is_repository:
+            if not folder["is_repository"]:
                 return ToolResult(success=False, error=f"Folder {folder_id} is not marked as a Code Repository.")
 
-            if not folder.repo_metadata:
+            if not folder["metadata"]:
                 return ToolResult(success=False, error=f"Folder {folder_id} has no repository metadata generated yet.")
 
-            metadata = json.loads(folder.repo_metadata)
-            dep_graph = metadata.get("dependency_graph")
+            dep_graph = folder["metadata"].get("dependency_graph")
             
             if not dep_graph:
                 return ToolResult(success=False, error="No dependency graph found in the metadata.")
@@ -712,6 +745,7 @@ class ReadASTNodeTool(BaseTool):
     """Tool to precisely extract a class or function from a Python file using AST."""
 
     name = "read_ast_node"
+    read_only = True
     description = (
         "Read the exact source code of a specific class or function from a Python file in a Code Repository folder. "
         "This is more precise and token-efficient than reading the entire file. "
@@ -753,16 +787,17 @@ class ReadASTNodeTool(BaseTool):
             if Path(filepath).is_absolute():
                 return ToolResult(success=False, error="filepath must be relative to the Code Repository folder.")
 
-            folder = db.session.get(Folder, folder_id)
-            if not folder:
-                return ToolResult(success=False, error=f"Folder {folder_id} not found.")
+            folder, err = _repository_folder(self, folder_id, with_physical_path=True)
+            if err:
+                return ToolResult(success=False, error=err)
 
-            if not folder.is_repository:
+            if not folder["is_repository"]:
                 return ToolResult(success=False, error=f"Folder {folder_id} is not marked as a Code Repository.")
 
-            from backend.api.files_api import get_physical_path
+            if not folder.get("physical_path"):
+                return ToolResult(success=False, error=f"Folder {folder_id} has no location on disk.")
 
-            repo_root = get_physical_path(folder.path).resolve()
+            repo_root = Path(folder["physical_path"]).resolve()
             full_path = (repo_root / filepath).resolve()
             try:
                 full_path.relative_to(repo_root)
@@ -829,6 +864,7 @@ class ListCodeRepositoriesTool(BaseTool):
     """Tool to list all folders marked as Code Repositories (for discovery in NL flows)."""
 
     name = "list_code_repositories"
+    read_only = True
     description = (
         "List all Code Repository folders that have been marked as such (is_repository=True) and analyzed. "
         "Returns id, name, path, and whether repo_metadata is available. "
@@ -840,16 +876,21 @@ class ListCodeRepositoriesTool(BaseTool):
 
     def execute(self, **kwargs) -> ToolResult:
         try:
-            repos = Folder.query.filter_by(is_repository=True).all()
-            result = []
-            for f in repos:
-                result.append({
-                    "id": f.id,
-                    "name": f.name,
-                    "path": f.path,
-                    "has_metadata": bool(f.repo_metadata),
-                    "description": (f.description or "")[:200] if f.description else ""
-                })
+            from backend.utils.backend_http import is_mcp_transport, request_json
+
+            if is_mcp_transport(self):
+                result = list((request_json("GET", "/api/files/repositories").data or {}).get("repositories") or [])
+            else:
+                repos = Folder.query.filter_by(is_repository=True).all()
+                result = []
+                for f in repos:
+                    result.append({
+                        "id": f.id,
+                        "name": f.name,
+                        "path": f.path,
+                        "has_metadata": bool(f.repo_metadata),
+                        "description": (f.description or "")[:200] if f.description else ""
+                    })
 
             # Always surface the live main source root (GUAARDVARK_ROOT) even if not a DB-indexed Code Repo.
             # Agent can use read_code / search_code / list_code_files with absolute or relative paths from here.

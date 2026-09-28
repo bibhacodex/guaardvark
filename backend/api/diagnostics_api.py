@@ -53,6 +53,12 @@ except Exception as e:
 
 
 diagnostics_bp = Blueprint("diagnostics_api", __name__, url_prefix="/api/meta")
+
+# Allow-list mirroring CATEGORIES in scripts/consolidated_selftest.py. The value
+# becomes a subprocess argument, so only a key from here may pass through.
+_SELFTEST_CATEGORIES = {
+    c: c for c in ("database", "services", "filesystem", "backend", "llm", "imports")
+}
 logger = logging.getLogger(__name__)
 METRICS_LOG_LEVEL = os.getenv("GUAARDVARK_METRICS_LOG_LEVEL", "INFO").upper()
 metrics_logger = logging.getLogger("metrics")
@@ -230,10 +236,7 @@ def test_llm_endpoint():
     # Fast connectivity test: cap output and disable chain-of-thought so thinking
     # models (gemma4:12b, qwen3, ...) don't spend the whole test reasoning before
     # answering (an uncapped "ping" was ~6.5s on gemma4:12b; this is ~0.3s).
-    _thinking = any(
-        p in model_name.lower()
-        for p in ("deepseek-r1", "thinking", "gemma4", "gemma-4", "qwen3")
-    )
+    from backend.utils.ollama_resource_manager import think_payload
     start = time.monotonic()
     try:
         import ollama as _ollama
@@ -244,8 +247,7 @@ def test_llm_endpoint():
             stream=False,
             options={"num_predict": 32},
         )
-        if _thinking:
-            _kwargs["think"] = False  # only thinking-capable models accept `think`
+        _kwargs.update(think_payload(model_name))  # only thinking-capable models accept `think`
         r = _ollama.chat(**_kwargs)
         msg = r.get("message", {}) if isinstance(r, dict) else getattr(r, "message", {})
         resp = (msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")) or ""
@@ -645,7 +647,11 @@ def run_selftest():
 
     data = request.get_json() or {}
     test_mode = data.get("mode", "basic")
-    test_category = data.get("category", None)
+    category_arg = data.get("category", None)
+    # Only an allow-listed key reaches the subprocess argument list.
+    test_category = _SELFTEST_CATEGORIES.get(str(category_arg)) if category_arg is not None else None
+    if category_arg is not None and test_category is None:
+        return jsonify({"error": "Unknown self-test category"}), 400
     include_legacy = data.get("include_legacy", True)
 
     results = {}

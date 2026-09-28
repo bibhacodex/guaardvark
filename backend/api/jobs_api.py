@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
 from flask import Blueprint, current_app, jsonify
+from backend.utils.clock import utcnow
+from backend.utils.path_guard import PathEscapesRoot, contained, contained_path
 
 try:
     from backend.models import Task, db, TrainingJob
@@ -380,7 +382,7 @@ def cleanup_stuck_jobs_route():
                         db.session.rollback()
             
             # Remove the progress directory for this stuck job
-            job_dir = progress_dir / job_id
+            job_dir = contained(progress_dir, job_id)
             if job_dir.exists() and job_dir.is_dir():
                 try:
                     import shutil
@@ -394,7 +396,7 @@ def cleanup_stuck_jobs_route():
         if db and TrainingJob:
             try:
                 from datetime import timedelta
-                cutoff_time = datetime.utcnow() - timedelta(hours=24)
+                cutoff_time = utcnow() - timedelta(hours=24)
                 completed_training_jobs = db.session.query(TrainingJob).filter(
                     TrainingJob.status.in_(["completed", "failed", "cancelled"]),
                     TrainingJob.completed_at < cutoff_time
@@ -471,7 +473,7 @@ def delete_job_route(job_id):
 
         # Remove from file system
         progress_dir = Path(output_dir) / ".progress_jobs"
-        job_dir = progress_dir / job_id
+        job_dir = contained(progress_dir, job_id)
         if job_dir.exists() and job_dir.is_dir():
             import shutil
             shutil.rmtree(job_dir)
@@ -504,7 +506,7 @@ def retry_job_route(job_id):
     try:
         # Get the original job metadata
         progress_dir = Path(output_dir) / ".progress_jobs"
-        job_dir = progress_dir / job_id
+        job_dir = contained(progress_dir, job_id)
         metadata_file = job_dir / "metadata.json"
         
         if not metadata_file.exists():

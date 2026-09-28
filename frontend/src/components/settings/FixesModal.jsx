@@ -10,6 +10,7 @@ import {
   Chip,
   Typography,
   CircularProgress,
+  LinearProgress,
   Alert,
   List,
   ListItemButton,
@@ -23,6 +24,7 @@ import {
   CheckCircle as CheckCircleIcon,
   Cancel as CancelIcon,
   PlayArrow as PlayIcon,
+  DoneAll as DoneAllIcon,
   Refresh as RefreshIcon,
   BugReport as BugReportIcon,
 } from "@mui/icons-material";
@@ -65,13 +67,24 @@ function formatRelative(iso) {
   return `${Math.floor(diffSec / 86400)}d ago`;
 }
 
+import { useSnackbar } from "../common/SnackbarProvider";
+import { ConfirmActionDialog } from "./ui";
+
 export default function FixesModal({ open, onClose, showMessage }) {
+  const snackbar = useSnackbar();
+  // Pending "apply" targets awaiting confirmation; null when the dialog is closed.
+  const [confirmApply, setConfirmApply] = useState(null);
   const [fixes, setFixes] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [statusFilter, setStatusFilter] = useState("all");
   const [selectedId, setSelectedId] = useState(null);
   const [actionBusy, setActionBusy] = useState(false);
+  // What the dialog is doing right now, so a click never disappears into
+  // silence: { label, done, total } while a single or bulk action runs.
+  const [progress, setProgress] = useState(null);
+  // The last completed action, kept on screen until the next one starts.
+  const [lastResult, setLastResult] = useState(null);
 
   const fetchFixes = useCallback(async () => {
     setLoading(true);
@@ -107,47 +120,59 @@ export default function FixesModal({ open, onClose, showMessage }) {
   );
 
   const notify = (msg, sev = "success") => {
-    if (showMessage) showMessage(msg, sev);
+    const emit = showMessage || snackbar?.showMessage;
+    if (emit) emit(msg, sev);
   };
 
-  const handleApprove = async (fix) => {
-    setActionBusy(true);
-    try {
-      await selfImprovementService.approveFix(fix.id);
-      notify("Fix approved");
-      await fetchFixes();
-    } catch (err) {
-      notify(err?.message || "Approve failed", "error");
-    } finally {
-      setActionBusy(false);
-    }
+  const ACTIONS = {
+    approve: { verb: "Approving", past: "approved", call: (id) => selfImprovementService.approveFix(id) },
+    reject: { verb: "Rejecting", past: "rejected", call: (id) => selfImprovementService.rejectFix(id) },
+    apply: { verb: "Applying", past: "applied to the filesystem", call: (id) => selfImprovementService.applyFix(id) },
   };
 
-  const handleReject = async (fix) => {
+  // Run one action over one or many fixes, sequentially, reporting progress
+  // as it goes. Apply writes files one at a time on the backend anyway.
+  const runAction = async (kind, targets) => {
+    const action = ACTIONS[kind];
+    const list = Array.isArray(targets) ? targets : [targets];
+    if (!list.length) return;
     setActionBusy(true);
-    try {
-      await selfImprovementService.rejectFix(fix.id);
-      notify("Fix rejected");
-      await fetchFixes();
-    } catch (err) {
-      notify(err?.message || "Reject failed", "error");
-    } finally {
-      setActionBusy(false);
+    setLastResult(null);
+    const failures = [];
+    let done = 0;
+    for (const fix of list) {
+      setProgress({
+        label: `${action.verb} fix #${fix.id} — ${fix.file_path || ""}`,
+        done,
+        total: list.length,
+      });
+      try {
+        await action.call(fix.id);
+      } catch (err) {
+        failures.push(`#${fix.id}: ${err?.message || "failed"}`);
+      }
+      done += 1;
     }
+    setProgress(null);
+    await fetchFixes();
+    const ok = list.length - failures.length;
+    const summary = list.length === 1
+      ? (failures.length ? failures[0] : `Fix #${list[0].id} ${action.past}`)
+      : `${ok} of ${list.length} fixes ${action.past}` + (failures.length ? ` — failed: ${failures.join("; ")}` : "");
+    setLastResult({ severity: failures.length ? (ok ? "warning" : "error") : "success", text: summary });
+    notify(summary, failures.length ? "error" : "success");
+    setActionBusy(false);
   };
 
-  const handleApply = async (fix) => {
-    setActionBusy(true);
-    try {
-      await selfImprovementService.applyFix(fix.id);
-      notify("Fix applied to filesystem");
-      await fetchFixes();
-    } catch (err) {
-      notify(err?.message || "Apply failed", "error");
-    } finally {
-      setActionBusy(false);
-    }
-  };
+  const handleApprove = (fix) => runAction("approve", fix);
+  const handleReject = (fix) => runAction("reject", fix);
+  const handleApply = (fix) => setConfirmApply([fix]);
+
+  const proposedFixes = useMemo(
+    () => fixes.filter((f) => f.status === "proposed" || f.status === "triaged"),
+    [fixes],
+  );
+  const approvedFixes = useMemo(() => fixes.filter((f) => f.status === "approved"), [fixes]);
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth>
@@ -174,6 +199,27 @@ export default function FixesModal({ open, onClose, showMessage }) {
         </IconButton>
       </DialogTitle>
 
+      {(progress || lastResult) && (
+        <Box sx={{ px: 3, pb: 1 }}>
+          {progress && (
+            <Box>
+              <Typography variant="caption" color="text.secondary">
+                {progress.label} ({progress.done + 1} of {progress.total})
+              </Typography>
+              <LinearProgress
+                variant={progress.total > 1 ? "determinate" : "indeterminate"}
+                value={progress.total > 1 ? (100 * progress.done) / progress.total : undefined}
+                sx={{ mt: 0.5 }}
+              />
+            </Box>
+          )}
+          {!progress && lastResult && (
+            <Alert severity={lastResult.severity} onClose={() => setLastResult(null)} sx={{ py: 0 }}>
+              {lastResult.text}
+            </Alert>
+          )}
+        </Box>
+      )}
       <DialogContent dividers sx={{ p: 0, height: "70vh", display: "flex", flexDirection: "column" }}>
         {/* Filter bar */}
         <Stack direction="row" spacing={1} sx={{ p: 1.5, borderBottom: 1, borderColor: "divider" }}>
@@ -337,9 +383,44 @@ export default function FixesModal({ open, onClose, showMessage }) {
       </DialogContent>
 
       <DialogActions sx={{ justifyContent: "space-between", px: 2 }}>
-        <Typography variant="caption" color="text.secondary">
-          {selected ? `Fix #${selected.id}` : "No fix selected"}
-        </Typography>
+        <Stack direction="row" spacing={1} alignItems="center">
+          <Typography variant="caption" color="text.secondary">
+            {selected ? `Fix #${selected.id}` : "No fix selected"}
+          </Typography>
+          {proposedFixes.length > 1 && (
+            <>
+              <Button
+                size="small"
+                color="error"
+                startIcon={<CancelIcon />}
+                disabled={actionBusy}
+                onClick={() => runAction("reject", proposedFixes)}
+              >
+                Reject all ({proposedFixes.length})
+              </Button>
+              <Button
+                size="small"
+                color="primary"
+                startIcon={<DoneAllIcon />}
+                disabled={actionBusy}
+                onClick={() => runAction("approve", proposedFixes)}
+              >
+                Approve all ({proposedFixes.length})
+              </Button>
+            </>
+          )}
+          {approvedFixes.length > 1 && (
+            <Button
+              size="small"
+              color="success"
+              startIcon={<PlayIcon />}
+              disabled={actionBusy}
+              onClick={() => setConfirmApply(approvedFixes)}
+            >
+              Apply all ({approvedFixes.length})
+            </Button>
+          )}
+        </Stack>
         <Stack direction="row" spacing={1}>
           {selected && (selected.status === "proposed" || selected.status === "triaged") && (
             <>
@@ -379,6 +460,20 @@ export default function FixesModal({ open, onClose, showMessage }) {
           <Button size="small" onClick={onClose}>Close</Button>
         </Stack>
       </DialogActions>
+      <ConfirmActionDialog
+        open={confirmApply !== null}
+        onClose={() => setConfirmApply(null)}
+        onConfirm={() => {
+          const targets = confirmApply;
+          setConfirmApply(null);
+          runAction("apply", targets);
+        }}
+        title={confirmApply && confirmApply.length > 1 ? `Apply ${confirmApply.length} fixes to the filesystem` : "Apply this fix to the filesystem"}
+        description="Rewrites the source files named in the fix. A backup copy of each file is kept on disk, but there is no restore button; reverting means restoring that copy by hand or from git."
+        facts={(confirmApply || []).slice(0, 8).map((f) => ({ label: `#${f.id}`, value: f.file_path || "" }))}
+        keeps="every file the fix does not name."
+        confirmLabel={confirmApply && confirmApply.length > 1 ? "Apply all" : "Apply"}
+      />
     </Dialog>
   );
 }

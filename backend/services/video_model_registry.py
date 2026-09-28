@@ -21,9 +21,13 @@ Both the batch-video API (download/install) and comfyui_video_generator
 (generation) import from here, so the two can no longer disagree.
 """
 
+import re
 import logging
 import os
 from pathlib import Path
+from typing import Optional
+
+from backend.services.job_types import RenderErrorKind, RenderFailure
 
 logger = logging.getLogger(__name__)
 
@@ -39,17 +43,214 @@ def comfyui_models_dir() -> Path:
     return Path(COMFYUI_DIR) / "models"
 
 
-def is_model_installed(model_id: str) -> bool:
-    """True when every check_file for model_id exists and is non-empty."""
-    entry = VIDEO_MODEL_REGISTRY.get(model_id)
+def background_removal_dir() -> Path:
+    """Home of the background-removal ONNX weights (dest "bgremove")."""
+    root = os.environ.get("GUAARDVARK_ROOT") or str(Path(__file__).resolve().parents[2])
+    return Path(root) / "data" / "models" / "background_removal"
+
+
+def resolve_entry_dir(entry: dict) -> Path:
+    """Directory an entry's files land in and are checked from.
+
+    Default: ComfyUI/models/<local_subdir>. `dest` names another loader's home
+    when the code that reads the file is not ComfyUI: "facexlib" (facexlib
+    downloads into its own package folder unless the file is already there),
+    "bgremove" (the backend's background-removal service), "hf_cache" (the
+    Hugging Face cache, for nodes that call hf_hub_download; the directory is
+    only used for progress, the ready check goes through the cache probe).
+    """
+    dest = entry.get("dest")
+    if dest == "facexlib":
+        try:
+            import facexlib
+            return Path(facexlib.__file__).resolve().parent / "weights"
+        except Exception:  # noqa: BLE001 — no facexlib: the node cannot run anyway
+            return comfyui_models_dir() / "facedetection"
+    if dest == "bgremove":
+        return background_removal_dir()
+    if dest == "hf_cache":
+        from backend.services.local_weights import hf_repo_cache_dir
+        return hf_repo_cache_dir(entry["hf_repo"])
+    return comfyui_models_dir() / entry.get("local_subdir", "")
+
+
+def entry_files_present(entry: dict) -> bool:
+    """True when every file the entry declares is on this machine, non-empty."""
     if not entry:
         return False
-    base = comfyui_models_dir() / entry.get("local_subdir", "")
+    if entry.get("dest") == "hf_cache":
+        from backend.services.local_weights import is_cached
+        return all(is_cached(entry["hf_repo"], f["src"]) for f in entry.get("files", []))
+    base = resolve_entry_dir(entry)
     for check_file in entry.get("check_files", []):
         fpath = base / check_file
         if not fpath.exists() or fpath.stat().st_size == 0:
             return False
-    return True
+    return bool(entry.get("check_files"))
+
+
+def is_model_installed(model_id: str) -> bool:
+    """True when every check_file for model_id exists and is non-empty."""
+    return entry_files_present(VIDEO_MODEL_REGISTRY.get(model_id))
+
+
+# ── MiniMax H3 shared capability data ────────────────────────────────────
+# Every H3 generation entry carries the same contract; the variants differ
+# only in precision, size and the VRAM tier they are meant for. Declared once
+# here and spliced into each entry so a limit is never re-typed per variant.
+#
+# Frame grid: the model samples 17k+5 frames at 24 fps (124 = ~5 s). The
+# trained range is 124-362 frames (~5-15 s); the node accepts less, and the
+# shipped "short" preset (73 frames, ~3 s) rendered for an external tester,
+# so the floor stays at 3 s until a measured run says otherwise.
+H3_FRAME_RULE = "17k+5"
+H3_NATIVE_FPS = 24
+H3_ASPECT_RATIOS = ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+H3_LICENSE = {
+    "name": "MiniMax H3 Community License",
+    "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE",
+    "form_url": "https://platform.minimax.io/h3-license",
+    "attribution": "MiniMax H3",
+    # Static text only. The product never checks entitlement online; the
+    # person installing reads this and decides, as with every gated model.
+    "note": (
+        "The license names the EU, UK, South Korea and USA as Excluded "
+        "Territories; MiniMax offers an application form for those. Commercial "
+        "products must display 'MiniMax H3' in their UI; revenue above 20M USD "
+        "needs written authorization; outputs may not be used to train other "
+        "models."
+    ),
+}
+# Ten style embeddings shipped beside the weights (models/embeddings). A
+# preset appends the token to the prompt after enhancement so the enhancer
+# cannot rewrite it. Ids are the filename stems minus the "minimaxh3_" prefix.
+H3_STYLE_EMBEDDING_IDS = [
+    "art_is_explosion", "blooming_flowers", "bullet_time", "dark_magic",
+    "fire_breath", "four_seasons", "kiss_camera", "spiral_ascent",
+    "storm_magic", "truman_show",
+]
+H3_STYLE_EMBEDDINGS = [
+    {
+        "id": sid,
+        "label": sid.replace("_", " ").capitalize(),
+        "token": f"embedding:minimaxh3_{sid}",
+        "file": f"minimaxh3_{sid}.safetensors",
+    }
+    for sid in H3_STYLE_EMBEDDING_IDS
+]
+# Speed profiles: the official template samples 20 steps without CFG. The
+# turbo LoRAs are Comfy-Org's distilled variants; their step counts come from
+# docs.comfy.org ("slightly lower audio and motion quality"), not from a
+# measurement here. min_steps is the no-bad-knob floor a preset may not go
+# below; an explicit value a person typed still wins and is logged.
+# The 4-step fl2v LoRA was published against the 768 px canvas and shipped here
+# behind a 768 short-edge gate. That gate had no measurement behind it and made
+# the profile fail at the model's 864x480 default and on every duration tier
+# past 7.3 s, so it is gone. Record the 864x480-vs-1344x768 comparison here
+# when it is run; a profile keeps ``min_short_edge`` only with a result beside it.
+H3_FL2VA_SPEED_PROFILES = {
+    "standard": {"label": "Standard (20 steps)", "steps": 20, "min_steps": 20},
+    "turbo-8": {
+        "label": "Turbo (8 steps)",
+        "lora": "minimax-h3-fl2v-turbo-8step",
+        "strength": 1.0,
+        "steps": 8,
+        "min_steps": 8,
+    },
+    "turbo-4-768p": {
+        "label": "Turbo (4 steps)",
+        "lora": "minimax-h3-fl2v-turbo-4step-768p",
+        "strength": 1.0,
+        "steps": 4,
+        "min_steps": 4,
+    },
+}
+H3_REF2VA_SPEED_PROFILES = {
+    "standard": {"label": "Standard (20 steps)", "steps": 20, "min_steps": 20},
+    "turbo-4": {
+        "label": "Turbo (4 steps, experimental)",
+        "lora": "minimax-h3-ref2v-turbo-4step",
+        "strength": 1.0,
+        "steps": 4,
+        "min_steps": 4,
+        "experimental": True,
+    },
+}
+# Wan 2.2 14B speed profile: the bundled ComfyUI templates run the 14B experts
+# at 4 steps, CFG 1, euler/simple, shift 5.0, with lightx2v's distilled LoRA
+# pair (one per expert) at strength 1.0. Our experts are GGUF Q5_K_M; ComfyUI-GGUF
+# calls LoRA loading "experimental but it should work with the built-in loader
+# nodes", so the profile is marked experimental until a render here confirms
+# it, and the standard profile stays the default.
+WAN14B_SPEED_PROFILES = {
+    "t2v": {
+        "standard": {"label": "Standard (25 steps)", "steps": 25, "min_steps": 20},
+        "lightx2v-4": {
+            "label": "Lightning (4 steps, lightx2v LoRA)",
+            "loras": {"unet_high": "wan22-t2v-lightx2v-high", "unet_low": "wan22-t2v-lightx2v-low"},
+            "strength": 1.0, "steps": 4, "min_steps": 4, "cfg": 1.0, "shift": 5.0,
+            "experimental": True,
+        },
+    },
+    "i2v": {
+        "standard": {"label": "Standard (25 steps)", "steps": 25, "min_steps": 20},
+        "lightx2v-4": {
+            "label": "Lightning (4 steps, lightx2v LoRA)",
+            "loras": {"unet_high": "wan22-i2v-lightx2v-high", "unet_low": "wan22-i2v-lightx2v-low"},
+            "strength": 1.0, "steps": 4, "min_steps": 4, "cfg": 1.0, "shift": 5.0,
+            "experimental": True,
+        },
+    },
+}
+
+# Duration tiers, each measured 2026-09-01 on a 16 GB RTX 40-series card at
+# 864x480 on the turbo-8 profile with a 3 GB reserve: 243 frames (10.1 s)
+# rendered in 237 s at 24.5 s/step, 15.4 GB peak; 362 frames (15.1 s) in
+# 372 s at 38 s/step with the transformer fully offloaded, 13.4 GB peak;
+# both clips stayed coherent to the last frame. The 480p pixel area is the
+# cap for the longer tiers on this card class. The native 1344x768 canvas at
+# 124 frames ran out of memory with a 3 GB reserve and rendered with a 5 GB
+# one (GUAARDVARK_COMFYUI_RESERVE_VRAM=5.0): 171 s on the turbo-4-768p
+# profile at 31.6 s/step, transformer fully offloaded, 11.3 GB peak, clean
+# frames. The UI offers a duration only when its tier exists here.
+H3_DURATION_TIERS = [
+    {"frames": 175, "seconds": 7.3, "max_pixel_area": 768 * 1344},
+    {"frames": 243, "seconds": 10.1, "max_pixel_area": 864 * 480},
+    {"frames": 362, "seconds": 15.1, "max_pixel_area": 864 * 480},
+]
+# Keys shared by every H3 generation entry. `tier_defaults` (per VRAM class)
+# and `speed_profiles` are per variant.
+_H3_COMMON = {
+    "type": "minimax",
+    # --reserve-vram ComfyUI is launched with for this family. Measured
+    # 2026-09-12 on a 16 GB card: 1344x768 x 124 frames ran out of memory at
+    # 3.0 and rendered at 5.0 (see H3_DURATION_TIERS). Wan 2.2 14B needs the
+    # opposite (1.0, on its entries): with 5.0 it loaded ~1 GB usable and
+    # offloaded 9.6 GB, 43 min per 5 s clip. One launch flag cannot serve
+    # both, so the generator restarts ComfyUI when the running reserve
+    # differs from the model's. GUAARDVARK_COMFYUI_RESERVE_VRAM, set
+    # explicitly, overrides every entry.
+    "comfyui_reserve_vram_gb": 5.0,
+    "dimension_alignment": 32,
+    # Template note: native canvas is a 768px short edge, capped at 768x1344.
+    "max_pixel_area": 768 * 1344,
+    "aspect_ratios": H3_ASPECT_RATIOS,
+    "audio_out": True,
+    "audio_in": True,
+    "cfg": False,
+    "native_fps": H3_NATIVE_FPS,
+    "frame_rule": H3_FRAME_RULE,
+    "max_frames": 362,
+    "min_clip_s": 3.0,
+    "max_clip_s": 15.0,
+    "duration_tiers": H3_DURATION_TIERS,
+    "min_steps": 20,
+    "default_steps": 20,
+    "style_embeddings": H3_STYLE_EMBEDDINGS,
+    "license": H3_LICENSE,
+}
+_H3_FL2VA_MODES = ["t2v", "i2v", "l2v", "flf2v"]
+_H3_REF_LIMITS = {"images": 9, "videos": 3, "audios": 3, "files": 12, "video_seconds": [2, 15]}
 
 
 VIDEO_MODEL_REGISTRY = {
@@ -62,22 +263,76 @@ VIDEO_MODEL_REGISTRY = {
         "check_files": ["transformer/diffusion_pytorch_model-00001-of-00002.safetensors", "vae/diffusion_pytorch_model.safetensors"],
         "size_gb": 11.3,
         "vram_mb": 16000,
+        # CogVideoXWrapper (fdb8abd, latest upstream) defines its latent format
+        # without latent_rgb_factors_reshape, which ComfyUI's Latent2RGB previewer
+        # reads: with --preview-method auto the sampler raises AttributeError on
+        # its first step (measured 2026-09-25, ComfyUI 0.33.0).
+        "live_preview": False,
         "type": "cogvideox",
         "dimension_alignment": 16,
+        "native_fps": 8,
+        "max_frames": 49,
+        "min_steps": 50,
+        "default_steps": 50,
+        # Measured 2026-09-25 on a 16376 MB card (bf16, sdpa, no CPU offload,
+        # 49 frames, ComfyUI --reserve-vram 1.0): 672x384 renders clean;
+        # 720x480, the canvas the model was trained at, runs out of memory in
+        # the transformer on the first sampler step. The 16 tier also covers
+        # larger cards; 720x480 on 24 GB is unmeasured.
+        "tier_defaults": {
+            "16": {"width": 672, "height": 384},
+        },
     },
     "cogvideox-5b-i2v": {
         "name": "CogVideoX 1.5 5B I2V (BF16)",
-        "description": "Image-to-video, 6s clips. Full precision, best quality. Needs ~16GB VRAM.",
+        "description": "Image-to-video, 6s clips. Full precision, best quality. Needs ~16GB VRAM. "
+                       "Pulls the CogVideoX VAE + T5 encoder.",
         "hf_repo": "Kijai/CogVideoX-comfy",
-        "hf_filename": "CogVideoX_1_5_5b_I2V_bf16.safetensors",
+        # The wrapper's single-file loader (CogVideoXModelLoader) enumerates
+        # models/diffusion_models, but this file has lived in checkpoints/ since
+        # the first install, so it stays canonical there and is hard-linked into
+        # diffusion_models/ (also_link at download; the generator reconciles
+        # existing installs). Before 2026-08-28 the workflow ignored this file
+        # entirely and asked DownloadAndLoadCogVideoModel for a hub id, which
+        # fetched a second 11GB diffusers snapshot from Hugging Face during
+        # generation — a download the person never clicked.
         "local_subdir": "checkpoints",
-        "check_files": ["CogVideoX_1_5_5b_I2V_bf16.safetensors"],
-        # ComfyUI's CogVideoX workflow loads the T5 encoder via CLIPLoader.
-        "requires": ["t5-encoder"],
+        "files": [
+            {
+                "src": "CogVideoX_1_5_5b_I2V_bf16.safetensors",
+                "dst": "CogVideoX_1_5_5b_I2V_bf16.safetensors",
+                "also_link": "diffusion_models",
+            },
+        ],
+        # ComfyUI's CogVideoX workflow loads the T5 encoder via CLIPLoader; the
+        # single-file loader needs the VAE as its own file (the diffusers
+        # snapshot used to carry it).
+        "requires": ["t5-encoder", "cogvideox-vae"],
         "size_gb": 10.4,
         "vram_mb": 16000,
+        # CogVideoXWrapper (fdb8abd, latest upstream) defines its latent format
+        # without latent_rgb_factors_reshape, which ComfyUI's Latent2RGB previewer
+        # reads: with --preview-method auto the sampler raises AttributeError on
+        # its first step (measured 2026-09-25, ComfyUI 0.33.0).
+        "live_preview": False,
         "type": "cogvideox",
         "dimension_alignment": 16,
+        "native_fps": 8,
+        "max_frames": 49,
+        "min_steps": 50,
+        "default_steps": 50,
+    },
+    "cogvideox-vae": {
+        "name": "CogVideoX VAE (BF16)",
+        "description": "Required by CogVideoX I2V — CogVideoXVAELoader reads it from vae/.",
+        "hf_repo": "Kijai/CogVideoX-comfy",
+        "local_subdir": "vae",
+        "files": [
+            {"src": "cogvideox_vae_bf16.safetensors", "dst": "cogvideox_vae_bf16.safetensors"},
+        ],
+        "size_gb": 0.43,
+        "vram_mb": 0,
+        "type": "vae",
     },
     # Wan GGUFs live in HighNoise/ and LowNoise/ subfolders in the repo, but
     # ComfyUI's UnetLoaderGGUF loads them flat from models/unet/. The `files`
@@ -100,8 +355,33 @@ VIDEO_MODEL_REGISTRY = {
         "size_gb": 21.0,
         "vram_mb": 11000,
         "type": "wan",
+        # Measured 2026-09-12 on a 16 GB card: launched with --reserve-vram 5.0
+        # (the MiniMax H3 value) the GGUF experts loaded with ~1 GB usable and
+        # 9.6 GB offloaded to CPU, 43 min per 5 s clip; at 1.0 they fit.
+        "comfyui_reserve_vram_gb": 1.0,
         "dimension_alignment": 32,
         "max_pixel_area": 1_000_000,
+        # Landscape, its transpose, and square. The earlier claim that off-native
+        # frames "come back warped" does not survive the evidence: the output
+        # directory holds seven 1:1 Wan I2V renders (512x512 and 736x736,
+        # 2026-08-14), one of them the project's own demo clip.
+        #
+        # What actually warped was the sampler shift. It was scaled by pixel area,
+        # so every non-native size sampled at 3.0-4.8 against the 8.0 these models
+        # are trained at, and the result was the colour bleed reported as "rainbow
+        # morphs". Forbidding the ratio treated the symptom; the shift is fixed at
+        # its source instead. The area clamp below still applies.
+        "aspect_ratios": ["16:9", "9:16", "1:1"],
+        # The step floor the UI has enforced (Wan smears below 20; CLAUDE.md
+        # records the observation) now lives here so API and tool callers get it.
+        "min_steps": 20,
+        "default_steps": 25,
+        "native_fps": 16,
+        "max_frames": 81,
+        "speed_profiles": WAN14B_SPEED_PROFILES["t2v"],
+        # Inferred, not measured: the same A14B expert architecture and attention
+        # path as wan22-14b-i2v, where ck attention was measured producing NaN tiles.
+        "attention": "pytorch",
     },
     "wan22-14b-i2v": {
         "name": "Wan 2.2 14B I2V MoE (GGUF Q5_K)",
@@ -118,8 +398,38 @@ VIDEO_MODEL_REGISTRY = {
         "size_gb": 21.0,
         "vram_mb": 11000,
         "type": "wan",
+        # Measured 2026-09-12 on a 16 GB card: launched with --reserve-vram 5.0
+        # (the MiniMax H3 value) the GGUF experts loaded with ~1 GB usable and
+        # 9.6 GB offloaded to CPU, 43 min per 5 s clip; at 1.0 they fit.
+        "comfyui_reserve_vram_gb": 1.0,
         "dimension_alignment": 32,
         "max_pixel_area": 1_000_000,
+        # Landscape, its transpose, and square. The earlier claim that off-native
+        # frames "come back warped" does not survive the evidence: the output
+        # directory holds seven 1:1 Wan I2V renders (512x512 and 736x736,
+        # 2026-08-14), one of them the project's own demo clip.
+        #
+        # What actually warped was the sampler shift. It was scaled by pixel area,
+        # so every non-native size sampled at 3.0-4.8 against the 8.0 these models
+        # are trained at, and the result was the colour bleed reported as "rainbow
+        # morphs". Forbidding the ratio treated the symptom; the shift is fixed at
+        # its source instead. The area clamp below still applies.
+        "aspect_ratios": ["16:9", "9:16", "1:1"],
+        "min_steps": 20,
+        "default_steps": 25,
+        "native_fps": 16,
+        "max_frames": 81,
+        "speed_profiles": WAN14B_SPEED_PROFILES["i2v"],
+        # ComfyUI's ck (Comfy Kitchen INT8) attention put NaN patch tokens into these
+        # experts' latents, decoded as black rectangles: 6 of 9 Lightning renders at
+        # 960x544, seed 1984, 16 GB card (2026-09-12). The same graphs with PyTorch
+        # attention had NaN 0 and clean frames. On the maintainer's box the 4-step
+        # Lightning profile under ck damaged 15 of 24 clips, while 25-step Standard
+        # renders under ck were clean. The graph pins PyTorch whenever the ComfyUI
+        # launch (GUAARDVARK_COMFYUI_ATTENTION) asks for a backend not verified for
+        # the profile being rendered.
+        "attention": "pytorch",
+        "attention_verified": {"pytorch": ["*"], "ck": ["standard"]},
     },
     "wan22-5b": {
         "name": "Wan 2.2 TI2V-5B (fp16)",
@@ -136,6 +446,25 @@ VIDEO_MODEL_REGISTRY = {
         "type": "wan",
         "dimension_alignment": 32,
         "max_pixel_area": 1_000_000,
+        # Landscape, its transpose, and square. The earlier claim that off-native
+        # frames "come back warped" does not survive the evidence: the output
+        # directory holds seven 1:1 Wan I2V renders (512x512 and 736x736,
+        # 2026-08-14), one of them the project's own demo clip.
+        #
+        # What actually warped was the sampler shift. It was scaled by pixel area,
+        # so every non-native size sampled at 3.0-4.8 against the 8.0 these models
+        # are trained at, and the result was the colour bleed reported as "rainbow
+        # morphs". Forbidding the ratio treated the symptom; the shift is fixed at
+        # its source instead. The area clamp below still applies.
+        "aspect_ratios": ["16:9", "9:16", "1:1"],
+        "min_steps": 20,
+        "default_steps": 20,
+        "native_fps": 24,
+        "max_frames": 121,
+        # Fits an 11 GB card without offload; the other Wan entries take the family's 16.
+        "min_vram_gb": 11,
+        # video_wan2_2_5B_ti2v: KSampler cfg 5 (the 14B templates use 3.5).
+        "cfg_when_unset": 5.0,
     },
     "wan-vae": {
         "name": "Wan 2.1/2.2 VAE",
@@ -322,6 +651,182 @@ VIDEO_MODEL_REGISTRY = {
         "vram_mb": 14000,
         "type": "flux-edit",
     },
+    # ── Qwen-Image-Edit 2509 FP8 — Chat editor + identity-in-a-new-scene ────────
+    # Official Comfy-Org split files (Apache-2.0). FP8 is the 16 GB path; the 2511
+    # bf16 blueprint wants ~40 GB and is not shipped. Sampler floor is Comfy's
+    # own "Original" table (20 steps / CFG 2.5), not the 4-step Lightning LoRA.
+    "qwen-image-vae": {
+        "name": "Qwen-Image VAE",
+        "description": "Shared VAE for Qwen-Image and Qwen-Image-Edit.",
+        "hf_repo": "Comfy-Org/Qwen-Image_ComfyUI",
+        "local_subdir": "vae",
+        "files": [
+            {"src": "split_files/vae/qwen_image_vae.safetensors", "dst": "qwen_image_vae.safetensors"},
+        ],
+        "size_gb": 0.25,
+        "vram_mb": 0,
+        "type": "vae",
+    },
+    "qwen-image-clip": {
+        "name": "Qwen2.5-VL 7B text encoder (FP8)",
+        "description": "CLIPLoader type=qwen_image for Qwen-Image-Edit. Same file Comfy's "
+                       "official edit blueprint loads.",
+        "hf_repo": "Comfy-Org/HunyuanVideo_1.5_repackaged",
+        "local_subdir": "text_encoders",
+        "files": [
+            {
+                "src": "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                "dst": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+            },
+        ],
+        "size_gb": 8.9,
+        "vram_mb": 0,
+        "type": "encoder",
+    },
+    "qwen-image-edit": {
+        "name": "Qwen-Image-Edit 2509 (FP8)",
+        "description": "Instruction image editing with up to three reference images — "
+                       "identity-preserving new scenes, relight, text-on-image. Apache-2.0. "
+                       "FP8 pack for a 16 GB card. Chat uses this for edit_image when installed.",
+        "hf_repo": "Comfy-Org/Qwen-Image-Edit_ComfyUI",
+        "local_subdir": "diffusion_models",
+        "files": [
+            {
+                "src": "split_files/diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors",
+                "dst": "qwen_image_edit_2509_fp8_e4m3fn.safetensors",
+            },
+        ],
+        "requires": ["qwen-image-clip", "qwen-image-vae"],
+        "size_gb": 19.4,
+        # Measured 2026-09-15 on a 16 GB card: ComfyUI loads 11.2 GB of the
+        # FP8 transformer and offloads 8.2 GB; peak 14.7 GB used on the card
+        # with 2.2 GB of other processes' contexts resident, 4.4 s/step, a
+        # 20-step 768x1024 edit in 108 s. 14000 + the admission headroom asked
+        # for more than the card has and refused every edit.
+        "vram_mb": 12000,
+        "min_steps": 20,
+        "type": "qwen-edit",
+    },
+    # ── PuLID-FLUX — one face photo → new prompt on flux-dev (no LoRA train) ──
+    "pulid-antelopev2": {
+        "name": "InsightFace AntelopeV2 (PuLID)",
+        "description": "Face analysis pack PuLID-FLUX needs. Small ONNX files.",
+        "hf_repo": "DIAMONIK7777/antelopev2",
+        "local_subdir": "insightface/models/antelopev2",
+        "files": [
+            {"src": "1k3d68.onnx", "dst": "1k3d68.onnx"},
+            {"src": "2d106det.onnx", "dst": "2d106det.onnx"},
+            {"src": "genderage.onnx", "dst": "genderage.onnx"},
+            {"src": "glintr100.onnx", "dst": "glintr100.onnx"},
+            {"src": "scrfd_10g_bnkps.onnx", "dst": "scrfd_10g_bnkps.onnx"},
+        ],
+        "size_gb": 0.35,
+        "vram_mb": 0,
+        "type": "encoder",
+    },
+    "pulid-flux": {
+        "name": "PuLID-FLUX v0.9.1",
+        "description": "Zero-shot face identity on FLUX.1-dev: attach a likeness, describe a "
+                       "new scene. Needs flux-dev installed. Chat tool generate_identity. "
+                       "Consent-gated — only a face the user has the right to use.",
+        "hf_repo": "guozinan/PuLID",
+        "local_subdir": "pulid",
+        "files": [
+            {"src": "pulid_flux_v0.9.1.safetensors", "dst": "pulid_flux_v0.9.1.safetensors"},
+        ],
+        "requires": ["pulid-antelopev2", "eva02-clip", "facexlib-face", "flux-dev"],
+        "size_gb": 1.1,
+        # Measured 2026-09-19 (matrix of fp8/bf16 x weight 0.8/1.0/1.3 x start 0.0/0.2,
+        # synthetic late-sixties bearded reference, seed 1984, 20 steps 768x1024):
+        # every cell kept the face once the node fix landed; weight 1.3 at start 0
+        # let the identity override the prompt (the fedora vanished), weight 0.8
+        # trimmed the beard, and 1.0 with start 0.2 kept the likeness and the scene.
+        # bf16 vs fp8 made no visible difference, so the loader default (fp8) stays.
+        "identity_defaults": {"weight": 1.0, "start_at": 0.2, "end_at": 1.0},
+        # Measured 2026-09-15 on a 16 GB card: FLUX.1-dev FP8 + PuLID + EVA02
+        # + InsightFace peaked at 14.6 GB used with 2.2 GB of other processes'
+        # contexts resident; a 20-step 768x1024 render in 28 s.
+        "vram_mb": 12000,
+        "min_steps": 20,
+        "type": "pulid",
+    },
+    # ── PuLID companions the custom node would otherwise fetch on its own ──
+    # ComfyUI-PuLID-Flux loads EVA02-CLIP through hf_hub_download and facexlib's
+    # detector and parser from GitHub on first use. Installed here instead, into
+    # the exact places those loaders read: the Hugging Face cache (ComfyUI runs
+    # with HF_HUB_OFFLINE=1, so a cache hit is the only way the node finds it)
+    # and facexlib's own weights folder. `dest` names that home; see
+    # resolve_entry_dir().
+    "eva02-clip": {
+        "name": "EVA02-CLIP-L/14 336 (PuLID)",
+        "description": "Vision encoder PuLID-FLUX reads the face with. Lands in the "
+                       "Hugging Face cache, where the PuLID node looks for it.",
+        "hf_repo": "QuanSun/EVA-CLIP",
+        "dest": "hf_cache",
+        "local_subdir": "clip",
+        "files": [
+            {"src": "EVA02_CLIP_L_336_psz14_s6B.pt", "dst": "EVA02_CLIP_L_336_psz14_s6B.pt"},
+        ],
+        "size_gb": 0.86,
+        "vram_mb": 0,
+        "type": "encoder",
+    },
+    "facexlib-face": {
+        "name": "facexlib face detector and parser (PuLID)",
+        "description": "RetinaFace ResNet50 detector and ParseNet parser PuLID crops the "
+                       "face with. Lands in facexlib's weights folder.",
+        "dest": "facexlib",
+        "local_subdir": "facedetection",
+        "direct_urls": [
+            {
+                "url": "https://github.com/xinntao/facexlib/releases/download/v0.1.0/detection_Resnet50_Final.pth",
+                "dst": "detection_Resnet50_Final.pth",
+            },
+            {
+                "url": "https://github.com/xinntao/facexlib/releases/download/v0.2.2/parsing_parsenet.pth",
+                "dst": "parsing_parsenet.pth",
+            },
+        ],
+        "size_gb": 0.19,
+        "vram_mb": 0,
+        "type": "encoder",
+    },
+    # ── Background removal (chat remove_background, Batch Image transparent
+    # background). ONNX weights published by the rembg project; inference is
+    # backend/services/background_removal.py on the onnxruntime already shipped.
+    # Sizes are the release assets' Content-Length, read 2026-09-15.
+    "bgremove-birefnet": {
+        "name": "Background removal, BiRefNet general",
+        "description": "Cuts the subject out of a photo with a clean alpha edge (hair, "
+                       "thin parts). 1024 px matting; a few seconds on CPU. MIT.",
+        "dest": "bgremove",
+        "local_subdir": "background_removal",
+        "direct_urls": [
+            {
+                "url": "https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-epoch_244.onnx",
+                "dst": "BiRefNet-general-epoch_244.onnx",
+            },
+        ],
+        "size_gb": 0.97,
+        "vram_mb": 0,
+        "type": "editing",
+    },
+    "bgremove-u2net": {
+        "name": "Background removal, u2net",
+        "description": "The small cut-out model: 320 px matting, under a second on CPU, "
+                       "softer edges than BiRefNet. Apache-2.0.",
+        "dest": "bgremove",
+        "local_subdir": "background_removal",
+        "direct_urls": [
+            {
+                "url": "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx",
+                "dst": "u2net.onnx",
+            },
+        ],
+        "size_gb": 0.18,
+        "vram_mb": 0,
+        "type": "editing",
+    },
     # ── LTX-2.3 (Lightricks) — 16GB Ada: distilled FP8 + Gemma FP4 ──────────────
     # Requires ComfyUI ≥ 0.16.1 (native LTX-2.3). Transformer-only FP8 lives in
     # diffusion_models/ (Kijai layout). Install click pulls Gemma + text projection
@@ -345,8 +850,16 @@ VIDEO_MODEL_REGISTRY = {
         # gpu_session fit check adds +1024MB margin, and 16000+1024 > ~16376 total
         # falsely blocked VideoGen batches that already rendered via the direct path.
         "vram_mb": 14000,
+        # The model samples an audio latent alongside the video. Decoding it is
+        # wired (audio_out=True mixes it into the clip) but stays off until one
+        # render has been listened to: distilled LTX audio quality is unmeasured.
+        "audio_out": False,
         "type": "ltx",
         "dimension_alignment": 32,
+        "native_fps": 16,
+        "max_frames": 161,
+        "default_steps": 8,
+        "min_steps": 8,
     },
     "ltx-gemma-fp4": {
         "name": "Gemma 3 12B IT (FP4) — LTX text encoder",
@@ -457,8 +970,20 @@ VIDEO_MODEL_REGISTRY = {
         ],
         "size_gb": 20.03,
         "vram_mb": 14000,
+        # The model samples an audio latent alongside the video. Decoding it is
+        # wired (audio_out=True mixes it into the clip) but stays off until one
+        # render has been listened to: distilled LTX audio quality is unmeasured.
+        "audio_out": False,
         "type": "ltx",
         "dimension_alignment": 32,
+        # Two stages: half size on the 32 px grid, then the x2 latent upscaler,
+        # so the file is always a multiple of 64 (832x480 came out 832x448,
+        # 2026-09-25). Requests snap to the size the model produces.
+        "output_alignment": 64,
+        "native_fps": 16,
+        "max_frames": 161,
+        "default_steps": 8,
+        "min_steps": 8,
     },
     "ltx25-gemma4-int8": {
         "name": "Gemma 4 12B + proj (Int8) — LTX-2.5 text encoder",
@@ -530,6 +1055,537 @@ VIDEO_MODEL_REGISTRY = {
         "vram_mb": 0,
         "type": "upscaler",
     },
+    # ── HunyuanVideo (Tencent) — 13B, GGUF Q5_K_M sized for 16GB cards ──────
+    # Base weights ship without a content filter. Native ComfyUI nodes plus the
+    # ComfyUI-GGUF loader; the LLaVA-3 8B text encoder sits on CPU on ≤20GB
+    # cards (same residency policy as Wan's UMT5).
+    "hunyuan-t2v": {
+        "name": "HunyuanVideo 13B T2V (GGUF Q5_K_M)",
+        "description": "Tencent HunyuanVideo 720p text-to-video. Cinematic motion, "
+                       "strong prompt adherence, no content filter. ~9.5GB UNet; "
+                       "LLaVA-3 text encoder loads on CPU on 16GB GPUs. 24fps, "
+                       "frame counts 4n+1 (73 ≈ 3s).",
+        "hf_repo": "city96/HunyuanVideo-gguf",
+        "local_subdir": "unet",
+        "files": [
+            {"src": "hunyuan-video-t2v-720p-Q5_K_M.gguf", "dst": "hunyuan-video-t2v-720p-Q5_K_M.gguf"},
+        ],
+        "requires": ["hunyuan-llava-te", "hunyuan-clip-l", "hunyuan-vae"],
+        "size_gb": 9.45,
+        "vram_mb": 11000,
+        "type": "hunyuan",
+        "dimension_alignment": 16,
+        "max_pixel_area": 1_000_000,
+        "native_fps": 24,
+        "max_frames": 129,
+        "default_steps": 20,
+        "min_steps": 20,
+    },
+    "hunyuan-i2v": {
+        "name": "HunyuanVideo 13B I2V (GGUF Q5_K_M)",
+        "description": "Tencent HunyuanVideo-I2V (v2 'replace' weights) — image-to-video "
+                       "that follows the start frame closely. Same text encoder + VAE "
+                       "as the T2V model plus the LLaVA vision tower. 24fps, 4n+1 frames.",
+        "hf_repo": "city96/HunyuanVideo-I2V-gguf",
+        "local_subdir": "unet",
+        "files": [
+            {"src": "hunyuan-video-i2v-720p-Q5_K_M.gguf", "dst": "hunyuan-video-i2v-720p-Q5_K_M.gguf"},
+        ],
+        "requires": ["hunyuan-llava-te", "hunyuan-clip-l", "hunyuan-vae", "hunyuan-clip-vision"],
+        "size_gb": 9.45,
+        "vram_mb": 11000,
+        "type": "hunyuan",
+        "dimension_alignment": 16,
+        "max_pixel_area": 1_000_000,
+        "native_fps": 24,
+        "max_frames": 129,
+        "default_steps": 20,
+        "min_steps": 20,
+    },
+    "hunyuan-llava-te": {
+        "name": "LLaVA-Llama-3 8B Text Encoder (FP8) — HunyuanVideo",
+        "description": "Required by HunyuanVideo T2V/I2V. Loaded through DualCLIPLoader "
+                       "together with clip_l; placed on CPU on 16GB cards.",
+        "hf_repo": "Comfy-Org/HunyuanVideo_repackaged",
+        "local_subdir": "text_encoders",
+        "files": [
+            {"src": "split_files/text_encoders/llava_llama3_fp8_scaled.safetensors",
+             "dst": "llava_llama3_fp8_scaled.safetensors"},
+        ],
+        "size_gb": 9.09,
+        "vram_mb": 0,
+        "type": "encoder",
+    },
+    "hunyuan-clip-l": {
+        "name": "CLIP-L Text Encoder — HunyuanVideo",
+        "description": "Required by HunyuanVideo (second half of the DualCLIPLoader pair).",
+        "hf_repo": "Comfy-Org/HunyuanVideo_repackaged",
+        "local_subdir": "text_encoders",
+        "files": [
+            {"src": "split_files/text_encoders/clip_l.safetensors", "dst": "clip_l.safetensors"},
+        ],
+        "size_gb": 0.25,
+        "vram_mb": 0,
+        "type": "encoder",
+    },
+    "hunyuan-vae": {
+        "name": "HunyuanVideo VAE (BF16)",
+        "description": "Required by HunyuanVideo T2V/I2V. Decoded tiled (256px / 64 frames).",
+        "hf_repo": "Comfy-Org/HunyuanVideo_repackaged",
+        "local_subdir": "vae",
+        "files": [
+            {"src": "split_files/vae/hunyuan_video_vae_bf16.safetensors", "dst": "hunyuan_video_vae_bf16.safetensors"},
+        ],
+        "size_gb": 0.49,
+        "vram_mb": 0,
+        "type": "vae",
+    },
+    "hunyuan-clip-vision": {
+        "name": "LLaVA-Llama-3 Vision Tower — HunyuanVideo I2V",
+        "description": "Required by HunyuanVideo I2V only: encodes the start frame for "
+                       "TextEncodeHunyuanVideo_ImageToVideo.",
+        "hf_repo": "Comfy-Org/HunyuanVideo_repackaged",
+        "local_subdir": "clip_vision",
+        "files": [
+            {"src": "split_files/clip_vision/llava_llama3_vision.safetensors", "dst": "llava_llama3_vision.safetensors"},
+        ],
+        "size_gb": 0.65,
+        "vram_mb": 0,
+        "type": "clip_vision",
+    },
+    "wan22-t2v-lightx2v-high": {
+        "name": "Wan 2.2 14B T2V Lightning LoRA (high noise)",
+        "description": "Optional lightx2v 4-step distillation for the Wan 2.2 14B T2V "
+                       "high-noise expert; paired with its low-noise sibling "
+                       "by the Lightning speed profile.",
+        "hf_repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+        "local_subdir": "loras",
+        "files": [
+            {"src": "split_files/loras/wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors", "dst": "wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors"},
+        ],
+        "size_gb": 1.14,
+        "vram_mb": 0,
+        "type": "lora",
+        "applies_to": ["wan22-14b"],
+    },
+    "wan22-t2v-lightx2v-low": {
+        "name": "Wan 2.2 14B T2V Lightning LoRA (low noise)",
+        "description": "Optional lightx2v 4-step distillation for the Wan 2.2 14B T2V "
+                       "low-noise expert; paired with its high-noise sibling "
+                       "by the Lightning speed profile.",
+        "hf_repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+        "local_subdir": "loras",
+        "files": [
+            {"src": "split_files/loras/wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors", "dst": "wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors"},
+        ],
+        "size_gb": 1.14,
+        "vram_mb": 0,
+        "type": "lora",
+        "applies_to": ["wan22-14b"],
+    },
+    "wan22-i2v-lightx2v-high": {
+        "name": "Wan 2.2 14B I2V Lightning LoRA (high noise)",
+        "description": "Optional lightx2v 4-step distillation for the Wan 2.2 14B I2V "
+                       "high-noise expert; paired with its low-noise sibling "
+                       "by the Lightning speed profile.",
+        "hf_repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+        "local_subdir": "loras",
+        "files": [
+            {"src": "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors", "dst": "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"},
+        ],
+        "size_gb": 1.14,
+        "vram_mb": 0,
+        "type": "lora",
+        "applies_to": ["wan22-14b-i2v"],
+    },
+    "wan22-i2v-lightx2v-low": {
+        "name": "Wan 2.2 14B I2V Lightning LoRA (low noise)",
+        "description": "Optional lightx2v 4-step distillation for the Wan 2.2 14B I2V "
+                       "low-noise expert; paired with its high-noise sibling "
+                       "by the Lightning speed profile.",
+        "hf_repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+        "local_subdir": "loras",
+        "files": [
+            {"src": "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors", "dst": "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"},
+        ],
+        "size_gb": 1.14,
+        "vram_mb": 0,
+        "type": "lora",
+        "applies_to": ["wan22-14b-i2v"],
+    },
+    # ── MiniMax Music 3 ───────────────────────────────────────────────────────
+    # Open-weight song model (lyrics and vocals, up to ~5 minutes) with native
+    # ComfyUI nodes since 0.33. Lives in this registry because everything under
+    # ComfyUI/models is installed, gated and budgeted here; the product contract
+    # stays /api/audio-foundry/generate/music with a model field. The MiniMax
+    # Music 3 Community License asks commercial products to display
+    # "MiniMax-Music3" and has no territory clause. VRAM is the vendor's
+    # "8 GB with layer streaming, 20-24 GB comfortable", unmeasured here.
+    "minimax-music3-int8": {
+        "name": "MiniMax Music 3 (Int8)",
+        "description": "Full songs with vocals from a caption and tagged lyrics, up to ~5 "
+                       "minutes, 32 kHz stereo. Int8 DiT plus the pruned int8 text encoder; "
+                       "tiled decode for long songs. Requires ComfyUI ≥ 0.33.",
+        "hf_repo": "Comfy-Org/MiniMax-Music-3",
+        "local_subdir": "diffusion_models",
+        "files": [
+            {"src": "diffusion_models/minimax_music3_dit_int8_convrot.safetensors",
+             "dst": "minimax_music3_dit_int8_convrot.safetensors"},
+        ],
+        "requires": ["minimax-music3-text-encoder", "minimax-music3-dav"],
+        "size_gb": 2.33,
+        "vram_mb": 10000,
+        "min_vram_gb": 12,
+        "type": "audio",
+        "min_steps": 30,
+        "default_steps": 30,
+        "max_clip_s": 300.0,
+        "license": {
+            "name": "MiniMax Music 3 Community License",
+            "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3/blob/main/LICENSE",
+            "attribution": "MiniMax-Music3",
+            "note": "Commercial products must display 'MiniMax-Music3'; revenue above 20M USD "
+                    "needs written authorization. No territory restriction.",
+        },
+    },
+    "minimax-music3-text-encoder": {
+        "name": "MiniMax Music 3 text encoder (pruned Int8)",
+        "description": "Required by MiniMax Music 3 (CLIPLoader, type 'minimax'): the 8B "
+                       "language model that turns caption and lyrics into the song plan.",
+        "hf_repo": "Comfy-Org/MiniMax-Music-3",
+        "local_subdir": "text_encoders",
+        "files": [
+            {"src": "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+             "dst": "minimax_music3_text_encoder_pruned_int8_convrot.safetensors"},
+        ],
+        "size_gb": 8.56,
+        "vram_mb": 0,
+        "type": "encoder",
+    },
+    "minimax-music3-dav": {
+        "name": "MiniMax Music 3 audio VAE",
+        "description": "Required by MiniMax Music 3; plain VAELoader from vae/.",
+        "hf_repo": "Comfy-Org/MiniMax-Music-3",
+        "local_subdir": "vae",
+        "files": [
+            {"src": "vae/minimax_music3_dav.safetensors", "dst": "minimax_music3_dav.safetensors"},
+        ],
+        "size_gb": 0.20,
+        "vram_mb": 0,
+        "type": "vae",
+    },
+    # ── MiniMax H3 ────────────────────────────────────────────────────────────
+    # "Which MiniMax": the local-weights H3 release (Comfy-Org/MiniMax-H3), not
+    # the Hailuo cloud API nodes that share the template name. Native ComfyUI
+    # support (MiniMaxH3ImageToVideo etc.) landed in v0.30.0 (PR #15224); the
+    # bundled ComfyUI is v0.33.0. Two checkpoints: fl2va covers T2V and
+    # first/last-frame I2V; ref2va is reference-to-video (up to 9 images,
+    # 3 clips, 3 audio files). Each is offered as a precision ladder: pruned
+    # int8 for 16 GB cards, unpruned int8 for 24 GB, bf16 for 48 GB+. Only the
+    # 16 GB rung has been exercised; the others are declared from the repo's
+    # file list and the vendor's size classes, marked unmeasured below.
+    "minimax-h3-int8": {
+        "name": "MiniMax H3 (Int8, 16GB)",
+        "description": "MiniMax H3 omni-modal video — generates picture and native "
+                       "stereo audio in one pass. Pruned int8+convrot transformer for "
+                       "RTX 40xx 16GB. T2V + first/last-frame I2V, 24fps, ~5-15s. "
+                       "Requires ComfyUI ≥ 0.30.0. Pulls Qwen3-VL 32B encoder + "
+                       "video VAE + audio VAE + style embeddings (~42GB total).",
+        "hf_repo": "Comfy-Org/MiniMax-H3",
+        "local_subdir": "diffusion_models",
+        "files": [
+            {
+                "src": "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+                "dst": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            },
+        ],
+        "requires": [
+            "minimax-h3-qwen3vl-nvfp4",
+            "minimax-h3-vae",
+            "minimax-h3-audio-vae",
+            "minimax-h3-style-embeddings",
+        ],
+        "size_gb": 20.97,
+        # Measured 2026-09-01 on a 16 GB RTX 40-series card (Ada) with 64 GB-class
+        # RAM: 864x480, 124 frames, 20 steps, --reserve-vram 3.0, PyTorch
+        # attention. Card peak 14.5 GB with ~2.7 GB held by the desktop and idle
+        # CUDA contexts, so the render's own working set was ~11.8 GB; ComfyUI
+        # partial-loads the transformer (6 GB resident, 14 GB offloaded) and the
+        # encoder to whatever is free, so the budget is the working set, not the
+        # weights. 14000 (copied from LTX-2.5) plus the session's 1 GB headroom
+        # asked for more than any 16 GB desktop card can free and refused every
+        # render. Wall time 390 s (~17 s/step); ComfyUI resident RAM peaked at 27 GB.
+        "vram_mb": 11000,
+        "min_vram_gb": 16,
+        **_H3_COMMON,
+        "modes": _H3_FL2VA_MODES,
+        "speed_profiles": H3_FL2VA_SPEED_PROFILES,
+        # Same card, seed and canvas, 20 steps: Comfy Kitchen int8 (ck) attention
+        # rendered frames indistinguishable from PyTorch's (339 s against 390 s).
+        # The turbo profiles and the other H3 builds were not compared under ck.
+        "attention_verified": {"pytorch": ["*"], "ck": ["standard"]},
+        # Per-VRAM-class starting points the Video Generator seeds its controls
+        # from. 16 GB starts at the template's 480p canvas on the 8-step turbo
+        # profile: measured 2026-09-01 on the same card as vram_mb, 864x480,
+        # 124 frames, the turbo-8 clip finished in 186 s against 390 s at 20
+        # steps with the subject, motion and background intact and fur detail
+        # slightly softer; standard stays one click away. Larger cards start on
+        # the native canvas at standard steps (unmeasured).
+        "tier_defaults": {
+            "16": {"width": 864, "height": 480, "speed_profile": "turbo-8", "frames": 124},
+            "24": {"width": 1344, "height": 768, "speed_profile": "standard", "frames": 124},
+        },
+    },
+    "minimax-h3-ref2va-int8": {
+        "name": "MiniMax H3 Reference (Int8, 16GB)",
+        "description": "MiniMax H3 reference-to-video: up to 9 reference images, "
+                       "3 reference clips and 3 audio files lock identity, motion, "
+                       "camera and voice, or edit and continue a clip. Pruned "
+                       "int8+convrot for RTX 40xx 16GB, 24fps, ~5-15s with native "
+                       "audio. Shares the Qwen3-VL encoder, VAEs and embeddings "
+                       "with MiniMax H3.",
+        "hf_repo": "Comfy-Org/MiniMax-H3",
+        "local_subdir": "diffusion_models",
+        "files": [
+            {
+                "src": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+                "dst": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            },
+        ],
+        "requires": [
+            "minimax-h3-qwen3vl-nvfp4",
+            "minimax-h3-vae",
+            "minimax-h3-audio-vae",
+            "minimax-h3-style-embeddings",
+        ],
+        "size_gb": 19.53,
+        # Same architecture and size class as the fl2va build; carries its
+        # measured budget, unmeasured itself.
+        "vram_mb": 11000,
+        "min_vram_gb": 16,
+        **_H3_COMMON,
+        "modes": ["ref2v"],
+        "ref_limits": _H3_REF_LIMITS,
+        "speed_profiles": H3_REF2VA_SPEED_PROFILES,
+        "tier_defaults": {
+            "16": {"width": 864, "height": 480, "speed_profile": "standard", "frames": 124},
+            "24": {"width": 1344, "height": 768, "speed_profile": "standard", "frames": 124},
+        },
+    },
+    "minimax-h3-int8-full": {
+        "name": "MiniMax H3 (Int8 unpruned, 24GB+)",
+        "description": "MiniMax H3 with the full modulation weights (Comfy-Org's "
+                       "pruned builds drop ~40% of them). Int8+convrot transformer "
+                       "plus the int8 Qwen3-VL encoder; meant for 24GB-class cards. "
+                       "Unmeasured: declared from the repo's size classes.",
+        "hf_repo": "Comfy-Org/MiniMax-H3",
+        "local_subdir": "diffusion_models",
+        "files": [
+            {
+                "src": "diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors",
+                "dst": "minimax_h3_fl2va_int8_convrot.safetensors",
+            },
+        ],
+        "requires": [
+            "minimax-h3-qwen3vl-int8",
+            "minimax-h3-vae",
+            "minimax-h3-audio-vae",
+            "minimax-h3-style-embeddings",
+        ],
+        "size_gb": 31.70,
+        # Unmeasured. Sized so gpu_session refuses the 16 GB tier outright
+        # instead of offload-thrashing; a 24 GB run replaces this number.
+        "vram_mb": 22000,
+        "min_vram_gb": 24,
+        **_H3_COMMON,
+        "modes": _H3_FL2VA_MODES,
+        "speed_profiles": H3_FL2VA_SPEED_PROFILES,
+        "tier_defaults": {
+            "24": {"width": 1344, "height": 768, "speed_profile": "standard", "frames": 124},
+        },
+    },
+    "minimax-h3-bf16": {
+        "name": "MiniMax H3 (BF16, 48GB+)",
+        "description": "MiniMax H3 at full bf16 precision with the bf16 Qwen3-VL "
+                       "encoder (~110GB of weights). For workstation cards with "
+                       "48GB or more. Unmeasured: declared from the repo's size "
+                       "classes.",
+        "hf_repo": "Comfy-Org/MiniMax-H3",
+        "local_subdir": "diffusion_models",
+        "files": [
+            {
+                "src": "diffusion_models/minimax_h3_fl2va_bf16.safetensors",
+                "dst": "minimax_h3_fl2va_bf16.safetensors",
+            },
+        ],
+        "requires": [
+            "minimax-h3-qwen3vl-bf16",
+            "minimax-h3-vae",
+            "minimax-h3-audio-vae",
+            "minimax-h3-style-embeddings",
+        ],
+        "size_gb": 61.74,
+        # Unmeasured; the floor keeps it off every consumer tier.
+        "vram_mb": 44000,
+        "min_vram_gb": 48,
+        **_H3_COMMON,
+        "modes": _H3_FL2VA_MODES,
+        "speed_profiles": H3_FL2VA_SPEED_PROFILES,
+        "tier_defaults": {
+            "48": {"width": 1344, "height": 768, "speed_profile": "standard", "frames": 124},
+        },
+    },
+    "minimax-h3-qwen3vl-nvfp4": {
+        "name": "Qwen3-VL 32B (NVFP4 AWQ) — MiniMax H3 text encoder",
+        "description": "Required by MiniMax H3 (CLIPLoader, type 'minimax'). NVFP4 is "
+                       "the template default and the smallest cut (15.7GB); on "
+                       "pre-Blackwell cards ComfyUI runs it as emulated ops via "
+                       "comfy_kitchen's dequantize_nvfp4 rather than native fp4 matmul.",
+        "hf_repo": "Comfy-Org/MiniMax-H3",
+        "local_subdir": "text_encoders",
+        "files": [
+            {
+                "src": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+                "dst": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            },
+        ],
+        "size_gb": 15.69,
+        "vram_mb": 0,
+        "type": "encoder",
+    },
+    "minimax-h3-qwen3vl-int8": {
+        "name": "Qwen3-VL 32B (Int8) — MiniMax H3 text encoder",
+        "description": "Encoder for the unpruned int8 H3 build on 24GB-class cards; "
+                       "no fp4 emulation.",
+        "hf_repo": "Comfy-Org/MiniMax-H3",
+        "local_subdir": "text_encoders",
+        "files": [
+            {
+                "src": "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+                "dst": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+            },
+        ],
+        "size_gb": 25.28,
+        "vram_mb": 0,
+        "type": "encoder",
+    },
+    "minimax-h3-qwen3vl-bf16": {
+        "name": "Qwen3-VL 32B (BF16) — MiniMax H3 text encoder",
+        "description": "Full-precision encoder for the bf16 H3 build.",
+        "hf_repo": "Comfy-Org/MiniMax-H3",
+        "local_subdir": "text_encoders",
+        "files": [
+            {
+                "src": "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
+                "dst": "qwen3vl_32b_minimax_h3_bf16.safetensors",
+            },
+        ],
+        "size_gb": 47.98,
+        "vram_mb": 0,
+        "type": "encoder",
+    },
+    "minimax-h3-vae": {
+        "name": "MiniMax H3 Video VAE (FP16)",
+        "description": "Required by MiniMax H3. Loaded through the plain VAELoader from vae/.",
+        "hf_repo": "Comfy-Org/MiniMax-H3",
+        "local_subdir": "vae",
+        "files": [
+            {
+                "src": "vae/minimax_h3_video_vae_fp16.safetensors",
+                "dst": "minimax_h3_video_vae_fp16.safetensors",
+            },
+        ],
+        "size_gb": 5.21,
+        "vram_mb": 0,
+        "type": "vae",
+    },
+    "minimax-h3-audio-vae": {
+        "name": "MiniMax H3 Audio VAE (FP32)",
+        "description": "Required by MiniMax H3 — the model samples a joint video+audio "
+                       "latent, so the audio decoder is not optional. Plain VAELoader "
+                       "from vae/ (unlike LTX, no checkpoints/ link needed).",
+        "hf_repo": "Comfy-Org/MiniMax-H3",
+        "local_subdir": "vae",
+        "files": [
+            {
+                "src": "vae/minimax_h3_audio_vae_fp32.safetensors",
+                "dst": "minimax_h3_audio_vae_fp32.safetensors",
+            },
+        ],
+        "size_gb": 0.61,
+        "vram_mb": 0,
+        "type": "vae",
+    },
+    "minimax-h3-style-embeddings": {
+        "name": "MiniMax H3 style embeddings",
+        "description": "Ten prompt embeddings shipped with H3 (bullet time, dark magic, "
+                       "four seasons, ...). Tiny; pulled with every H3 build so the "
+                       "style preset can never point at a missing file.",
+        "hf_repo": "Comfy-Org/MiniMax-H3",
+        "local_subdir": "embeddings",
+        "files": [
+            {"src": f"embeddings/{e['file']}", "dst": e["file"]} for e in H3_STYLE_EMBEDDINGS
+        ],
+        "size_gb": 0.011,
+        "vram_mb": 0,
+        "type": "embedding",
+    },
+    # Turbo LoRAs are optional (not in `requires`): 2 GB each, chosen through a
+    # speed profile. Preflight names the missing file when a profile asks for
+    # one that is not installed.
+    "minimax-h3-fl2v-turbo-8step": {
+        "name": "MiniMax H3 Turbo LoRA (8-step)",
+        "description": "Optional distilled LoRA for the fl2va builds: 8 sampling steps "
+                       "instead of 20 at slightly lower audio and motion quality "
+                       "(docs.comfy.org). Selected via the Turbo speed profile.",
+        "hf_repo": "Comfy-Org/MiniMax-H3",
+        "local_subdir": "loras",
+        "files": [
+            {
+                "src": "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+                "dst": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            },
+        ],
+        "size_gb": 1.96,
+        "vram_mb": 0,
+        "type": "lora",
+        "applies_to": ["minimax-h3-int8", "minimax-h3-int8-full", "minimax-h3-bf16"],
+    },
+    "minimax-h3-fl2v-turbo-4step-768p": {
+        "name": "MiniMax H3 Turbo LoRA (4-step, 768p)",
+        "description": "Optional distilled LoRA for the fl2va builds tuned at the 768 px "
+                       "canvas: 4 sampling steps. Selected via the Turbo 768p speed "
+                       "profile, which requires a 768 px short edge.",
+        "hf_repo": "Comfy-Org/MiniMax-H3",
+        "local_subdir": "loras",
+        "files": [
+            {
+                "src": "loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+                "dst": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+            },
+        ],
+        "size_gb": 1.96,
+        "vram_mb": 0,
+        "type": "lora",
+        "applies_to": ["minimax-h3-int8", "minimax-h3-int8-full", "minimax-h3-bf16"],
+    },
+    "minimax-h3-ref2v-turbo-4step": {
+        "name": "MiniMax H3 Reference Turbo LoRA (4-step, v0.1)",
+        "description": "Optional distilled LoRA for the ref2va build: 4 sampling steps. "
+                       "Vendor-labelled v0.1; the profile is marked experimental.",
+        "hf_repo": "Comfy-Org/MiniMax-H3",
+        "local_subdir": "loras",
+        "files": [
+            {
+                "src": "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+                "dst": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+            },
+        ],
+        "size_gb": 1.96,
+        "vram_mb": 0,
+        "type": "lora",
+        "applies_to": ["minimax-h3-ref2va-int8"],
+    },
 }
 
 
@@ -557,6 +1613,25 @@ def vram_mb_for_model(model_id: str, *, default: int = 11000) -> int:
     return vram if vram > 0 else default
 
 
+def live_preview_for_model(model_id: str) -> bool:
+    """False when the model's ComfyUI nodes cannot render sampler previews."""
+    entry = VIDEO_MODEL_REGISTRY.get(model_id or "") or {}
+    return entry.get("live_preview", True) is not False
+
+
+def comfyui_reserve_vram_gb_for_model(model_id: str) -> Optional[float]:
+    """The --reserve-vram a model's entry declares, or None when it has no opinion."""
+    entry = VIDEO_MODEL_REGISTRY.get(model_id or "") or {}
+    value = entry.get("comfyui_reserve_vram_gb")
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
 # 16GB-consumer defaults — Wan 2.2 5B TI2V fits without CPU offload.
 DEFAULT_T2V_MODEL = "wan22-5b"
 DEFAULT_I2V_MODEL = "wan22-5b"
@@ -575,25 +1650,70 @@ def _comfyui_reachable() -> bool:
     return False
 
 
+# Seconds to wait for ComfyUI to answer after an automatic start. The plugin
+# script returns once the process is up; the HTTP server follows within a few
+# seconds on a warm box (about 5 s observed 2026-09-24).
+COMFYUI_AUTOSTART_WAIT_S = 90
+
+
+def prepare_video_model(model_id: str) -> tuple[bool, str]:
+    """preflight_video_model, starting ComfyUI first when that is all that is missing.
+
+    Used by every place that queues a render (Video Gen batches, the
+    generate_video tool). The start goes through plugin_bridge's stage path
+    (no persisted preference, an explicit user-disable still wins, GPU
+    conflicts resolved there); GUAARDVARK_PLUGIN_AUTO_ORCHESTRATOR=0 turns it
+    off and the original "Start the ComfyUI plugin" error is returned.
+    """
+    ready, err = preflight_video_model(model_id)
+    if ready or "ComfyUI" not in (err or ""):
+        return ready, err
+    try:
+        from backend.services import plugin_bridge
+    except Exception:
+        return ready, err
+    if not plugin_bridge.auto_orchestrator_enabled():
+        return ready, err
+
+    logger.info("Video model %s needs ComfyUI; starting it", model_id)
+    try:
+        plugin_bridge.ensure_plugins_for_stage("video", "generating")
+    except plugin_bridge.PluginUnavailable as exc:
+        return False, RenderFailure(RenderErrorKind.COMFYUI_DOWN, f"{err} (Automatic start failed: {exc})")
+    except Exception as exc:  # noqa: BLE001 - report, never raise into a request
+        logger.warning("ComfyUI auto-start for %s failed: %s", model_id, exc)
+        return False, RenderFailure(RenderErrorKind.COMFYUI_DOWN, f"{err} (Automatic start failed: {exc})")
+
+    import time as _time
+    deadline = _time.time() + COMFYUI_AUTOSTART_WAIT_S
+    while not _comfyui_reachable() and _time.time() < deadline:
+        _time.sleep(1.0)
+    ready, err2 = preflight_video_model(model_id)
+    if ready:
+        logger.info("ComfyUI started for %s", model_id)
+        return True, ""
+    return False, err2 or err
+
+
 def preflight_video_model(model_id: str) -> tuple[bool, str]:
     """Return (ready, error_message). Blocks silent fallback to the wrong backend."""
     entry = VIDEO_MODEL_REGISTRY.get(model_id or "")
     if not entry:
-        return False, f"Unknown video model '{model_id}'"
+        return False, RenderFailure(RenderErrorKind.INVALID_REQUEST, f"Unknown video model '{model_id}'")
 
     name = entry.get("name") or model_id
     mtype = entry.get("type")
 
     if mtype == "wan":
         if not is_model_installed(model_id):
-            return False, (
+            return False, RenderFailure(RenderErrorKind.MODEL_NOT_INSTALLED, (
                 f"{name} is not installed. Open Manage Video Models to download it "
                 f"before queuing a batch."
-            )
+            ))
         if not _comfyui_reachable():
-            return False, (
+            return False, RenderFailure(RenderErrorKind.COMFYUI_DOWN, (
                 f"{name} requires ComfyUI. Start the ComfyUI plugin, then retry."
-            )
+            ))
         return True, ""
 
     if mtype == "cogvideox":
@@ -602,52 +1722,673 @@ def preflight_video_model(model_id: str) -> tuple[bool, str]:
             try:
                 from backend.services.offline_video_generator import OfflineVideoGenerator
                 off = OfflineVideoGenerator()
-                offline_ok = bool(getattr(off, "cogvideox_available", False))
+                # Importable diffusers + a GPU used to count as "ready"; with an
+                # empty in-process cache that let a batch start and download 20GB.
+                offline_ok = bool(getattr(off, "cogvideox_available", False)) and off.is_model_cached(model_id)
             except Exception:
                 offline_ok = False
             if offline_ok or is_model_installed(model_id):
                 return True, ""
-            return False, (
+            return False, RenderFailure(RenderErrorKind.MODEL_NOT_INSTALLED, (
                 "CogVideoX 5B is not ready: install the model via Manage Video Models "
                 "or ensure the offline diffusers backend (torch + GPU) is available."
-            )
+            ))
 
         if not is_model_installed(model_id):
-            return False, (
+            return False, RenderFailure(RenderErrorKind.MODEL_NOT_INSTALLED, (
                 f"{name} is not installed. Open Manage Video Models to download it."
-            )
+            ))
+        for dep in entry.get("requires", []):
+            if not is_model_installed(dep):
+                dep_name = (VIDEO_MODEL_REGISTRY.get(dep) or {}).get("name") or dep
+                return False, RenderFailure(RenderErrorKind.COMPANION_MISSING, (
+                    f"{name} is missing companion '{dep_name}'. "
+                    f"Open Manage Video Models and Install again (companions auto-pull)."
+                ))
         if not _comfyui_reachable():
-            return False, (
+            return False, RenderFailure(RenderErrorKind.COMFYUI_DOWN, (
                 f"{name} requires ComfyUI for image-to-video. Start ComfyUI, then retry."
-            )
+            ))
+        return True, ""
+
+    if mtype == "hunyuan":
+        if not is_model_installed(model_id):
+            return False, RenderFailure(RenderErrorKind.MODEL_NOT_INSTALLED, (
+                f"{name} is not installed. Open Manage Video Models to download it "
+                f"(and its LLaVA / CLIP-L / VAE companions) before queuing a batch."
+            ))
+        for dep in entry.get("requires", []):
+            if not is_model_installed(dep):
+                dep_name = (VIDEO_MODEL_REGISTRY.get(dep) or {}).get("name") or dep
+                return False, RenderFailure(RenderErrorKind.COMPANION_MISSING, (
+                    f"{name} is missing companion '{dep_name}'. "
+                    f"Open Manage Video Models and Install again (companions auto-pull)."
+                ))
+        if not _comfyui_reachable():
+            return False, RenderFailure(RenderErrorKind.COMFYUI_DOWN, (
+                f"{name} requires ComfyUI with the ComfyUI-GGUF custom node. "
+                f"Start the ComfyUI plugin, then retry."
+            ))
         return True, ""
 
     if mtype == "ltx":
         if not is_model_installed(model_id):
-            return False, (
+            return False, RenderFailure(RenderErrorKind.MODEL_NOT_INSTALLED, (
                 f"{name} is not installed. Open Manage Video Models to download it "
                 f"(and its Gemma / VAE companions) before queuing a batch."
-            )
+            ))
         for dep in entry.get("requires", []):
             if not is_model_installed(dep):
                 dep_name = (VIDEO_MODEL_REGISTRY.get(dep) or {}).get("name") or dep
-                return False, (
+                return False, RenderFailure(RenderErrorKind.COMPANION_MISSING, (
                     f"{name} is missing companion '{dep_name}'. "
                     f"Open Manage Video Models and Install again (companions auto-pull)."
-                )
+                ))
         if not _comfyui_reachable():
             if str(model_id).startswith("ltx25"):
-                return False, (
+                return False, RenderFailure(RenderErrorKind.COMFYUI_DOWN, (
                     f"{name} requires ComfyUI ≥ 0.32.0 with LTX-2.5 support. "
                     f"Start the ComfyUI plugin, then retry."
-                )
-            return False, (
+                ))
+            return False, RenderFailure(RenderErrorKind.COMFYUI_DOWN, (
                 f"{name} requires ComfyUI ≥ 0.16.1 with LTX-2.3 support. "
                 f"Start the ComfyUI plugin, then retry."
-            )
+            ))
+        return True, ""
+
+    if mtype == "audio":
+        if not is_model_installed(model_id):
+            return False, RenderFailure(RenderErrorKind.MODEL_NOT_INSTALLED, (
+                f"{name} is not installed. Open Manage Video Models to download it "
+                f"(and its encoder / VAE companions) first."
+            ))
+        for dep in entry.get("requires", []):
+            if not is_model_installed(dep):
+                dep_name = (VIDEO_MODEL_REGISTRY.get(dep) or {}).get("name") or dep
+                return False, RenderFailure(RenderErrorKind.COMPANION_MISSING, (
+                    f"{name} is missing companion '{dep_name}'. "
+                    f"Open Manage Video Models and Install again (companions auto-pull)."
+                ))
+        if not _comfyui_reachable():
+            return False, RenderFailure(RenderErrorKind.COMFYUI_DOWN, f"{name} requires ComfyUI ≥ 0.33.0. Start the ComfyUI plugin, then retry.")
+        return True, ""
+
+    if mtype == "minimax":
+        if not is_model_installed(model_id):
+            return False, RenderFailure(RenderErrorKind.MODEL_NOT_INSTALLED, (
+                f"{name} is not installed. Open Manage Video Models to download it "
+                f"(and its Qwen3-VL / VAE companions) before queuing a batch."
+            ))
+        for dep in entry.get("requires", []):
+            if not is_model_installed(dep):
+                dep_name = (VIDEO_MODEL_REGISTRY.get(dep) or {}).get("name") or dep
+                return False, RenderFailure(RenderErrorKind.COMPANION_MISSING, (
+                    f"{name} is missing companion '{dep_name}'. "
+                    f"Open Manage Video Models and Install again (companions auto-pull)."
+                ))
+        if not _comfyui_reachable():
+            return False, RenderFailure(RenderErrorKind.COMFYUI_DOWN, (
+                f"{name} requires ComfyUI ≥ 0.30.0 with MiniMax H3 support. "
+                f"Start the ComfyUI plugin, then retry."
+            ))
         return True, ""
 
     return True, ""
+
+
+def supports_first_frame_i2v(model_id: str) -> bool:
+    """True when the model animates a supplied first frame itself.
+
+    Derived from what each family already declares — the Wan/Hunyuan loader
+    maps carry a t2v/i2v/ti2v type, LTX and MiniMax H3 take a first frame in
+    their own graphs, CogVideoX names its I2V build — so the cinematic
+    keyframe path never swaps a model for a different family behind the
+    person's back. Before 2026-08-29 every non-Cog model without "i2v" in its
+    id was animated by Wan 2.2 14B I2V: LTX, Wan 5B and MiniMax renders came
+    back as Wan renders."""
+    entry = VIDEO_MODEL_REGISTRY.get(model_id or "")
+    if not entry:
+        return False
+    modes = entry.get("modes")
+    if modes:
+        # Declared capability wins: the H3 reference build has no first-frame
+        # input, so it must never be picked to animate a keyframe.
+        return "i2v" in modes or "flf2v" in modes
+    mtype = entry.get("type")
+    if mtype in ("ltx", "minimax"):
+        return True
+    if mtype == "wan":
+        return (wan_comfyui_map().get(model_id) or {}).get("type") in ("i2v", "ti2v")
+    if mtype == "hunyuan":
+        return (hunyuan_comfyui_map().get(model_id) or {}).get("type") == "i2v"
+    if mtype == "cogvideox":
+        return "i2v" in model_id
+    return False
+
+
+def i2v_model_for(model_id: str, default: str | None = None) -> str:
+    """The model that animates a keyframe for `model_id`: the model itself
+    when it takes a first frame, else its same-family I2V sibling
+    (wan22-14b → wan22-14b-i2v, hunyuan-t2v → hunyuan-i2v, cogvideox-5b →
+    cogvideox-5b-i2v), else `default`."""
+    mid = model_id or ""
+    if supports_first_frame_i2v(mid):
+        return mid
+    entry = VIDEO_MODEL_REGISTRY.get(mid) or {}
+    for candidate in (f"{mid}-i2v", mid.replace("-t2v", "-i2v")):
+        if candidate != mid and candidate in VIDEO_MODEL_REGISTRY \
+                and VIDEO_MODEL_REGISTRY[candidate].get("type") == entry.get("type") \
+                and supports_first_frame_i2v(candidate):
+            return candidate
+    # No name-pattern sibling (the H3 reference build): the same-family
+    # first-frame model that shares the most companions, so the keyframe is
+    # still animated by the family the person picked.
+    if entry:
+        shared = set(entry.get("requires", []))
+        siblings = [
+            (len(shared & set(e.get("requires", []))), cid)
+            for cid, e in VIDEO_MODEL_REGISTRY.items()
+            if cid != mid and e.get("type") == entry.get("type") and supports_first_frame_i2v(cid)
+        ]
+        if siblings:
+            return max(siblings)[1]
+    return default if default is not None else DEFAULT_I2V_MODEL
+
+
+# ── Family specs and extension hooks ─────────────────────────────────────────
+# What a family of ComfyUI graphs has in common: alignment, the pixel budget a
+# 16 GB card sustains, the VRAM floor, the latent frame rule, the LoRA slot its
+# loader offers, whether it decodes audio and how it takes guidance. The
+# generator's per-family tables read these; an extension registering a family
+# adds a row here instead of editing those tables.
+# The negative prompts the model makers' own ComfyUI workflow templates ship
+# (package comfyui-workflow-templates-json 0.1.57, the one ComfyUI v0.34.0 pins
+# through comfyui-workflow-templates 0.11.48).
+# Wan: video_wan2_2_14B_i2v and video_wan2_2_5B_ti2v, verbatim. video_wan2_2_14B_t2v
+# adds two content terms (nudity, NSFW) that are left out here: the defaults
+# target defects, not content.
+WAN_REFERENCE_NEGATIVE = (
+    "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，"
+    "低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，"
+    "毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+)
+# LTX: video_ltx2_3_t2v and video_ltx2_5_t2v, verbatim. Not the LTX default: it
+# names "cartoon" and "childish", against five of the eight prompt styles.
+# scripts/video_prompt_ab.py renders it as a variant.
+LTX_REFERENCE_NEGATIVE = "pc game, console game, video game, cartoon, childish, ugly"
+
+FAMILY_SPECS = {
+    "wan": {"dimension_alignment": 16, "max_pixel_area": 1_050_000, "min_vram_gb": 16, "frame_rule": "4n+1",
+            "lora_slot": "model_only", "audio_out": False, "guidance": 3.5,
+            "frame_snap": None, "negative_prompt": True,
+            "cfg_when_unset": 3.5, "negative_when_unset": WAN_REFERENCE_NEGATIVE,
+            "text_encoder_cpu_max_vram_mb": 20 * 1024, "attention": "pytorch"},
+    "cogvideox": {"dimension_alignment": 16, "max_pixel_area": None, "min_vram_gb": 16, "frame_rule": "8n+1",
+                  "lora_slot": None, "audio_out": False, "guidance": 6.0,
+                  "frame_snap": None, "negative_prompt": True, "cfg_when_unset": 6.0},
+    "ltx": {"dimension_alignment": 32, "max_pixel_area": 1_050_000, "min_vram_gb": 16, "frame_rule": "8n+1",
+            "lora_slot": "model_only", "audio_out": False, "guidance": 1.0,
+            "frame_snap": "down", "min_frames": 9, "frames_when_unset": 65, "negative_prompt": True,
+            "cfg_when_unset": 1.0, "cfg_range": [0.0, 1.5],
+            "text_encoder_cpu_max_vram_mb": 20 * 1024, "attention": "pytorch"},
+    "hunyuan": {"dimension_alignment": 16, "max_pixel_area": 1_050_000, "min_vram_gb": 16, "frame_rule": "4n+1",
+                "lora_slot": "model_only", "audio_out": False, "guidance": 6.0,
+                "frame_snap": "nearest", "min_frames": 1, "frames_when_unset": 73, "negative_prompt": False,
+                "cfg_when_unset": 6.0,
+                "text_encoder_cpu_max_vram_mb": 20 * 1024, "attention": "pytorch"},
+    "minimax": {"dimension_alignment": 32, "max_pixel_area": 768 * 1344, "min_vram_gb": 16, "frame_rule": "17k+5",
+                "lora_slot": "model_only", "audio_out": True, "guidance": None,
+                "frame_snap": "up", "min_frames": 5, "frames_when_unset": 124, "negative_prompt": False,
+                "enforce_min_steps": True, "attention": "pytorch"},
+}
+# How the render holds a request to these (backend/services/video_render_limits.py):
+#   frame_snap          how a length is moved onto frame_rule: "down", "up" (MiniMax's
+#                       template rounds up), "nearest", or None (sent as asked)
+#   min_frames / frames_when_unset  the floor, and the length used when none is given
+#   enforce_min_steps   raise a preset step count to min_steps (a typed count stands)
+#   cfg_when_unset / cfg_range      guidance used when none is given; outside the
+#                       range the value is kept and logged. The values are the
+#                       reference templates' (same package as above): Wan 14B
+#                       video_wan2_2_14B_t2v/_i2v 3.5 on the 20-step path, LTX
+#                       video_ltx2_3_t2v CFGGuider 1, Hunyuan hunyuan_video_text_to_video
+#                       FluxGuidance 6. CogVideoX has no template; 6.0 is the
+#                       CogVideoSampler default in the /object_info snapshot
+#                       (backend/tests/fixtures/comfyui_object_info.json).
+#                       A request that gives no guidance gets this only with
+#                       GUAARDVARK_VIDEO_REFERENCE_DEFAULTS on; with it off it keeps
+#                       the 7.5 every layer filled in before.
+#   negative_when_unset the negative prompt used when none is given, under
+#                       GUAARDVARK_VIDEO_REFERENCE_DEFAULTS; None keeps the style's
+#   prompt_styles_withheld  {style: why} prompt styles this model is not offered
+#                       with (backend/utils/prompt_enhancer.STYLE_SUFFIXES); the
+#                       evidence is an A/B run (scripts/video_prompt_ab.py)
+#   output_alignment    the grid the finished file lands on when the graph resizes
+#                       (a two-stage upscale); requests always snap to it
+#   negative_prompt     whether the graph has a negative branch
+#   text_encoder_cpu_max_vram_mb    at or below this total VRAM the text encoder
+#                       loads on CPU so the UNet keeps the card (Wan UMT5 is ~6.4 GB
+#                       resident; on 16-20 GB cards it pushed the GGUF UNet into CPU
+#                       offload at ~150 s per step)
+#   attention           the backend the graph pins (ModelAttentionBackend) when the
+#                       ComfyUI launch asks for one the entry has not verified;
+#                       None where the graph cannot take the pin (the CogVideoX
+#                       wrapper picks its own attention_mode)
+#   attention_verified  on an entry only: {backend: [speed profile ids]} measured
+#                       clean. PyTorch, ComfyUI's default and the backend every
+#                       render was measured with, is verified everywhere.
+# An entry may declare any of these to override its family.
+RENDER_LIMIT_KEYS = (
+    "frame_snap", "min_frames", "frames_when_unset", "enforce_min_steps", "cfg_when_unset",
+    "cfg_range", "negative_prompt", "text_encoder_cpu_max_vram_mb", "attention",
+    "negative_when_unset", "prompt_styles_withheld", "output_alignment",
+)
+
+
+def family_spec(family: str) -> dict:
+    return dict(FAMILY_SPECS.get(family or "") or {})
+
+
+def register_family_spec(family: str, spec: dict, *, replace: bool = False) -> None:
+    """Declare a family an extension brings its own builder for."""
+    if not family or not isinstance(spec, dict):
+        raise ValueError("register_family_spec needs a family name and a spec dict")
+    if family in FAMILY_SPECS and not replace:
+        raise ValueError(f"family '{family}' is already declared; pass replace=True to override")
+    FAMILY_SPECS[family] = dict(spec)
+
+
+def register_video_model(model_id: str, entry: dict, *, replace: bool = False) -> list:
+    """Add a registry entry at runtime (an extension's media_models.py).
+
+    The entry takes the same shape as the ones above; check_files is derived
+    the way _normalize_registry does it, and the registry is re-verified so a
+    broken entry is logged at once. Returns the verification problems."""
+    if not model_id or not isinstance(entry, dict):
+        raise ValueError("register_video_model needs an id and an entry dict")
+    if model_id in VIDEO_MODEL_REGISTRY and not replace:
+        raise ValueError(f"video model '{model_id}' is already registered; pass replace=True to override")
+    VIDEO_MODEL_REGISTRY[model_id] = dict(entry)
+    _normalize_registry()
+    problems = [p for p in verify_registry() if p.startswith(f"{model_id}:")]
+    if problems:
+        logger.error("register_video_model(%s): %s", model_id, "; ".join(problems))
+    return problems
+
+
+# ── Capability contract ──────────────────────────────────────────────────────
+# Flat keys on a generation entry describe what the model can do, so the
+# Video Generator, MCP tools and batch generators read data instead of
+# testing `type == "minimax"`. Entries that predate the contract get family
+# defaults from model_capabilities(); nothing here is a second registry.
+CAPABILITY_MODES = ("t2v", "i2v", "l2v", "flf2v", "ref2v")
+GENERATION_TYPES = ("wan", "cogvideox", "ltx", "hunyuan", "minimax")
+# Families whose ComfyUI graph stacks user LoRAs (LoraLoaderModelOnly after the
+# UNET) and takes a user-chosen text encoder in place of the shipped companion.
+# A family not listed refuses that role at add time rather than accepting a
+# file the graph would never load. CogVideoX runs through the wrapper nodes and
+# has neither hook.
+LORA_STACK_TYPES = ("wan", "minimax", "ltx", "hunyuan")
+TEXT_ENCODER_SWAP_TYPES = ("wan", "minimax", "ltx", "hunyuan")
+
+
+def shipped_encoder_for(model_id: str) -> str | None:
+    """Id of the text-encoder companion a generation model requires, or None.
+
+    The first encoder in ``requires`` is the one the graph's main text slot
+    loads and the one a user encoder replaces; secondary parts (LTX 2.3's text
+    projection, Hunyuan's clip_l) stay as shipped."""
+    entry = VIDEO_MODEL_REGISTRY.get(model_id) or {}
+    for dep in entry.get("requires") or []:
+        if (VIDEO_MODEL_REGISTRY.get(dep) or {}).get("type") == "encoder":
+            return dep
+    return None
+
+
+def _derived_modes(model_id: str, entry: dict) -> list:
+    mtype = entry.get("type")
+    if mtype == "wan":
+        kind = (wan_comfyui_map().get(model_id) or {}).get("type")
+        return {"t2v": ["t2v"], "i2v": ["i2v"], "ti2v": ["t2v", "i2v"]}.get(kind, ["t2v"])
+    if mtype == "hunyuan":
+        return ["i2v"] if (hunyuan_comfyui_map().get(model_id) or {}).get("type") == "i2v" else ["t2v"]
+    if mtype == "cogvideox":
+        return ["i2v"] if "i2v" in model_id else ["t2v"]
+    if mtype in ("ltx", "minimax"):
+        return ["t2v", "i2v"]
+    return []
+
+
+def model_capabilities(model_id: str) -> dict:
+    """The capability record for a generation entry (empty dict for companions
+    and unknown ids). Declared keys win; the rest are family defaults."""
+    entry = VIDEO_MODEL_REGISTRY.get(model_id or "") or {}
+    if entry.get("type") not in GENERATION_TYPES and entry.get("type") != "audio":
+        return {}
+    caps = {
+        "modes": entry.get("modes") or _derived_modes(model_id, entry),
+        "audio_out": bool(entry.get("audio_out", False)),
+        "audio_in": bool(entry.get("audio_in", False)),
+        "cfg": bool(entry.get("cfg", True)),
+        "aspect_ratios": list(entry.get("aspect_ratios") or []),
+        "dimension_alignment": entry.get("dimension_alignment"),
+        "max_pixel_area": entry.get("max_pixel_area"),
+        "native_fps": entry.get("native_fps"),
+        "frame_rule": entry.get("frame_rule"),
+        "max_frames": entry.get("max_frames"),
+        "min_clip_s": entry.get("min_clip_s"),
+        "max_clip_s": entry.get("max_clip_s"),
+        "duration_tiers": list(entry.get("duration_tiers") or []),
+        "min_steps": entry.get("min_steps"),
+        "default_steps": entry.get("default_steps"),
+        "speed_profiles": dict(entry.get("speed_profiles") or {}),
+        "style_embeddings": list(entry.get("style_embeddings") or []),
+        "ref_limits": entry.get("ref_limits"),
+        "tier_defaults": dict(entry.get("tier_defaults") or {}),
+        "min_vram_gb": entry.get("min_vram_gb"),
+        "license": entry.get("license"),
+    }
+    caps["supports_t2v"] = "t2v" in caps["modes"]
+    caps["supports_i2v"] = "i2v" in caps["modes"] or "flf2v" in caps["modes"]
+    spec = family_spec(entry.get("type"))
+    if caps["dimension_alignment"] is None:
+        caps["dimension_alignment"] = spec.get("dimension_alignment")
+    if caps["max_pixel_area"] is None:
+        caps["max_pixel_area"] = spec.get("max_pixel_area")
+    if not caps["frame_rule"]:
+        caps["frame_rule"] = spec.get("frame_rule")
+    if caps["min_vram_gb"] is None:
+        caps["min_vram_gb"] = spec.get("min_vram_gb")
+    for key in RENDER_LIMIT_KEYS:
+        caps[key] = entry[key] if key in entry else spec.get(key)
+    # Verified backends are measurements of this entry; a model cloned "like" it
+    # inherits the pin target through its type, not the measurement.
+    caps["attention_verified"] = dict(entry.get("attention_verified") or {"pytorch": ["*"]})
+    caps["prompt_styles_withheld"] = dict(caps.get("prompt_styles_withheld") or {})
+    from backend.utils.prompt_enhancer import PROMPT_STYLE_IDS
+    caps["prompt_styles"] = [s for s in PROMPT_STYLE_IDS if s not in caps["prompt_styles_withheld"]]
+    return caps
+
+
+_VRAM_FIT_MARGIN_MB = 1024
+_SURFACE_SETTING = {
+    "music-video": "active_video_model_music_video",
+    "film-crew": "active_video_model_film_crew",
+}
+
+
+def _role_ok(model_id: str, role: str) -> bool:
+    caps = model_capabilities(model_id)
+    if not caps:
+        return False
+    if role == "t2v":
+        return bool(caps.get("supports_t2v"))
+    if role == "i2v":
+        return bool(caps.get("supports_i2v"))
+    if role == "scene":
+        modes = caps.get("modes") or []
+        return bool(caps.get("audio_out") and (caps.get("supports_i2v") or "ref2v" in modes))
+    return False
+
+
+def _fits_card(model_id: str, total_vram_mb) -> bool:
+    if not total_vram_mb:
+        return True
+    return vram_mb_for_model(model_id) + _VRAM_FIT_MARGIN_MB <= float(total_vram_mb)
+
+
+def _video_setting(key: str) -> str:
+    try:
+        from backend.utils.settings_utils import get_setting
+        return (get_setting(key, default="") or "").strip()
+    except Exception:
+        return ""
+
+
+def _probe_total_vram_mb():
+    try:
+        from backend.services.gpu_resource_coordinator import get_available_vram
+        return (get_available_vram() or {}).get("total_mb") or 0
+    except Exception:
+        return 0
+
+
+def _accept_or_refuse(model_id: str, role: str) -> tuple:
+    ready, err = preflight_video_model(model_id)
+    if not ready:
+        return None, err
+    if not _role_ok(model_id, role):
+        name = (VIDEO_MODEL_REGISTRY.get(model_id) or {}).get("name") or model_id
+        return None, f"{name} cannot serve {role} generation."
+    return model_id, None
+
+
+def _hardware_fallback(role: str, total_vram_mb) -> str | None:
+    preferred = DEFAULT_I2V_MODEL if role == "i2v" else DEFAULT_T2V_MODEL
+    if role == "scene":
+        preferred = None
+    candidates = []
+    for mid, entry in VIDEO_MODEL_REGISTRY.items():
+        if entry.get("type") not in GENERATION_TYPES:
+            continue
+        if not _role_ok(mid, role):
+            continue
+        if not is_model_installed(mid):
+            continue
+        if not _fits_card(mid, total_vram_mb):
+            continue
+        candidates.append(mid)
+    if not candidates:
+        return None
+    if preferred in candidates:
+        return preferred
+    # Largest model the card can hold, so a 16 GB card with two installed
+    # families gets the higher-fidelity one rather than whichever the registry
+    # happens to list first. Registry order only breaks ties.
+    order = list(VIDEO_MODEL_REGISTRY)
+    return max(candidates, key=lambda m: (vram_mb_for_model(m), -order.index(m)))
+
+
+def resolve_active_video_model(
+    role: str,
+    explicit: str | None = None,
+    *,
+    surface: str | None = None,
+) -> tuple:
+    """Pick the video model for this job.
+
+    Priority: explicit request → per-pipeline override → global active
+    setting → first installed model that fits the card. A typed id that
+    cannot run is refused in one sentence; families are never swapped
+    silently. Returns ``(model_id, None)`` or ``(None, message)``.
+    """
+    if role not in ("t2v", "i2v", "scene"):
+        return None, f"Unknown video role '{role}'."
+    explicit = (explicit or "").strip() or None
+    if explicit:
+        return _accept_or_refuse(explicit, role)
+
+    if surface:
+        key = _SURFACE_SETTING.get(surface)
+        if key:
+            override = _video_setting(key)
+            if override:
+                return _accept_or_refuse(override, role)
+
+    if role == "i2v":
+        i2v_override = _video_setting("active_video_model_i2v")
+        if i2v_override:
+            return _accept_or_refuse(i2v_override, "i2v")
+        global_id = _video_setting("active_video_model")
+        if global_id:
+            if _role_ok(global_id, "i2v"):
+                return _accept_or_refuse(global_id, "i2v")
+            sibling = i2v_model_for(global_id, default="")
+            if sibling:
+                return _accept_or_refuse(sibling, "i2v")
+    else:
+        global_id = _video_setting("active_video_model")
+        if global_id:
+            if _role_ok(global_id, role):
+                return _accept_or_refuse(global_id, role)
+            if role == "scene":
+                sibling = i2v_model_for(global_id, default="")
+                if sibling and _role_ok(sibling, "scene"):
+                    return _accept_or_refuse(sibling, "scene")
+
+    fallback = _hardware_fallback(role, _probe_total_vram_mb())
+    if fallback:
+        return fallback, None
+    return None, "No installed video model is ready for this card."
+
+
+_FRAME_RULE_RE = re.compile(r"^(\d+)[a-z]\+(\d+)$")
+
+
+def snap_frames(model_id: str, frames: int, *, up: bool = False) -> int:
+    """``frames`` moved onto the model's declared frame grid.
+
+    Rules are written as ``4n+1``, ``8n+1``, ``17k+5``: a step and an offset.
+    Snaps down by default (a request is never lengthened without asking); pass
+    ``up=True`` to snap up, as the MiniMax template does. A model with no rule
+    returns ``frames`` unchanged.
+    """
+    rule = (model_capabilities(model_id) or {}).get("frame_rule") or ""
+    m = _FRAME_RULE_RE.match(str(rule).replace(" ", ""))
+    if not m:
+        return int(frames)
+    step, offset = int(m.group(1)), int(m.group(2))
+    n = max(int(frames), offset)
+    k, rem = divmod(n - offset, step)
+    if up and rem:
+        k += 1
+    return offset + k * step
+
+
+def clip_defaults_for(model_id: str, total_vram_mb=None) -> dict:
+    """Native fps/frames/steps/canvas for a model when the caller omitted them."""
+    caps = model_capabilities(model_id)
+    tiers = tier_defaults_for(model_id, total_vram_mb)
+    fps = int(caps.get("native_fps") or 24)
+    max_frames = int(caps.get("max_frames") or 121)
+    frames = int(tiers.get("frames") or min(49, max_frames))
+    frames = max(1, min(frames, max_frames))
+    steps = int(tiers.get("steps") or caps.get("default_steps") or 20)
+    floor = int(caps.get("min_steps") or 0)
+    if floor:
+        steps = max(steps, floor)
+    width = tiers.get("width")
+    height = tiers.get("height")
+    if not width or not height:
+        area = int(caps.get("max_pixel_area") or 512 * 512)
+        align = int(caps.get("dimension_alignment") or 16) or 16
+        # 16:9 inside the pixel budget, snapped to alignment.
+        h = int((area * 9 / 16) ** 0.5)
+        w = int(h * 16 / 9)
+        width = max(align, (w // align) * align)
+        height = max(align, (h // align) * align)
+    return {
+        "fps": fps,
+        "duration_frames": frames,
+        "num_inference_steps": steps,
+        "width": int(width),
+        "height": int(height),
+    }
+
+
+def speed_profile_loras(model_id: str) -> dict:
+    """LoRA id -> label of the speed profile that owns it, for one model. A
+    profile LoRA is trained for its profile's steps, cfg and shift, and a Wan
+    pair is split per expert, so it is never offered or accepted as a free
+    adapter: stacked on both experts at the base settings it renders badly."""
+    entry = VIDEO_MODEL_REGISTRY.get(model_id or "") or {}
+    owned = {}
+    for pid, spec in (entry.get("speed_profiles") or {}).items():
+        label = spec.get("label") or pid
+        if spec.get("lora"):
+            owned[spec["lora"]] = label
+        for lora_id in (spec.get("loras") or {}).values():
+            owned[lora_id] = label
+    return owned
+
+
+def speed_profile_for(model_id: str, profile: str | None) -> dict | None:
+    """Resolve a declared speed profile to its settings plus the LoRA filename
+    the builder loads (``lora_file``), or None when the model does not declare
+    that profile. A profile without a LoRA resolves with ``lora_file`` None."""
+    if not profile:
+        return None
+    entry = VIDEO_MODEL_REGISTRY.get(model_id or "") or {}
+    spec = (entry.get("speed_profiles") or {}).get(profile)
+    if not spec:
+        return None
+    resolved = dict(spec)
+    resolved["id"] = profile
+    resolved["lora_file"] = None
+    lora_id = spec.get("lora")
+    if lora_id:
+        lora_entry = VIDEO_MODEL_REGISTRY.get(lora_id) or {}
+        files = lora_entry.get("files") or []
+        resolved["lora_file"] = files[0]["dst"] if files else None
+        resolved["lora_installed"] = is_model_installed(lora_id)
+    pair = spec.get("loras") or {}
+    if pair:
+        # One LoRA per model role (Wan 14B: unet_high / unet_low).
+        resolved["lora_files"] = {}
+        installed = True
+        for role, pid in pair.items():
+            entry = VIDEO_MODEL_REGISTRY.get(pid) or {}
+            files = entry.get("files") or []
+            resolved["lora_files"][role] = files[0]["dst"] if files else None
+            installed = installed and is_model_installed(pid)
+        resolved["lora_installed"] = installed
+    return resolved
+
+
+def style_embedding_token(model_id: str, style_id: str | None) -> str | None:
+    """The prompt token for a declared style embedding id, or None."""
+    if not style_id:
+        return None
+    for emb in (VIDEO_MODEL_REGISTRY.get(model_id or "") or {}).get("style_embeddings") or []:
+        if emb.get("id") == style_id:
+            return emb.get("token")
+    return None
+
+
+def vram_tier_for(total_vram_mb: int | float | None, tiers) -> str | None:
+    """The largest declared tier key (a VRAM class in GB, as a string) that the
+    card meets. Cards that report a few hundred MB under a round number still
+    count for it, matching hardware_policy's grace for 15.9 GB "16 GB" cards."""
+    if not total_vram_mb or not tiers:
+        return None
+    total_gb = float(total_vram_mb) / 1024.0 + 0.5
+    best = None
+    for key in tiers:
+        try:
+            need = float(key)
+        except (TypeError, ValueError):
+            continue
+        if need <= total_gb and (best is None or need > float(best)):
+            best = key
+    return best
+
+
+def tier_defaults_for(model_id: str, total_vram_mb: int | float | None = None) -> dict:
+    """The starting settings for this card, chosen from the entry's
+    ``tier_defaults``. Probes VRAM when not supplied; returns {} when the
+    entry declares no tiers or the card is below every declared class."""
+    tiers = (VIDEO_MODEL_REGISTRY.get(model_id or "") or {}).get("tier_defaults") or {}
+    if not tiers:
+        return {}
+    if total_vram_mb is None:
+        try:
+            from backend.services.gpu_resource_coordinator import get_available_vram
+            total_vram_mb = (get_available_vram() or {}).get("total_mb") or 0
+        except Exception:
+            total_vram_mb = 0
+    key = vram_tier_for(total_vram_mb, tiers)
+    if key is None:
+        return {}
+    return {"tier": key, **tiers[key]}
 
 
 def wan_comfyui_map() -> dict:
@@ -705,6 +2446,13 @@ def classify_hf_download_error(exc: BaseException, *, repo_id: str | None = None
     Non-gated failures are returned as ``str(exc)`` unchanged.
     """
     msg = str(exc).lower()
+    if "429" in msg or "rate limit" in msg or "too many requests" in msg:
+        return (
+            "Hugging Face rate-limited this lookup. Wait a moment, or set HF_TOKEN in .env."
+        )
+    if "404" in msg or "entrynotfound" in msg or "repository not found" in msg:
+        where = f" '{repo_id}'" if repo_id else ""
+        return f"No Hugging Face repo{where} was found."
     gated = any(
         token in msg
         for token in (
@@ -783,6 +2531,165 @@ def ltx_comfyui_map() -> dict:
     return out
 
 
+def minimax_comfyui_map() -> dict:
+    """Build the ComfyUI MiniMax H3 loader map from the registry (never raises).
+
+    Returns {model_id: {unet, clip, vae, audio_vae}} derived from `files[].dst`,
+    so the (future) workflow builder loads exactly the bytes the downloader
+    wrote. The two VAEs are told apart by filename because both are type "vae".
+    """
+    out = {}
+    try:
+        for mid, entry in VIDEO_MODEL_REGISTRY.items():
+            if entry.get("type") != "minimax":
+                continue
+            dsts = [f["dst"] for f in entry.get("files", [])]
+            mapped = {"unet": dsts[0] if dsts else None, "clip": None, "vae": None, "audio_vae": None}
+            for dep in entry.get("requires", []):
+                dep_entry = VIDEO_MODEL_REGISTRY.get(dep, {})
+                dep_files = dep_entry.get("files", [])
+                dep_dst = dep_files[0]["dst"] if dep_files else (dep_entry.get("check_files") or [None])[0]
+                dep_type = dep_entry.get("type")
+                if dep_type == "encoder":
+                    mapped["clip"] = dep_dst
+                elif dep_type == "vae":
+                    mapped["audio_vae" if "audio" in (dep_dst or "") else "vae"] = dep_dst
+            out[mid] = mapped
+    except Exception as e:
+        logger.error("minimax_comfyui_map() build failed: %s", e, exc_info=True)
+    return out
+
+
+def music_comfyui_map() -> dict:
+    """ComfyUI loader map for audio entries: {model_id: {unet, clip, vae}}."""
+    out = {}
+    try:
+        for mid, entry in VIDEO_MODEL_REGISTRY.items():
+            if entry.get("type") != "audio":
+                continue
+            dsts = [f["dst"] for f in entry.get("files", [])]
+            mapped = {"unet": dsts[0] if dsts else None, "clip": None, "vae": None}
+            for dep in entry.get("requires", []):
+                dep_entry = VIDEO_MODEL_REGISTRY.get(dep, {})
+                dep_files = dep_entry.get("files", [])
+                dep_dst = dep_files[0]["dst"] if dep_files else None
+                if dep_entry.get("type") == "encoder":
+                    mapped["clip"] = dep_dst
+                elif dep_entry.get("type") == "vae":
+                    mapped["vae"] = dep_dst
+            out[mid] = mapped
+    except Exception as e:
+        logger.error("music_comfyui_map() build failed: %s", e, exc_info=True)
+    return out
+
+
+def cogvideox_comfyui_map() -> dict:
+    """Build the ComfyUI CogVideoX single-file loader map from the registry
+    (never raises). Returns {model_id: {unet, vae}} for the wrapper's
+    CogVideoXModelLoader (models/diffusion_models) + CogVideoXVAELoader
+    (models/vae). Only entries that use `files` are mapped — cogvideox-5b is a
+    diffusers snapshot loaded by directory and is not part of this map."""
+    out = {}
+    try:
+        for mid, entry in VIDEO_MODEL_REGISTRY.items():
+            if entry.get("type") != "cogvideox" or not entry.get("files"):
+                continue
+            unet = entry["files"][0]["dst"]
+            vae = None
+            for dep in entry.get("requires", []):
+                dep_entry = VIDEO_MODEL_REGISTRY.get(dep, {})
+                if dep_entry.get("type") == "vae" and dep_entry.get("files"):
+                    vae = dep_entry["files"][0]["dst"]
+            out[mid] = {"unet": unet, "vae": vae}
+    except Exception as e:
+        logger.error("cogvideox_comfyui_map() build failed: %s", e, exc_info=True)
+    return out
+
+
+def hunyuan_comfyui_map() -> dict:
+    """Build the ComfyUI HunyuanVideo loader map from the registry (never raises).
+
+    Returns {model_id: {type, unet, clip_l, clip_llava, vae, clip_vision}} with
+    every filename taken from the same ``files[].dst`` the downloader writes.
+    ``clip_vision`` is only populated for image-to-video entries.
+    """
+    out = {}
+    try:
+        for mid, entry in VIDEO_MODEL_REGISTRY.items():
+            if entry.get("type") != "hunyuan":
+                continue
+            dsts = [f["dst"] for f in entry.get("files", [])]
+            mapped = {
+                "type": "i2v" if "i2v" in mid else "t2v",
+                "unet": dsts[0] if dsts else None,
+                "clip_l": None,
+                "clip_llava": None,
+                "vae": None,
+                "clip_vision": None,
+            }
+            for dep in entry.get("requires", []):
+                dep_entry = VIDEO_MODEL_REGISTRY.get(dep, {})
+                dep_files = dep_entry.get("files", [])
+                dep_dst = dep_files[0]["dst"] if dep_files else (dep_entry.get("check_files") or [None])[0]
+                if not dep_dst:
+                    continue
+                dep_type = dep_entry.get("type")
+                if dep_type == "vae":
+                    mapped["vae"] = dep_dst
+                elif dep_type == "clip_vision":
+                    mapped["clip_vision"] = dep_dst
+                elif dep_type == "encoder":
+                    if "clip_l" in dep_dst:
+                        mapped["clip_l"] = dep_dst
+                    else:
+                        mapped["clip_llava"] = dep_dst
+            out[mid] = mapped
+    except Exception as e:
+        logger.error("hunyuan_comfyui_map() build failed: %s", e, exc_info=True)
+    return out
+
+
+def _verify_capabilities(mid: str, entry: dict) -> list:
+    """Contract checks for an entry that declares capabilities: every mode is
+    in the vocabulary, every speed profile's LoRA exists and is a LoRA whose
+    floor does not exceed its step count, every style token has a file in an
+    embedding companion, and a license names its attribution."""
+    problems = []
+    for mode in entry.get("modes") or []:
+        if mode not in CAPABILITY_MODES:
+            problems.append(f"{mid}: unknown mode '{mode}'")
+    for pid, spec in (entry.get("speed_profiles") or {}).items():
+        steps, floor = spec.get("steps"), spec.get("min_steps")
+        if not steps or not floor or floor > steps:
+            problems.append(f"{mid}: speed profile '{pid}' needs min_steps <= steps")
+        lora_ids = [spec["lora"]] if spec.get("lora") else list((spec.get("loras") or {}).values())
+        for lora in lora_ids:
+            lora_entry = VIDEO_MODEL_REGISTRY.get(lora)
+            if not lora_entry or lora_entry.get("type") != "lora" or not lora_entry.get("files"):
+                problems.append(f"{mid}: speed profile '{pid}' names unknown LoRA '{lora}'")
+            elif mid not in (lora_entry.get("applies_to") or []):
+                problems.append(f"{mid}: LoRA '{lora}' does not list it in applies_to")
+    embedding_files = set()
+    for dep in entry.get("requires", []):
+        dep_entry = VIDEO_MODEL_REGISTRY.get(dep) or {}
+        if dep_entry.get("type") == "embedding":
+            embedding_files.update(f["dst"] for f in dep_entry.get("files", []))
+    for emb in entry.get("style_embeddings") or []:
+        if emb.get("file") not in embedding_files:
+            problems.append(f"{mid}: style embedding '{emb.get('id')}' has no file in an embedding companion")
+    if entry.get("min_steps") and entry.get("default_steps") \
+            and entry["default_steps"] < entry["min_steps"]:
+        problems.append(f"{mid}: default_steps below min_steps")
+    lic = entry.get("license")
+    if lic is not None and not (lic.get("name") and lic.get("attribution")):
+        problems.append(f"{mid}: license must carry name and attribution")
+    for tier, defaults in (entry.get("tier_defaults") or {}).items():
+        prof = defaults.get("speed_profile")
+        if prof and prof not in (entry.get("speed_profiles") or {}):
+            problems.append(f"{mid}: tier '{tier}' default names unknown speed profile '{prof}'")
+    return problems
+
+
 def verify_registry() -> list:
     """Sanity-check the registry is internally complete. Returns a list of
     human-readable problems (empty = healthy). Never raises."""
@@ -795,6 +2702,7 @@ def verify_registry() -> list:
                 if dep not in VIDEO_MODEL_REGISTRY:
                     problems.append(f"{mid}: requires unknown model '{dep}'")
             if entry.get("type") == "wan":
+                problems.extend(_verify_capabilities(mid, entry))
                 m = wan_comfyui_map().get(mid, {})
                 # Single-model TI2V (5B) has one `unet`; MoE (A14B) has high/low experts.
                 required = ("unet", "clip", "vae") if m.get("single") else ("unet_high", "unet_low", "clip", "vae")
@@ -811,12 +2719,43 @@ def verify_registry() -> list:
                 for k in required:
                     if not m.get(k):
                         problems.append(f"{mid}: LTX ComfyUI map missing '{k}'")
+            if entry.get("type") == "minimax":
+                m = minimax_comfyui_map().get(mid, {})
+                for k in ("unet", "clip", "vae", "audio_vae"):
+                    if not m.get(k):
+                        problems.append(f"{mid}: MiniMax ComfyUI map missing '{k}'")
+                problems.extend(_verify_capabilities(mid, entry))
+            if entry.get("type") == "audio":
+                m = music_comfyui_map().get(mid, {})
+                for k in ("unet", "clip", "vae"):
+                    if not m.get(k):
+                        problems.append(f"{mid}: music ComfyUI map missing '{k}'")
+                problems.extend(_verify_capabilities(mid, entry))
+            if entry.get("type") == "cogvideox" and entry.get("files"):
+                m = cogvideox_comfyui_map().get(mid, {})
+                for k in ("unet", "vae"):
+                    if not m.get(k):
+                        problems.append(f"{mid}: CogVideoX ComfyUI map missing '{k}'")
+            if entry.get("type") == "hunyuan":
+                m = hunyuan_comfyui_map().get(mid, {})
+                required = ("unet", "clip_l", "clip_llava", "vae")
+                if m.get("type") == "i2v":
+                    required += ("clip_vision",)
+                for k in required:
+                    if not m.get(k):
+                        problems.append(f"{mid}: Hunyuan ComfyUI map missing '{k}'")
     except Exception as e:
         problems.append(f"verify_registry crashed: {e}")
     return problems
 
 
 _normalize_registry()
+
+try:
+    from backend.services.user_video_models import load_user_catalog
+    load_user_catalog()
+except Exception as e:
+    logger.error("user video catalog failed to load: %s", e)
 
 # Loud-but-non-fatal startup check: drift/typos surface in logs instead of as a
 # mysterious blank render later.

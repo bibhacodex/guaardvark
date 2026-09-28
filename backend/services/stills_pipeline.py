@@ -74,6 +74,7 @@ def run_stills_pipeline(
     width: int | None = None,
     height: int | None = None,
     steps: int | None = None,
+    steps_explicit: bool = False,
     guidance: float | None = None,
     style: str = "realistic",
     negative_prompt: str = "",
@@ -129,12 +130,14 @@ def run_stills_pipeline(
         director=director,
         auto_enhance=auto_enhance,
         verbatim=verbatim,
+        model=model,
     )
 
     # Director rewrite (batch-level director already applied: pass enhance=none)
     if enhance_mode == "director":
         cleaned = apply_enhance_to_prompts(
             cleaned, enhance_mode="director", style=style, extra_guidance=extra_guidance,
+            model=model,
         )
         # After director, offline stuffing would double-rewrite — use none for auto_enhance
         req_auto_enhance = False
@@ -148,6 +151,7 @@ def run_stills_pipeline(
         width=width,
         height=height,
         steps=steps,
+        steps_explicit=steps_explicit,
         guidance=guidance,
         replace_legacy_sd_markers=replace_legacy_sd_markers,
     )
@@ -177,6 +181,7 @@ def run_stills_pipeline(
                 width=w,
                 height=h,
                 steps=st,
+                steps_explicit=steps_explicit,
                 guidance=g,
                 style=style,
                 seed=seed,
@@ -198,6 +203,12 @@ def run_stills_pipeline(
                 hold_gpu=hold_gpu,
             )
         )
+    for result in results:
+        result.metadata.update(
+            steps=result.steps,
+            steps_requested=defaults["steps_requested"],
+            steps_notice=defaults["steps_notice"],
+        )
     return results
 
 
@@ -209,6 +220,7 @@ def _generate_one(
     width: int,
     height: int,
     steps: int,
+    steps_explicit: bool,
     guidance: float,
     style: str,
     seed: int | None,
@@ -240,6 +252,7 @@ def _generate_one(
         return _generate_comfy_flux(
             prompt=prompt, negative=negative, model=model,
             width=width, height=height, steps=steps, guidance=guidance,
+            steps_explicit=steps_explicit,
             seed=seed, enhance_mode=enhance_mode, output=output, output_dir=output_dir,
         )
 
@@ -262,6 +275,7 @@ def _generate_one(
         width=width,
         height=height,
         num_inference_steps=steps,
+        steps_explicit=steps_explicit,
         guidance_scale=guidance,
         style=style,
         seed=seed,
@@ -310,7 +324,8 @@ def _generate_one(
                     vram_reserve_mb=compositor_vram_reserve_mb(),
                 ):
                     gen_result = generator.generate_image(request)
-            except GpuBusyError:
+            except GpuBusyError as busy:
+                logger.warning("stills admission refused (%s): %s", source, busy)
                 return StillResult(
                     success=False,
                     error="GPU is busy with another render right now — try again in a moment.",
@@ -347,6 +362,7 @@ def _generate_one(
 
     prompt_used = getattr(gen_result, "prompt_used", None) or prompt
     neg_used = getattr(gen_result, "negative_prompt_used", None) or negative
+    actual_steps = (getattr(gen_result, "metadata", None) or {}).get("steps", request.num_inference_steps)
     base = StillResult(
         success=bool(gen_result.success),
         image_path=gen_result.image_path,
@@ -356,7 +372,7 @@ def _generate_one(
         negative_used=neg_used,
         width=width,
         height=height,
-        steps=steps,
+        steps=actual_steps,
         guidance=guidance,
         enhance_mode=enhance_mode,
         generation_time=float(getattr(gen_result, "generation_time", 0) or 0),
@@ -401,6 +417,7 @@ def _generate_comfy_flux(
     width: int,
     height: int,
     steps: int,
+    steps_explicit: bool = False,
     guidance: float,
     seed: int | None,
     enhance_mode: str,
@@ -409,6 +426,11 @@ def _generate_comfy_flux(
 ) -> StillResult:
     try:
         from backend.services.comfyui_image_generator import ComfyUIImageGenerator
+        from backend.services.image_render_limits import resolve_canvas, strict_limits_enabled
+        if strict_limits_enabled():
+            # FLUX's ~2 MP design range applies here too; the offline path and
+            # the Studio batch already clamp, this path sent the size as asked.
+            width, height, _ = resolve_canvas(width, height, model)
         gen = ComfyUIImageGenerator()
         out_path = None
         if output_dir:
@@ -420,8 +442,14 @@ def _generate_comfy_flux(
             height=height,
             negative_prompt=negative or None,
             seed=seed if seed is not None else 42,
-            model="flux",
+            # The caller's tag, not a hard-coded "flux": _build_workflow picks the
+            # FLUX-dev graph on "flux" + "dev" and the schnell GGUF graph otherwise.
+            # Collapsing every tag to "flux" sent flux-dev requests through schnell
+            # while still applying the flux family's 28 steps / cfg 3.5 — dev
+            # settings on a 4-step distilled model.
+            model=model,
             steps=steps,
+            steps_explicit=steps_explicit,
             cfg=guidance,
         )
         url = None
@@ -447,7 +475,7 @@ def _generate_comfy_flux(
             negative_used=negative,
             width=width,
             height=height,
-            steps=steps,
+            steps=getattr(gen, "last_steps", steps),
             guidance=guidance,
             enhance_mode=enhance_mode,
         )

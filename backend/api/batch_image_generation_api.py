@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
 from flask import Blueprint, current_app, jsonify, request, send_file, Response, stream_with_context
+from werkzeug.security import safe_join
 from werkzeug.utils import secure_filename
 from datetime import datetime
 import time
@@ -65,18 +66,98 @@ except ImportError as e:
 
 batch_image_bp = Blueprint("batch_image", __name__, url_prefix="/api/batch-image")
 
-# Global variables for tracking model download status
-model_download_status = {
-    "is_downloading": False,
-    "current_model": None,
-    "progress": 0,
-    "status": "idle",
-    "error": None,
-    "speed_mbps": 0,
-    "downloaded_gb": 0,
-    "total_gb": 0,
-}
+# Global variables for tracking model download status (parity with video, issue #36).
+_DOWNLOAD_STALL_SECONDS = 180
+_IMAGE_DOWNLOAD_EPOCH = 0
 model_download_lock = threading.Lock()
+
+
+def _image_download_status_path() -> Path:
+    return Path(os.environ.get("GUAARDVARK_ROOT", ".")) / "data" / "image_model_download_status.json"
+
+
+def _idle_image_download_status() -> dict:
+    return {
+        "is_downloading": False,
+        "current_model": None,
+        "progress": 0,
+        "status": "idle",
+        "error": None,
+        "speed_mbps": 0,
+        "downloaded_gb": 0,
+        "total_gb": 0,
+        "updated_at": time.time(),
+        "epoch": _IMAGE_DOWNLOAD_EPOCH,
+    }
+
+
+def _persist_image_download_status() -> None:
+    try:
+        p = _image_download_status_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(model_download_status), encoding="utf-8")
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
+def _dir_bytes(d: Path) -> int:
+    """Bytes currently under dest, including hf_hub_download .incomplete staging."""
+    total = 0
+    if d.exists():
+        for f in d.rglob("*"):
+            try:
+                if f.is_file():
+                    total += f.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _image_download_dest(img, catalog_key: str, hf_model_id: str) -> Path:
+    """Directory whose growth is the download — Comfy unet/loras, or the snapshot path."""
+    from backend.services.user_image_models import user_download_dir
+
+    dest = user_download_dir(img, catalog_key)
+    if dest is not None:
+        return dest
+    return img._get_model_path(hf_model_id)
+
+
+def _reconcile_image_download_status_on_load() -> None:
+    global model_download_status, _IMAGE_DOWNLOAD_EPOCH
+    try:
+        p = _image_download_status_path()
+        persisted = json.loads(p.read_text()) if p.exists() else None
+    except Exception:
+        persisted = None
+    if not persisted:
+        model_download_status = _idle_image_download_status()
+        return
+    _IMAGE_DOWNLOAD_EPOCH = int(persisted.get("epoch", 0))
+    if persisted.get("is_downloading") or persisted.get("status") in ("starting", "downloading"):
+        persisted.update({
+            "is_downloading": False,
+            "status": "failed",
+            "error": "Download was interrupted by a backend restart. Click Install to retry.",
+            "progress": 0,
+            "updated_at": time.time(),
+        })
+        model_download_status = persisted
+        _persist_image_download_status()
+    else:
+        # A finished run was already reported to the person who started it;
+        # carrying "completed" across restarts makes the modal announce it
+        # again every time it opens. Keep the epoch, start idle.
+        model_download_status = _idle_image_download_status()
+
+
+model_download_status = _idle_image_download_status()
+_reconcile_image_download_status_on_load()
+# The image-editing pack whose Install this modal handed to the video
+# downloader; the status route mirrors that run under the pack's id.
+_DELEGATED_PACK: str | None = None
 
 # Approximate model sizes in GB (HuggingFace repo total). Curated set only —
 # matches offline_image_generator.available_models after the 2026-05-29 cull.
@@ -121,6 +202,14 @@ def _resolve_catalog_model(model_ref: str):
             return key, hf_id
     return None, None
 
+CSV_UPLOAD_MAX_BYTES = 5 * 1024 * 1024
+
+# Upper bound for /generate/prompts. The page allows up to 100 copies per
+# prompt (utils/batchImageSettings.MAX_QUANTITY) across many lines; this stops
+# a stray client from queueing a batch that would take days on one GPU.
+PROMPT_BATCH_MAX_ITEMS = 2000
+
+
 def _validate_csv_upload(file):
     """Validate uploaded CSV file."""
     if not file or file.filename == '':
@@ -129,15 +218,59 @@ def _validate_csv_upload(file):
     if not file.filename.lower().endswith('.csv'):
         return False, "File must be a CSV file"
 
-    # Check file size (max 5MB)
     file.seek(0, 2)  # Seek to end
     file_size = file.tell()
     file.seek(0)  # Reset to beginning
 
-    if file_size > 5 * 1024 * 1024:  # 5MB
+    if file_size > CSV_UPLOAD_MAX_BYTES:
         return False, "File too large (max 5MB)"
 
     return True, "Valid"
+
+
+def _load_batch_status(generator, batch_id: str, *, include_results: bool = False):
+    """Batch status from memory or disk; None when the batch does not exist."""
+    return generator.find_batch_status(batch_id, include_results=include_results)
+
+
+def _progress_percentage(status) -> int:
+    """Share of the batch that has finished, successfully or not.
+
+    Counting only successes left a batch with any failed image stuck below 100%
+    while the queue panel (completed + failed) said it was done.
+    """
+    total = int(getattr(status, "total_images", 0) or 0)
+    if total <= 0:
+        return 0
+    done = int(getattr(status, "completed_images", 0) or 0) + int(getattr(status, "failed_images", 0) or 0)
+    return max(0, min(100, int((done / total) * 100)))
+
+
+def _thumbnail_candidates(image_name: str) -> List[str]:
+    """Thumbnail filenames a batch image may have.
+
+    BatchImageGenerator writes thumbnails as ``<stem>.jpg`` regardless of the
+    image's extension; the upload route keeps the original name. Try both.
+    """
+    stem_jpg = Path(image_name).with_suffix(".jpg").name
+    return [stem_jpg] if stem_jpg == image_name else [stem_jpg, image_name]
+
+
+def _sync_active_batch(generator, batch_id: str, mutate) -> None:
+    """Apply ``mutate(status)`` to the in-memory status, if this process has one.
+
+    Mutating endpoints rewrite batch_metadata.json, but /status and /list
+    prefer the in-memory copy in ``active_batches`` (never pruned), so a rename
+    or delete stayed invisible until restart. Keep the two in step.
+    """
+    with generator.batch_lock:
+        status = generator.active_batches.get(batch_id)
+        if status is None:
+            return
+        try:
+            mutate(status)
+        except Exception as e:
+            logger.warning(f"Failed to sync in-memory status for batch {batch_id}: {e}")
 
 def _resolve_subject_ids_from_prompts(prompts: Any) -> list[int]:
     """Match trigger tokens / [brackets] / cast names in prompt text to trained Subjects.
@@ -247,6 +380,24 @@ def _apply_character_casting(data: Dict[str, Any], params: Dict[str, Any]) -> No
         logger.warning("Character casting partial: %s", "; ".join(warn))
 
 
+_FALSE_STRINGS = frozenset({"false", "0", "no", "off", ""})
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    """Coerce a JSON or form-field value to bool.
+
+    The CSV route reads ``request.form``, where every value is a string, and
+    ``bool("false")`` is True — so the toggles could never be turned off there.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() not in _FALSE_STRINGS
+
+
 def _parse_generation_params(data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Parse and validate generation parameters.
@@ -264,9 +415,9 @@ def _parse_generation_params(data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict
 
     # Generation settings — absolute safety bounds only (quality sliders own the rest).
     params['max_workers'] = min(max(int(data.get('max_workers', 2)), 1), 4)  # 1-4 workers
-    params['preserve_order'] = bool(data.get('preserve_order', True))
-    params['generate_thumbnails'] = bool(data.get('generate_thumbnails', True))
-    params['save_metadata'] = bool(data.get('save_metadata', True))
+    params['preserve_order'] = _as_bool(data.get('preserve_order'), True)
+    params['generate_thumbnails'] = _as_bool(data.get('generate_thumbnails'), True)
+    params['save_metadata'] = _as_bool(data.get('save_metadata'), True)
     if 'ui_config' in data:
         params['ui_config'] = data['ui_config']
 
@@ -284,29 +435,36 @@ def _parse_generation_params(data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict
     # Default image parameters — family-aware (stills_defaults), not SD-era 512/20/7.5
     from backend.services.stills_defaults import resolve_stills_defaults
     params['style'] = data.get('style', 'realistic')
+    params['negative_prompt'] = str(data.get('negative_prompt') or '').strip()
     _raw_w = data.get('width', None)
     _raw_h = data.get('height', None)
     _raw_steps = data.get('steps', None)
+    params['steps_explicit'] = _as_bool(data.get('steps_explicit'), False)
     _raw_g = data.get('guidance', None)
     _resolved = resolve_stills_defaults(
         params['model'],
         width=int(_raw_w) if _raw_w is not None else None,
         height=int(_raw_h) if _raw_h is not None else None,
         steps=int(_raw_steps) if _raw_steps is not None else None,
+        steps_explicit=params['steps_explicit'],
         guidance=float(_raw_g) if _raw_g is not None else None,
         replace_legacy_sd_markers=True,
     )
     params['width'] = int(_resolved['width'])
     params['height'] = int(_resolved['height'])
-    # Absolute step bounds 1–100 — model validator recommends ranges but does not
-    # throttle quality when hard_clamp=False (FLUX / Z-Image / Krea).
+    # Absolute bounds 1-100 hold for every value; the floor and the model clamps
+    # are what a typed value bypasses.
     params['steps'] = min(max(int(_resolved['steps']), 1), 100)
+    params['steps_requested'] = _resolved['steps_requested']
+    params['steps_notice'] = _resolved['steps_notice']
 
     # Guidance scale - will be validated by SettingsValidator
     guidance = float(_resolved['guidance'])
 
-    # Use SettingsValidator for comprehensive validation
-    if service_available and settings_validator_available and get_settings_validator:
+    # Use SettingsValidator for comprehensive validation. 'auto' is resolved to a
+    # concrete model by the generator's router, so validating it here would apply
+    # the validator's unknown-model (SD 1.5) rules to a Z-Image/FLUX render.
+    if service_available and settings_validator_available and get_settings_validator and params['model'] != 'auto':
         try:
             validator = get_settings_validator()
             validation_result = validator.validate_settings(
@@ -321,8 +479,11 @@ def _parse_generation_params(data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict
             # Start from user guidance; corrected_values may override hard clamps only.
             params['guidance'] = guidance
             if validation_result.corrected_values:
-                params.update(validation_result.corrected_values)
-                validation_info["corrected_values"] = validation_result.corrected_values
+                corrections = dict(validation_result.corrected_values)
+                if params['steps_explicit']:
+                    corrections.pop("steps", None)
+                params.update(corrections)
+                validation_info["corrected_values"] = corrections
 
             # Collect warnings and recommendations
             validation_info["warnings"] = validation_result.warnings
@@ -383,14 +544,14 @@ def _parse_generation_params(data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict
             params['max_workers'] = 1
 
     # Quality enhancement parameters
-    params['content_preset'] = data.get('content_preset')  # None = auto-detect
-    params['auto_enhance'] = data.get('auto_enhance', True)
-    params['enhance_anatomy'] = data.get('enhance_anatomy', True)
-    params['enhance_faces'] = data.get('enhance_faces', True)
-    params['enhance_hands'] = data.get('enhance_hands', True)
+    params['content_preset'] = data.get('content_preset') or None  # None = auto-detect
+    params['auto_enhance'] = _as_bool(data.get('auto_enhance'), True)
+    params['enhance_anatomy'] = _as_bool(data.get('enhance_anatomy'), True)
+    params['enhance_faces'] = _as_bool(data.get('enhance_faces'), True)
+    params['enhance_hands'] = _as_bool(data.get('enhance_hands'), True)
 
     # Director intelligence (opt-in; mirrors batch-video exactly). Safe defaults = disabled.
-    params['director_mode'] = bool(data.get('director_mode', False))
+    params['director_mode'] = _as_bool(data.get('director_mode'), False)
     params['director_guidance'] = data.get('director_guidance') or data.get('extra_guidance')
     params['storyboard_concept'] = data.get('storyboard_concept')
     params['planning_mode'] = data.get('planning_mode', 'narrative')
@@ -398,11 +559,11 @@ def _parse_generation_params(data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict
     params['user_treatment'] = data.get('user_treatment') or data.get('treatment')
 
     # Face restoration parameters
-    params['restore_faces'] = data.get('restore_faces', False)
+    params['restore_faces'] = _as_bool(data.get('restore_faces'), False)
     params['face_restoration_weight'] = float(data.get('face_restoration_weight', 0.5))
 
     # Transparent-background (rembg post-process) — RGBA PNG for icons/clip-art/logos
-    params['remove_background'] = bool(data.get('remove_background', False))
+    params['remove_background'] = _as_bool(data.get('remove_background'), False)
 
     # User context
     params['user_id'] = data.get('user_id')
@@ -429,6 +590,8 @@ def get_service_status():
                 "cache_dir": str(generator.cache_dir),
                 "image_generator_available": generator.image_generator is not None
             }
+            if generator.image_generator and hasattr(generator.image_generator, "get_status"):
+                status["image_generator"] = generator.image_generator.get_status()
         except Exception as status_error:
             logger.error(f"Error creating basic status: {status_error}")
             status = {"service_available": False, "error": str(status_error)}
@@ -466,8 +629,12 @@ def list_models():
                 "label": info.get("label", model_id),
                 "description": info.get("description", ""),
                 "recommended": info.get("recommended", False),
-                "size_gb": IMAGE_MODEL_SIZES.get(info["id"], 2.5),
+                "size_gb": info.get("size_gb") or IMAGE_MODEL_SIZES.get(info["id"], 2.5),
                 "availability": info.get("availability", "downloadable"),
+                # User catalog rows (Manage Image Models → Add new model).
+                "user": bool(info.get("user")),
+                "family": info.get("family"),
+                "kind": info.get("kind"),
             }
             # A model the user cannot actually run must not sit in the picker — that
             # is how a gated Krea 2 got selected and silently produced SD 1.5 output.
@@ -480,10 +647,24 @@ def list_models():
                 )
                 unavailable.append(row)
 
+        from backend.services.user_image_models import catalog_rows, family_choices
+        try:
+            from backend.services.image_editing_packs import pack_rows
+            editing = pack_rows()
+        except Exception as e:  # noqa: BLE001 — the picker must list even if a pack probe fails
+            logger.warning("image editing pack rows failed: %s", e)
+            editing = []
         return success_response({
             "models": models,
             "unavailable_models": unavailable,
             "default_model": "auto",
+            # User LoRAs never enter the picker; the page shows them as chips and
+            # the modal lists them with Install / Remove.
+            "adapters": catalog_rows(generator.image_generator),
+            "families": family_choices(),
+            # Chat photo tools' packs (Qwen-Image-Edit, PuLID, background
+            # removal): installed through the video downloader, listed here.
+            "editing": editing,
         })
 
     except Exception as e:
@@ -494,17 +675,34 @@ def list_models():
 @batch_image_bp.route("/models/download", methods=["POST"])
 def download_model():
     """Start downloading a specific model with real-time file size progress monitoring."""
-    global model_download_status
+    data = request.get_json()
+    if not data or 'model_path' not in data:
+        return error_response("No model_path provided", 400)
+    return _start_image_model_download(data['model_path'])
+
+
+def _start_image_model_download(model_path: str):
+    """Start the background download for a catalog key or HF id (the Install button)."""
+    global model_download_status, _IMAGE_DOWNLOAD_EPOCH, _DELEGATED_PACK
 
     try:
+        # Image-editing packs (chat photo tools) install through the video
+        # downloader; the status route mirrors that run under the pack id.
+        from backend.services.image_editing_packs import pack_by_id
+        pack_key = str(model_path or "").strip()
+        if pack_key.startswith("comfy:"):
+            pack_key = pack_key[len("comfy:"):]
+        if pack_by_id(pack_key):
+            from backend.api import batch_video_generation_api as _video_api
+            resp = _video_api.start_video_model_download(pack_key)
+            status = resp[1] if isinstance(resp, tuple) else getattr(resp, "status_code", 200)
+            if status < 400:
+                _DELEGATED_PACK = pack_key
+            return resp
+
         if not service_available:
             return error_response("Batch image generation service not available", 503)
 
-        data = request.get_json()
-        if not data or 'model_path' not in data:
-            return error_response("No model_path provided", 400)
-
-        model_path = data['model_path']
         generator = get_batch_image_generator()
 
         if not generator.image_generator:
@@ -515,6 +713,15 @@ def download_model():
             return error_response(
                 f"Unknown model '{model_path}' — not in the allowed model set", 400
             )
+
+        img = generator.image_generator
+        if img._is_model_downloaded(catalog_key) or img._is_model_downloaded(hf_model_id):
+            return success_response({
+                "message": f"{catalog_key} is already installed",
+                "already_installed": True,
+                "catalog_key": catalog_key,
+                "model_path": hf_model_id,
+            })
 
         # Comfy-only catalog entries carry a "comfy:" sentinel, not an HF repo id —
         # feeding it to the diffusers path fails HF validation ('comfy:flux-dev').
@@ -531,12 +738,27 @@ def download_model():
                 )
             return _video_api.start_video_model_download(catalog_key)
 
-        estimated_size_gb = IMAGE_MODEL_SIZES.get(catalog_key, IMAGE_MODEL_SIZES.get(hf_model_id, 2.5))
+        user_entry = (getattr(img, "user_entries", None) or {}).get(catalog_key) or {}
+        file_bytes = sum(int(f.get("size") or 0) for f in (user_entry.get("files") or []))
+        size_gb = user_entry.get("size_gb")
+        if size_gb:
+            estimated_size_gb = float(size_gb)
+        elif file_bytes:
+            estimated_size_gb = round(file_bytes / (1024 ** 3), 3)
+        else:
+            estimated_size_gb = IMAGE_MODEL_SIZES.get(catalog_key, IMAGE_MODEL_SIZES.get(hf_model_id, 2.5))
 
         with model_download_lock:
-            if model_download_status["is_downloading"]:
-                return error_response(f"Already downloading model: {model_download_status['current_model']}", 409)
+            now = time.time()
+            st = model_download_status
+            # Keep 409 while the worker thread is alive. Stall marks status failed
+            # but does not clear this flag until download_task's finally — a retry
+            # must not start a second hf_hub_download into the same dest.
+            if st.get("is_downloading"):
+                return error_response(f"Already downloading model: {st.get('current_model')}", 409)
 
+            _IMAGE_DOWNLOAD_EPOCH += 1
+            epoch = _IMAGE_DOWNLOAD_EPOCH
             model_download_status = {
                 "is_downloading": True,
                 "current_model": hf_model_id,
@@ -546,51 +768,64 @@ def download_model():
                 "speed_mbps": 0,
                 "downloaded_gb": 0,
                 "total_gb": estimated_size_gb,
+                "updated_at": now,
+                "epoch": epoch,
             }
+            _persist_image_download_status()
 
-        def download_task(hf_model_id, total_gb):
+        def download_task(hf_model_id, total_gb, epoch):
             _start_time = time.time()
-            total_bytes = int(total_gb * 1024**3)
+            total_bytes = int(total_gb * 1024**3) if total_gb else 1
+            dest = _image_download_dest(generator.image_generator, catalog_key, hf_model_id)
+            baseline = _dir_bytes(dest)
+            stalled = threading.Event()
 
             try:
                 with model_download_lock:
-                    model_download_status["status"] = "downloading"
+                    if model_download_status.get("epoch") == epoch:
+                        model_download_status["status"] = "downloading"
+                        model_download_status["updated_at"] = time.time()
+                        _persist_image_download_status()
 
-                # Monitor download progress by watching file sizes on disk
                 stop_monitor = threading.Event()
 
                 def _monitor_progress():
+                    last_bytes = -1
+                    last_change = time.time()
                     while not stop_monitor.is_set():
                         try:
-                            downloaded = 0
-                            # Check HF cache for .incomplete files (active downloads)
-                            cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
-                            if cache_dir.exists():
-                                for f in cache_dir.rglob("*.incomplete"):
-                                    try:
-                                        downloaded += f.stat().st_size
-                                    except OSError:
-                                        pass
-                            # Check target model directory for completed files
-                            target_dir = generator.image_generator._get_model_path(hf_model_id)
-                            if target_dir.exists():
-                                for f in target_dir.rglob("*"):
-                                    if f.is_file():
-                                        try:
-                                            downloaded += f.stat().st_size
-                                        except OSError:
-                                            pass
-
-                            elapsed = time.time() - _start_time
+                            downloaded = max(0, _dir_bytes(dest) - baseline)
+                            now_m = time.time()
+                            if downloaded != last_bytes:
+                                last_bytes = downloaded
+                                last_change = now_m
+                            elif (now_m - last_change) > _DOWNLOAD_STALL_SECONDS:
+                                stalled.set()
+                                with model_download_lock:
+                                    if model_download_status.get("epoch") != epoch:
+                                        return
+                                    model_download_status.update({
+                                        "status": "failed",
+                                        "error": "Download stalled (no new bytes for 3 minutes). Click Install to retry.",
+                                        "progress": 0,
+                                        "updated_at": now_m,
+                                    })
+                                    _persist_image_download_status()
+                                stop_monitor.set()
+                                return
+                            elapsed = now_m - _start_time
                             speed = (downloaded / (1024 * 1024)) / max(elapsed, 0.1)
                             pct = min(int((downloaded / max(total_bytes, 1)) * 100), 99)
-
                             with model_download_lock:
+                                if model_download_status.get("epoch") != epoch:
+                                    return
                                 model_download_status.update({
                                     "progress": pct,
                                     "speed_mbps": round(speed, 1),
                                     "downloaded_gb": round(downloaded / 1024**3, 2),
+                                    "updated_at": now_m,
                                 })
+                                _persist_image_download_status()
                         except Exception:
                             pass
                         stop_monitor.wait(1.0)
@@ -599,39 +834,53 @@ def download_model():
                 monitor_thread.start()
 
                 try:
-                    success, dl_error = generator.image_generator._download_model(hf_model_id)
+                    success, dl_error = generator.image_generator._download_model(
+                        hf_model_id, stop=stalled
+                    )
                 finally:
                     stop_monitor.set()
                     monitor_thread.join(timeout=2)
 
                 with model_download_lock:
+                    if model_download_status.get("epoch") != epoch:
+                        return
+                    if stalled.is_set():
+                        return
                     if success:
                         model_download_status.update({
                             "status": "completed",
                             "progress": 100,
                             "downloaded_gb": total_gb,
                             "total_gb": total_gb,
+                            "updated_at": time.time(),
                         })
                     else:
                         model_download_status.update({
                             "status": "failed",
                             "error": dl_error or "Failed to download model",
                             "progress": 0,
+                            "updated_at": time.time(),
                         })
+                    _persist_image_download_status()
             except Exception as e:
                 logger.error(f"Error in model download thread: {e}")
                 with model_download_lock:
-                    model_download_status.update({
-                        "status": "failed",
-                        "error": str(e),
-                        "progress": 0,
-                    })
+                    if model_download_status.get("epoch") == epoch and not stalled.is_set():
+                        model_download_status.update({
+                            "status": "failed",
+                            "error": str(e),
+                            "progress": 0,
+                            "updated_at": time.time(),
+                        })
+                        _persist_image_download_status()
             finally:
                 with model_download_lock:
-                    model_download_status["is_downloading"] = False
+                    if model_download_status.get("epoch") == epoch:
+                        model_download_status["is_downloading"] = False
+                        model_download_status["updated_at"] = time.time()
+                        _persist_image_download_status()
 
-        # Start download in background
-        thread = threading.Thread(target=download_task, args=(hf_model_id, estimated_size_gb))
+        thread = threading.Thread(target=download_task, args=(hf_model_id, estimated_size_gb, epoch))
         thread.daemon = True
         thread.start()
 
@@ -650,19 +899,27 @@ def download_model():
 @batch_image_bp.route("/models/download-status", methods=["GET"])
 def get_download_status():
     """Get the current model download status."""
-    global model_download_status
+    global model_download_status, _DELEGATED_PACK
     try:
         with model_download_lock:
             status = dict(model_download_status)
         if not status.get("is_downloading"):
-            # Comfy-only entries (flux-dev) delegate to the video registry
-            # downloader — mirror its status for flux plans so this modal's
+            # Comfy-only entries (flux-dev) and image-editing packs delegate to
+            # the video registry downloader — mirror its status so this modal's
             # poller tracks progress/completion of the delegated install.
             # Module-attribute access on purpose: the video module REBINDS its
             # status dict per download, so a from-import would go stale.
             from backend.api import batch_video_generation_api as _video_api
             with _video_api._video_model_download_lock:
                 vstatus = dict(_video_api._video_model_download_status)
+            if _DELEGATED_PACK:
+                # The video run names each companion in turn; the modal's row
+                # is the pack, so report the pack. A finished run is reported
+                # once, then forgotten, so reopening the modal stays quiet.
+                vstatus["current_model"] = _DELEGATED_PACK
+                if not vstatus.get("is_downloading"):
+                    _DELEGATED_PACK = None
+                return success_response(vstatus)
             if str(vstatus.get("current_model") or "").startswith("flux"):
                 return success_response(vstatus)
         return success_response(status)
@@ -690,6 +947,7 @@ def validate_settings():
             width=int(data['width']) if data.get('width') is not None else None,
             height=int(data['height']) if data.get('height') is not None else None,
             steps=int(data['steps']) if data.get('steps') is not None else None,
+            steps_explicit=_as_bool(data.get('steps_explicit'), False),
             guidance=float(data['guidance']) if data.get('guidance') is not None else None,
         )
         guidance = float(_r['guidance'])
@@ -725,6 +983,128 @@ def validate_settings():
     except Exception as e:
         logger.error(f"Error validating settings: {e}")
         return error_response(str(e), 500)
+
+@batch_image_bp.route("/models/from-hf", methods=["POST"])
+def preview_hf_image_model():
+    """Parse a Hugging Face paste and list its weight files. Does not download."""
+    from backend.services.user_image_models import preview_hf_url
+    from backend.services.video_model_registry import classify_hf_download_error
+    from backend.services.user_video_models import parse_hf_url
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return error_response("Paste a Hugging Face URL or org/repo.", 400)
+    repo_id = None
+    try:
+        repo_id = parse_hf_url(url)["hf_repo"]
+        return success_response(preview_hf_url(url))
+    except ValueError as e:
+        return error_response(str(e), 400)
+    except Exception as e:
+        logger.error("HF image preview failed: %s", e)
+        return error_response(classify_hf_download_error(e, repo_id=repo_id), 400)
+
+
+@batch_image_bp.route("/models/user", methods=["POST"])
+def add_user_image_model():
+    """Register a user image model or LoRA, then Install it unless told not to."""
+    from backend.services.user_image_models import add_user_model, preview_hf_url
+    from backend.services.user_model_families import DuplicateUserModel, hf_inspect_url
+    from backend.services.video_model_registry import classify_hf_download_error
+    if not service_available:
+        return error_response("Batch image generation service not available", 503)
+    data = request.get_json(silent=True) or {}
+    hf_repo = (data.get("hf_repo") or "").strip()
+    revision = (data.get("revision") or "main").strip() or "main"
+    files = data.get("files") if isinstance(data.get("files"), list) else []
+    url = (data.get("url") or "").strip()
+    inspected = None
+    if not url and hf_repo:
+        src = None
+        if len(files) == 1 and isinstance(files[0], dict):
+            src = files[0].get("src")
+        url = hf_inspect_url(hf_repo, revision, src)
+    if url:
+        try:
+            inspected = preview_hf_url(url)
+        except ValueError as e:
+            return error_response(str(e), 400)
+        except Exception as e:
+            logger.error("HF image re-inspect failed: %s", e)
+            return error_response(classify_hf_download_error(e, repo_id=hf_repo or None), 400)
+        hf_repo = inspected["hf_repo"]
+        revision = inspected.get("revision") or revision
+        if inspected.get("unwired"):
+            return error_response(inspected["unwired"].get("reason") or "That architecture is not wired yet.", 400)
+        if inspected.get("src") and not files:
+            files = [{"src": inspected["src"]}]
+        has_model_index = bool(inspected.get("has_model_index"))
+    else:
+        return error_response("Paste a Hugging Face URL or org/repo.", 400)
+    generator = get_batch_image_generator()
+    if not generator.image_generator:
+        return error_response("Image generator not initialized", 503)
+    try:
+        mid, entry = add_user_model(
+            generator.image_generator,
+            role=(data.get("role") or "").strip(),
+            family=(data.get("family") or "").strip(),
+            hf_repo=hf_repo,
+            files=files,
+            has_model_index=has_model_index,
+            name=(data.get("name") or "").strip() or None,
+            description=(data.get("description") or "").strip() or None,
+            revision=revision,
+            known_files=inspected["files"] if inspected else None,
+        )
+    except DuplicateUserModel as e:
+        return error_response(str(e), 409, data={"id": e.model_id})
+    except ValueError as e:
+        return error_response(str(e), 400)
+    except Exception as e:
+        logger.error("add user image model failed: %s", e)
+        return error_response(str(e), 500)
+    download_payload = None
+    if str(data.get("install", "true")).lower() != "false":
+        dl = _start_image_model_download(mid)
+        resp_obj, status = dl if isinstance(dl, tuple) else (dl, getattr(dl, "status_code", 200))
+        body = resp_obj.get_json(silent=True) or {}
+        if status >= 400 or not body.get("success"):
+            err = (body.get("error") or {})
+            download_payload = {
+                "error": err.get("message") if isinstance(err, dict) else (err or body.get("message")),
+                "status": status,
+            }
+        else:
+            download_payload = body.get("data")
+    return success_response({
+        "id": mid,
+        "entry": {k: entry.get(k) for k in ("name", "role", "family", "kind", "hf_repo", "files", "size_gb", "applies_to", "engine")},
+        "download": download_payload,
+    })
+
+
+@batch_image_bp.route("/models/user/<model_id>", methods=["DELETE"])
+def delete_user_image_model(model_id):
+    """Remove a user-added image model or LoRA. Shipped keys are refused."""
+    from backend.services.user_image_models import remove_user_model
+    if not service_available:
+        return error_response("Batch image generation service not available", 503)
+    delete_files = str(
+        request.args.get("delete_files") or (request.get_json(silent=True) or {}).get("delete_files") or ""
+    ).lower() in ("1", "true", "yes")
+    generator = get_batch_image_generator()
+    try:
+        result = remove_user_model(generator.image_generator, model_id, delete_files=delete_files)
+    except ValueError as e:
+        return error_response(str(e), 403)
+    except KeyError as e:
+        return error_response(str(e), 404)
+    except Exception as e:
+        logger.error("remove user image model failed: %s", e)
+        return error_response(str(e), 500)
+    return success_response(result)
+
 
 @batch_image_bp.route("/model-info/<model>", methods=["GET"])
 def get_model_info(model: str):
@@ -921,6 +1301,14 @@ def enhance_prompt():
                 )
             except Exception:
                 family = ""
+        if not family:
+            # "auto" resolves to the product default (Z-Image); the preview must
+            # show that family's prompt policy, not the tag-stuffed SD one.
+            try:
+                from backend.services.stills_defaults import model_family
+                family = model_family(model or "auto")
+            except Exception:
+                family = ""
 
         # Enhance the prompt
         enhanced_prompt, negative_prompt, detection = generator.image_generator.enhance_prompt_for_quality(
@@ -1093,6 +1481,12 @@ def generate_from_prompts():
         if not validated_prompts:
             return error_response("No valid prompts found", 400)
 
+        if len(validated_prompts) > PROMPT_BATCH_MAX_ITEMS:
+            return error_response(
+                f"Too many prompts ({len(validated_prompts)}); maximum is {PROMPT_BATCH_MAX_ITEMS} per batch",
+                400,
+            )
+
         # Parse generation parameters
         params, validation_info = _parse_generation_params(data)
 
@@ -1105,6 +1499,24 @@ def generate_from_prompts():
         cast_warnings = params.pop("_cast_warnings", None) or []
         if cast_warnings:
             validation_info.setdefault("warnings", []).extend(cast_warnings)
+
+        # User LoRAs (Manage Image Models): ids → files + strength. A cast render
+        # goes through the character pipeline, which owns its own adapters.
+        adapters = data.get("adapters") if isinstance(data.get("adapters"), list) else []
+        if adapters:
+            from backend.services.user_image_models import resolve_user_loras
+            paths, scale, lora_err = resolve_user_loras(
+                get_batch_image_generator().image_generator, params.get("model") or "auto", adapters
+            )
+            if lora_err:
+                return error_response(lora_err, 400)
+            if params.get("subject_ids"):
+                validation_info.setdefault("warnings", []).append(
+                    "A cast character is selected, so your LoRAs were not stacked on this render."
+                )
+            else:
+                params["adapter_loras"] = paths
+                params["adapter_scale"] = scale
 
         # Start batch generation
         batch_id = start_batch_from_prompts(validated_prompts, **params)
@@ -1158,40 +1570,8 @@ def get_batch_generation_status(batch_id: str):
             return error_response("Batch image generation service not available", 503)
 
         generator = get_batch_image_generator()
-        status = generator.get_batch_status(batch_id)
-        
-        # If not in active batches, try to load from disk
-        if not status:
-            all_batches = generator.list_all_batches()
-            status = next((b for b in all_batches if b.batch_id == batch_id), None)
-            
-            # If found on disk but needs results, load from metadata
-            if status and request.args.get('include_results') == 'true':
-                try:
-                    import json
-                    metadata_file = Path(status.output_dir) / "batch_metadata.json"
-                    if metadata_file.exists():
-                        with open(metadata_file, 'r') as f:
-                            metadata = json.load(f)
-                        
-                        # Load results from metadata
-                        if 'results' in metadata:
-                            from backend.services.batch_image_generator import BatchImageResult
-                            status.results = [
-                                BatchImageResult(
-                                    prompt_id=r.get("prompt_id", ""),
-                                    success=r.get("success", False),
-                                    image_path=r.get("image_path"),
-                                    thumbnail_path=r.get("thumbnail_path"),
-                                    generation_time=r.get("generation_time", 0.0),
-                                    error=r.get("error"),
-                                    metadata=r.get("metadata", {})
-                                )
-                                for r in metadata.get("results", [])
-                            ]
-                except Exception as e:
-                    logger.warning(f"Failed to load results from metadata for batch {batch_id}: {e}")
-        
+        include_results = request.args.get('include_results') == 'true'
+        status = _load_batch_status(generator, batch_id, include_results=include_results)
         if not status:
             return error_response("Batch not found", 404)
 
@@ -1209,11 +1589,16 @@ def get_batch_generation_status(batch_id: str):
             "error": status.error,
             "display_name": getattr(status, "display_name", None) or status.batch_id,
             "retry_data": getattr(status, "retry_data", None),
-            "progress_percentage": int((status.completed_images / status.total_images) * 100) if status.total_images > 0 else 0
+            "gpu_wait_reason": getattr(status, "gpu_wait_reason", None),
+            "progress_percentage": _progress_percentage(status),
         }
 
         # Include results if requested
-        if request.args.get('include_results') == 'true':
+        if include_results:
+            status_data['steps_notices'] = list(dict.fromkeys(
+                r.metadata['steps_notice'] for r in (status.results or [])
+                if (r.metadata or {}).get('steps_notice')
+            ))
             status_data['results'] = [
                 {
                     "prompt_id": r.prompt_id,
@@ -1311,7 +1696,7 @@ def list_batch_generations():
                     "end_time": batch.end_time.isoformat() if batch.end_time else None,
                     "retry_data": getattr(batch, "retry_data", None),
                     "can_retry": bool(getattr(batch, "retry_data", None)),
-                    "progress_percentage": int((batch.completed_images / batch.total_images) * 100) if batch.total_images > 0 else 0
+                    "progress_percentage": _progress_percentage(batch),
                 }
 
                 # Add folder_id and thumbnail URLs for completed batches
@@ -1355,11 +1740,16 @@ def download_batch_results(batch_id: str):
         if not service_available:
             return error_response("Batch image generation service not available", 503)
 
-        status = get_batch_status(batch_id)
+        # Completed batches from before this process started only exist on disk,
+        # and the history cards offer Download for all of them.
+        generator = get_batch_image_generator()
+        status = _load_batch_status(generator, batch_id)
         if not status:
             return error_response("Batch not found", 404)
 
-        if status.status not in ["completed", "cancelled"]:
+        # Anything terminal can be downloaded: an errored batch may still hold the
+        # images that did render.
+        if status.status not in ("completed", "cancelled", "error"):
             return error_response("Batch not ready for download", 400)
 
         if not status.output_dir or not os.path.exists(status.output_dir):
@@ -1390,21 +1780,28 @@ def download_batch_results(batch_id: str):
                 if metadata_file.exists():
                     zipf.write(metadata_file, "batch_metadata.json")
 
-            zip_filename = f"batch_{batch_id}_results.zip"
+            zip_filename = f"batch_{secure_filename(batch_id) or 'batch'}_results.zip"
 
             def generate():
-                with open(temp_zip.name, 'rb') as f:
-                    while True:
-                        chunk = f.read(8192)
-                        if not chunk:
-                            break
-                        yield chunk
-                os.unlink(temp_zip.name)
+                # The temp file must go even if the client disconnects mid-stream,
+                # which raises GeneratorExit inside the loop.
+                try:
+                    with open(temp_zip.name, 'rb') as f:
+                        while True:
+                            chunk = f.read(8192)
+                            if not chunk:
+                                break
+                            yield chunk
+                finally:
+                    try:
+                        os.unlink(temp_zip.name)
+                    except OSError:
+                        pass
 
             return Response(
                 stream_with_context(generate()),
                 mimetype='application/zip',
-                headers={'Content-Disposition': f'attachment; filename={zip_filename}'}
+                headers={'Content-Disposition': f'attachment; filename="{zip_filename}"'}
             )
 
     except Exception as e:
@@ -1428,20 +1825,28 @@ def _resolve_batch_output_dir(generator, batch_id: str) -> Optional[Path]:
     batch id, so try the direct path first and keep the scan only as a fallback for
     layouts where that does not hold.
     """
-    status = generator.get_batch_status(batch_id)
+    status = _load_batch_status(generator, batch_id)
     if status and status.output_dir:
         return Path(status.output_dir)
-
-    safe_id = secure_filename(batch_id)
-    if safe_id:
-        direct = Path(generator.base_output_dir) / safe_id
-        if (direct / "batch_metadata.json").exists():
-            return direct
-
-    match = next((b for b in generator.list_all_batches() if b.batch_id == batch_id), None)
-    if match and match.output_dir:
-        return Path(match.output_dir)
     return None
+
+
+def _contained_file(base_dir: Path, name: str) -> Optional[Path]:
+    """Resolve ``name`` as a direct child of ``base_dir``.
+
+    Returns None when the name is empty, carries a path separator, or resolves
+    (through ``..`` or a symlink) anywhere other than directly inside ``base_dir``.
+    Werkzeug has already URL-decoded the route segment once; it must not be
+    decoded again here.
+    """
+    if not name or name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+        return None
+    base = base_dir.resolve()
+    joined = safe_join(str(base), name)
+    if joined is None:
+        return None
+    candidate = Path(joined).resolve()
+    return candidate if candidate.parent == base else None
 
 
 def _ensure_thumbnail(generator, source: Path, thumbnail_dir: Path) -> Optional[Path]:
@@ -1478,52 +1883,38 @@ def get_batch_image(batch_id: str, image_name: str):
         if not output_dir:
             return error_response("Batch not found", 404)
 
-        # URL decode the image name in case it was encoded
-        from urllib.parse import unquote
-        decoded_image_name = unquote(image_name)
-
-        # Secure filename to prevent directory traversal
-        safe_image_name = secure_filename(decoded_image_name)
-
         want_thumbnail = request.args.get('thumbnail') == 'true'
         thumbnail_dir = output_dir / "thumbnails"
+        images_dir = output_dir / "images"
 
         # Check if it's a thumbnail request
         if want_thumbnail:
-            image_path = thumbnail_dir / safe_image_name
+            image_path = _contained_file(thumbnail_dir, image_name)
+            if image_path is None:
+                return error_response("Invalid image name", 400)
 
             # Special case: BatchImageGenerator saves thumbnails as .jpg
             if not image_path.exists():
-                jpg_name = Path(safe_image_name).with_suffix('.jpg')
-                image_path = thumbnail_dir / jpg_name
-
-            # If not found with safe name, try with original decoded name
-            if not image_path.exists() and safe_image_name != decoded_image_name:
-                image_path = thumbnail_dir / decoded_image_name
-                if not image_path.exists():
-                    jpg_name = Path(decoded_image_name).with_suffix('.jpg')
-                    image_path = thumbnail_dir / jpg_name
+                jpg_path = _contained_file(thumbnail_dir, Path(image_name).with_suffix('.jpg').name)
+                if jpg_path is not None:
+                    image_path = jpg_path
         else:
-            image_path = output_dir / "images" / safe_image_name
-            # If not found with safe name, try with original decoded name
-            if not image_path.exists() and safe_image_name != decoded_image_name:
-                image_path = output_dir / "images" / decoded_image_name
+            image_path = _contained_file(images_dir, image_name)
+            if image_path is None:
+                return error_response("Invalid image name", 400)
 
         if not image_path.exists():
             # Thumbnail requested but absent: build it from the full image rather than
             # serving the full image itself. Use stem matching because thumbnails are
             # always .jpg while images keep their original extension.
             if want_thumbnail:
-                stem = Path(safe_image_name).stem
-                images_dir = output_dir / "images"
+                stem = Path(image_name).stem
                 candidates = [f"{stem}{ext}" for ext in ('.png', '.jpg', '.jpeg', '.webp', '.gif')]
-                candidates.append(safe_image_name)
-                if safe_image_name != decoded_image_name:
-                    candidates.append(decoded_image_name)
+                candidates.append(image_name)
 
                 for candidate_name in candidates:
-                    candidate = images_dir / candidate_name
-                    if not candidate.exists():
+                    candidate = _contained_file(images_dir, candidate_name)
+                    if candidate is None or not candidate.exists():
                         continue
                     generated = _ensure_thumbnail(generator, candidate, thumbnail_dir)
                     if generated:
@@ -1533,11 +1924,11 @@ def get_batch_image(batch_id: str, image_name: str):
                     # full-resolution image is heavy but beats showing nothing.
                     logger.info(f"Thumbnail generation failed, serving full image: {candidate}")
                     return send_file(str(candidate), max_age=IMAGE_CACHE_MAX_AGE)
-            logger.warning(f"Image not found: {image_path} (requested: {image_name}, decoded: {decoded_image_name}, safe: {safe_image_name})")
-            images_dir = output_dir / ("thumbnails" if want_thumbnail else "images")
-            if images_dir.exists():
-                available_files = [f.name for f in images_dir.iterdir() if f.is_file()]
-                logger.warning(f"Available files in {images_dir}: {available_files[:5]}")
+            logger.warning(f"Image not found: {image_path} (requested: {image_name})")
+            listing_dir = thumbnail_dir if want_thumbnail else images_dir
+            if listing_dir.exists():
+                available_files = [f.name for f in listing_dir.iterdir() if f.is_file()]
+                logger.warning(f"Available files in {listing_dir}: {available_files[:5]}")
             return error_response(f"Image not found: {image_name}", 404)
 
         # Determine MIME type from extension
@@ -1565,33 +1956,27 @@ def delete_batch_image(batch_id: str, image_name: str):
             return error_response("Batch image generation service not available", 503)
 
         generator = get_batch_image_generator()
-        status = generator.get_batch_status(batch_id)
-        
-        # If not in active batches, try to load from disk
-        if not status:
-            all_batches = generator.list_all_batches()
-            status = next((b for b in all_batches if b.batch_id == batch_id), None)
-        
+        status = _load_batch_status(generator, batch_id)
         if not status or not status.output_dir:
             return error_response("Batch not found", 404)
-
-        # URL decode the image name
-        from urllib.parse import unquote
-        decoded_image_name = unquote(image_name)
-        safe_image_name = secure_filename(decoded_image_name)
 
         output_dir = Path(status.output_dir)
         images_dir = output_dir / "images"
         thumbnails_dir = output_dir / "thumbnails"
 
+        image_path = _contained_file(images_dir, image_name)
+        if image_path is None:
+            return error_response("Invalid image name", 400)
+        thumbnail_paths = []
+        for cand in _thumbnail_candidates(image_name):
+            p = _contained_file(thumbnails_dir, cand)
+            if p is None:
+                return error_response("Invalid image name", 400)
+            thumbnail_paths.append(p)
+
         deleted_files = []
         errors = []
 
-        # Delete main image
-        image_path = images_dir / safe_image_name
-        if not image_path.exists() and safe_image_name != decoded_image_name:
-            image_path = images_dir / decoded_image_name
-        
         if image_path.exists():
             try:
                 image_path.unlink()
@@ -1600,21 +1985,27 @@ def delete_batch_image(batch_id: str, image_name: str):
             except Exception as e:
                 errors.append(f"Failed to delete image: {str(e)}")
 
-        # Delete thumbnail if it exists
-        thumbnail_path = thumbnails_dir / safe_image_name
-        if not thumbnail_path.exists() and safe_image_name != decoded_image_name:
-            thumbnail_path = thumbnails_dir / decoded_image_name
-        
-        if thumbnail_path.exists():
-            try:
-                thumbnail_path.unlink()
-                deleted_files.append(str(thumbnail_path))
-                logger.info(f"Deleted thumbnail: {thumbnail_path}")
-            except Exception as e:
-                errors.append(f"Failed to delete thumbnail: {str(e)}")
+        for thumbnail_path in thumbnail_paths:
+            if thumbnail_path.exists():
+                try:
+                    thumbnail_path.unlink()
+                    deleted_files.append(str(thumbnail_path))
+                    logger.info(f"Deleted thumbnail: {thumbnail_path}")
+                except Exception as e:
+                    errors.append(f"Failed to delete thumbnail: {str(e)}")
 
         if not deleted_files:
             return error_response(f"Image not found: {image_name}", 404)
+
+        def _drop_result(results):
+            kept, removed = [], 0
+            for r in results:
+                path = r.get('image_path') if isinstance(r, dict) else getattr(r, 'image_path', None)
+                if path and Path(path).name == image_name:
+                    removed += 1
+                    continue
+                kept.append(r)
+            return kept, removed
 
         # Update batch metadata if it exists
         metadata_file = output_dir / "batch_metadata.json"
@@ -1622,27 +2013,25 @@ def delete_batch_image(batch_id: str, image_name: str):
             try:
                 with open(metadata_file, 'r') as f:
                     metadata = json.load(f)
-                
-                # Update results to remove deleted image
+
+                removed = 0
                 if 'results' in metadata:
-                    metadata['results'] = [
-                        r for r in metadata['results']
-                        if r.get('image_path') and not (
-                            decoded_image_name in r.get('image_path', '') or
-                            safe_image_name in r.get('image_path', '')
-                        )
-                    ]
-                
-                # Update counts
-                if 'completed_images' in metadata:
-                    metadata['completed_images'] = max(0, metadata.get('completed_images', 0) - 1)
-                
+                    metadata['results'], removed = _drop_result(metadata['results'] or [])
+                if removed and 'completed_images' in metadata:
+                    metadata['completed_images'] = max(0, int(metadata.get('completed_images') or 0) - removed)
                 metadata['updated_at'] = datetime.now().isoformat()
-                
+
                 with open(metadata_file, 'w') as f:
                     json.dump(metadata, f, indent=2)
             except Exception as e:
                 logger.warning(f"Could not update metadata: {e}")
+
+        def _sync(st):
+            st.results, removed = _drop_result(list(st.results or []))
+            if removed:
+                st.completed_images = max(0, st.completed_images - removed)
+
+        _sync_active_batch(generator, batch_id, _sync)
 
         if errors:
             return error_response(f"Deleted files but encountered errors: {'; '.join(errors)}", 207)
@@ -1679,37 +2068,27 @@ def rename_batch_image(batch_id: str, image_name: str):
             return error_response("Filename contains invalid characters", 400)
 
         generator = get_batch_image_generator()
-        status = generator.get_batch_status(batch_id)
-        
-        # If not in active batches, try to load from disk
-        if not status:
-            all_batches = generator.list_all_batches()
-            status = next((b for b in all_batches if b.batch_id == batch_id), None)
-        
+        status = _load_batch_status(generator, batch_id)
         if not status or not status.output_dir:
             return error_response("Batch not found", 404)
-
-        # URL decode the image name
-        from urllib.parse import unquote
-        decoded_image_name = unquote(image_name)
-        safe_image_name = secure_filename(decoded_image_name)
 
         output_dir = Path(status.output_dir)
         images_dir = output_dir / "images"
         thumbnails_dir = output_dir / "thumbnails"
 
+        old_image_path = _contained_file(images_dir, image_name)
+        if old_image_path is None:
+            return error_response("Invalid image name", 400)
+
         # Preserve file extension
-        old_ext = Path(decoded_image_name).suffix or Path(safe_image_name).suffix
-        if not new_name.endswith(old_ext):
+        old_ext = Path(image_name).suffix
+        if old_ext and not new_name.endswith(old_ext):
             new_name = new_name + old_ext
 
         safe_new_name = secure_filename(new_name)
+        if not safe_new_name or safe_new_name in (".", ".."):
+            return error_response("Invalid new name", 400)
 
-        # Rename main image
-        old_image_path = images_dir / safe_image_name
-        if not old_image_path.exists() and safe_image_name != decoded_image_name:
-            old_image_path = images_dir / decoded_image_name
-        
         if not old_image_path.exists():
             return error_response(f"Image not found: {image_name}", 404)
 
@@ -1723,18 +2102,39 @@ def rename_batch_image(batch_id: str, image_name: str):
         except Exception as e:
             return error_response(f"Failed to rename image: {str(e)}", 500)
 
-        # Rename thumbnail if it exists
-        old_thumbnail_path = thumbnails_dir / safe_image_name
-        if not old_thumbnail_path.exists() and safe_image_name != decoded_image_name:
-            old_thumbnail_path = thumbnails_dir / decoded_image_name
-        
-        if old_thumbnail_path.exists():
-            new_thumbnail_path = thumbnails_dir / safe_new_name
+        # The thumbnail keeps whichever extension it was written with (.jpg for
+        # generated batches, original for uploads); only its stem changes.
+        new_thumbnail_name = None
+        for old_cand in _thumbnail_candidates(image_name):
+            old_thumbnail_path = _contained_file(thumbnails_dir, old_cand)
+            if old_thumbnail_path is None or not old_thumbnail_path.exists():
+                continue
+            new_thumbnail_name = Path(safe_new_name).with_suffix(old_thumbnail_path.suffix).name
+            new_thumbnail_path = thumbnails_dir / new_thumbnail_name
             try:
                 old_thumbnail_path.rename(new_thumbnail_path)
                 logger.info(f"Renamed thumbnail: {old_thumbnail_path} -> {new_thumbnail_path}")
             except Exception as e:
                 logger.warning(f"Failed to rename thumbnail: {e}")
+                new_thumbnail_name = None
+            break
+
+        def _rename_result(r):
+            is_dict = isinstance(r, dict)
+            path = r.get('image_path') if is_dict else getattr(r, 'image_path', None)
+            if not path or Path(path).name != image_name:
+                return
+            new_path = str(Path(path).parent / safe_new_name)
+            thumb = r.get('thumbnail_path') if is_dict else getattr(r, 'thumbnail_path', None)
+            new_thumb = str(Path(thumb).parent / new_thumbnail_name) if (thumb and new_thumbnail_name) else thumb
+            if is_dict:
+                r['image_path'] = new_path
+                if thumb:
+                    r['thumbnail_path'] = new_thumb
+            else:
+                r.image_path = new_path
+                if thumb:
+                    r.thumbnail_path = new_thumb
 
         # Update batch metadata if it exists
         metadata_file = output_dir / "batch_metadata.json"
@@ -1742,30 +2142,21 @@ def rename_batch_image(batch_id: str, image_name: str):
             try:
                 with open(metadata_file, 'r') as f:
                     metadata = json.load(f)
-                
-                # Update results to reflect new filename
-                if 'results' in metadata:
-                    for result in metadata['results']:
-                        if result.get('image_path') and (
-                            decoded_image_name in result.get('image_path', '') or
-                            safe_image_name in result.get('image_path', '')
-                        ):
-                            # Update image_path
-                            old_path = result.get('image_path', '')
-                            if old_path:
-                                result['image_path'] = str(Path(old_path).parent / safe_new_name)
-                            
-                            # Update thumbnail_path if it exists
-                            if result.get('thumbnail_path'):
-                                old_thumb_path = result.get('thumbnail_path', '')
-                                result['thumbnail_path'] = str(Path(old_thumb_path).parent / safe_new_name)
-                
+
+                for result in metadata.get('results') or []:
+                    if isinstance(result, dict):
+                        _rename_result(result)
                 metadata['updated_at'] = datetime.now().isoformat()
-                
+
                 with open(metadata_file, 'w') as f:
                     json.dump(metadata, f, indent=2)
             except Exception as e:
                 logger.warning(f"Could not update metadata: {e}")
+
+        _sync_active_batch(
+            generator, batch_id,
+            lambda st: [_rename_result(r) for r in (st.results or [])],
+        )
 
         return success_response({
             "batch_id": batch_id,
@@ -1833,19 +2224,17 @@ def delete_batch(batch_id: str):
             return error_response("Batch image generation service not available", 503)
 
         generator = get_batch_image_generator()
-        status = generator.get_batch_status(batch_id)
-        
-        # If not in active batches, try to load from disk
-        if not status:
-            all_batches = generator.list_all_batches()
-            status = next((b for b in all_batches if b.batch_id == batch_id), None)
-        
+        status = _load_batch_status(generator, batch_id)
         if not status:
             return error_response("Batch not found", 404)
 
-        # Check if batch is still running
-        if status.status == 'running':
-            return error_response("Wait for generation to finish before deleting.", 400)
+        # A batch that is running, or still waiting in the queue, must not lose
+        # its directory: the worker would pick it up and fail every prompt into
+        # a folder that no longer exists. Cancel it first.
+        if status.status in generator._ACTIVE_STATUSES:
+            return error_response(
+                "Batch is still queued or running — cancel it before deleting.", 409
+            )
 
         # Delete the batch directory
         if status.output_dir and os.path.exists(status.output_dir):
@@ -1857,13 +2246,23 @@ def delete_batch(batch_id: str):
                 logger.error(f"Error deleting batch directory: {e}")
                 return error_response(f"Failed to delete batch files: {str(e)}", 500)
 
-        # Remove from active batches if present
-        if batch_id in generator.active_batches:
-            with generator.batch_lock:
-                generator.active_batches.pop(batch_id, None)
+        generator.forget_batch(batch_id)
+
+        # The directory is gone, so the rows that pointed into it have to go
+        # too — otherwise the Documents tree keeps an empty folder and the
+        # Jobs page keeps history for a batch that no longer exists.
+        db_removed = {}
+        try:
+            from backend.services.generation_history_service import delete_batch_history_rows
+            db_removed = delete_batch_history_rows(
+                image_batch_ids=[batch_id], triggered_by="batch_image_delete"
+            )
+        except Exception as e:
+            logger.error(f"Batch {batch_id} files deleted but its database rows remain: {e}")
 
         return success_response({
             "batch_id": batch_id,
+            "deleted": db_removed,
             "message": "Batch deleted successfully"
         })
 
@@ -1887,13 +2286,7 @@ def rename_batch(batch_id: str):
             return error_response("Name cannot be empty", 400)
 
         generator = get_batch_image_generator()
-        status = generator.get_batch_status(batch_id)
-        
-        # If not in active batches, try to load from disk
-        if not status:
-            all_batches = generator.list_all_batches()
-            status = next((b for b in all_batches if b.batch_id == batch_id), None)
-        
+        status = _load_batch_status(generator, batch_id)
         if not status or not status.output_dir:
             return error_response("Batch not found", 404)
 
@@ -1901,7 +2294,6 @@ def rename_batch(batch_id: str):
         metadata_file = Path(status.output_dir) / "batch_metadata.json"
         if metadata_file.exists():
             try:
-                import json
                 with open(metadata_file, 'r') as f:
                     metadata = json.load(f)
                 
@@ -1918,7 +2310,6 @@ def rename_batch(batch_id: str):
         else:
             # Create metadata file if it doesn't exist
             try:
-                import json
                 metadata = {
                     "batch_id": batch_id,
                     "display_name": new_name,
@@ -1935,6 +2326,11 @@ def rename_batch(batch_id: str):
             except Exception as e:
                 logger.error(f"Error creating metadata: {e}")
                 return error_response(f"Failed to create metadata: {str(e)}", 500)
+
+        def _set_name(st):
+            st.display_name = new_name
+
+        _sync_active_batch(generator, batch_id, _set_name)
 
         return success_response({
             "batch_id": batch_id,
@@ -2012,15 +2408,12 @@ def move_batch_to_folder(batch_id: str):
         folder_name = data.get('folder_name', '').strip() if data else None
 
         generator = get_batch_image_generator()
-        status = generator.get_batch_status(batch_id)
-        
-        # If not in active batches, try to load from disk
-        if not status:
-            all_batches = generator.list_all_batches()
-            status = next((b for b in all_batches if b.batch_id == batch_id), None)
-        
+        status = _load_batch_status(generator, batch_id)
         if not status or not status.output_dir:
             return error_response("Batch not found", 404)
+
+        if status.status in generator._ACTIVE_STATUSES:
+            return error_response("Batch is still queued or running — wait for it to finish before moving.", 409)
 
         current_path = Path(status.output_dir)
         
@@ -2055,7 +2448,6 @@ def move_batch_to_folder(batch_id: str):
         metadata_file = new_path / "batch_metadata.json"
         if metadata_file.exists():
             try:
-                import json
                 with open(metadata_file, 'r') as f:
                     metadata = json.load(f)
                 
@@ -2066,6 +2458,11 @@ def move_batch_to_folder(batch_id: str):
                     json.dump(metadata, f, indent=2)
             except Exception as e:
                 logger.warning(f"Could not update metadata: {e}")
+
+        def _set_dir(st):
+            st.output_dir = str(new_path)
+
+        _sync_active_batch(generator, batch_id, _set_dir)
 
         return success_response({
             "batch_id": batch_id,
@@ -2186,34 +2583,25 @@ def upload_images():
 def get_csv_template():
     """Get CSV template for batch generation."""
     try:
-        # Create sample CSV template
-        template_content = """prompt,negative_prompt,style,width,height,steps,guidance,seed
-"A beautiful sunset over mountains",,"realistic",512,512,20,7.5,
-"A cat sitting on a windowsill","blurry, low quality","artistic",512,512,25,8.0,42
-"Abstract geometric patterns in blue","","artistic",768,768,30,7.0,
-"Portrait of a wise old wizard","cartoon, anime","realistic",512,512,20,7.5,123
-"""
-
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as temp_file:
-            temp_file.write(template_content)
-            temp_file_path = temp_file.name
-
-        # Send file
-        response = send_file(
-            temp_file_path,
-            as_attachment=True,
-            download_name="batch_generation_template.csv",
-            mimetype='text/csv'
+        # Size/steps/guidance are left blank so each row takes the selected
+        # model's own recipe (stills_defaults). Filled-in values are honoured
+        # verbatim, so the sample keeps them empty rather than shipping SD-1.5
+        # numbers that would run unchanged on Z-Image or FLUX.
+        template_content = (
+            "prompt,negative_prompt,style,width,height,steps,guidance,seed\n"
+            '"A beautiful sunset over mountains",,"realistic",,,,,\n'
+            '"A cat sitting on a windowsill","blurry, low quality","artistic",,,,,42\n'
+            '"Abstract geometric patterns in blue","","artistic",1024,1024,,,\n'
+            '"Portrait of a wise old wizard","cartoon, anime","realistic",,,,,123\n'
         )
 
-        # Clean up temp file after sending
-        try:
-            os.unlink(temp_file_path)
-        except OSError:
-            pass
-
-        return response
+        # Served straight from memory: the previous temp-file + send_file +
+        # unlink sequence deleted the file before Flask streamed it.
+        return Response(
+            template_content,
+            mimetype='text/csv',
+            headers={'Content-Disposition': 'attachment; filename="batch_generation_template.csv"'},
+        )
 
     except Exception as e:
         logger.error(f"Error generating CSV template: {e}")
@@ -2231,10 +2619,14 @@ def generate_blueprints_batch():
             return error_response("No CSV file uploaded", 400)
 
         file = request.files['file']
-        if not file.filename.endswith('.csv'):
-            return error_response("Must be a CSV file", 400)
+        is_valid, message = _validate_csv_upload(file)
+        if not is_valid:
+            return error_response(message, 400)
 
-        csv_content = file.read().decode("UTF-8")
+        try:
+            csv_content = file.read().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return error_response("CSV must be UTF-8 encoded", 400)
         stream = io.StringIO(csv_content, newline=None)
         reader = csv.DictReader(stream)
         row_count = sum(1 for row in reader if (row.get('city') or row.get('City') or row.get('name')))

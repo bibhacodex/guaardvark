@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import {
   Badge,
@@ -24,6 +24,9 @@ import { spacing } from "../../theme/tokens";
 
 import { BrandLogo } from "../branding";
 import brand from "../../config/brand";
+import { filterNavGroups, landingRouteFor } from "../../config/profile";
+import { pathIsActive } from "../../config/navCatalog";
+import { extensionNavGroups } from "../../extensions";
 import { usePendingApprovals } from "../../hooks/usePendingApprovals";
 import BarChartIcon from "@mui/icons-material/BarChart";
 import DesktopWindowsIcon from "@mui/icons-material/DesktopWindows";
@@ -36,12 +39,17 @@ import AgentScreenViewer from "../agent/AgentScreenViewer";
 const COLLAPSED_WIDTH = spacing.sidebarCollapsed;
 const EXPANDED_WIDTH = spacing.sidebarExpanded;
 
-// Navigation layout is brand-owned: see config/brand.jsx (navGroups).
-const navGroups = brand.navGroups;
-
 const Sidebar = () => {
   const location = useLocation();
   const theme = useTheme();
+  // Navigation layout is catalog-owned (config/navCatalog.jsx); brand.navGroups
+  // is the sidebar projection. The active profile decides which items are listed.
+  const profile = useAppStore((state) => state.profile);
+  const navGroups = useMemo(
+    () => filterNavGroups([...extensionNavGroups(), ...brand.navGroups], profile?.hidden_routes),
+    [profile],
+  );
+  const homeRoute = landingRouteFor(profile) || "/dashboard";
   const systemName = useAppStore((state) => state.systemName);
   const systemLogo = useAppStore((state) => state.systemLogo);
   const isExpanded = useAppStore((state) => state.sidebarExpanded);
@@ -70,31 +78,40 @@ const Sidebar = () => {
     activateResourceManager();
   }, []);
 
-  const getNavLinkStyle = (isActive) => ({
-    backgroundColor: isActive ? theme.palette.action.selected : "transparent",
-    color: "inherit",
-    width: "100%",
-    minHeight: 40,
-    justifyContent: isExpanded ? "flex-start" : "center",
-    px: isExpanded ? 2 : 1.5,
-    py: 0.75,
-    mb: 0.25,
-    borderRadius: "6px",
-    "&:hover": {
-      backgroundColor: isActive
-        ? theme.palette.action.selected
-        : theme.palette.action.hover,
-      "& .MuiListItemIcon-root svg": { color: theme.palette.primary.main },
-    },
-    "& .MuiListItemIcon-root": {
-      minWidth: isExpanded ? 36 : 0,
-      justifyContent: "center",
-      color: isActive
-        ? theme.palette.primary.main
-        : theme.palette.text.secondary,
-      "& svg": { fontSize: 22 },
-    },
-  });
+  // Each nav item can carry its area's hue from the theme's `moduleAccents`
+  // map, so the sidebar is scannable by colour. Themes without one fall back to
+  // the primary/secondary pair and look exactly as before.
+  const getNavLinkStyle = (isActive, accent) => {
+    const activeColor = accent || theme.palette.primary.main;
+    return {
+      backgroundColor: isActive ? theme.palette.action.selected : "transparent",
+      color: "inherit",
+      width: "100%",
+      minHeight: 40,
+      justifyContent: isExpanded ? "flex-start" : "center",
+      px: isExpanded ? 2 : 1.5,
+      py: 0.75,
+      mb: 0.25,
+      borderRadius: "6px",
+      borderLeft: "2px solid",
+      borderLeftColor: isActive && accent ? accent : "transparent",
+      "&:hover": {
+        backgroundColor: isActive
+          ? theme.palette.action.selected
+          : theme.palette.action.hover,
+        "& .MuiListItemIcon-root svg": { color: activeColor },
+      },
+      "& .MuiListItemIcon-root": {
+        minWidth: isExpanded ? 36 : 0,
+        justifyContent: "center",
+        // Inactive icons keep a muted tint of their own hue rather than a flat
+        // grey, which is what makes the collapsed rail readable.
+        color: isActive ? activeColor : accent || theme.palette.text.secondary,
+        opacity: isActive ? 1 : 0.75,
+        "& svg": { fontSize: 22 },
+      },
+    };
+  };
 
   return (
     <>
@@ -136,8 +153,8 @@ const Sidebar = () => {
           >
             <Avatar
               component={NavLink}
-              // Static for now; later this can be SettingsPage-configurable or route to Agent Chat.
-              to="/dashboard"
+              // Brand home: the profile's landing route, else the dashboard.
+              to={homeRoute}
               src={systemLogo ? `/api/uploads/${systemLogo}` : undefined}
               sx={{
                 width: 36,
@@ -206,17 +223,7 @@ const Sidebar = () => {
                 )}
                 <List disablePadding>
                   {group.items.map((item) => {
-                    // Match on whole path segments, not raw string prefix.
-                    // A bare startsWith() makes "/video" (Video Gen) light up
-                    // when the route is "/video-editor" or "/video-text-overlay",
-                    // because both literally start with "/video". Requiring an
-                    // exact match or a "/" boundary keeps nested routes
-                    // (e.g. /clients/123 -> Clients) highlighting correctly
-                    // while killing the sibling-collision.
-                    const isActive = item.path === "/"
-                      ? location.pathname === "/"
-                      : location.pathname === item.path ||
-                        location.pathname.startsWith(item.path + "/");
+                    const isActive = pathIsActive(item.path, location.pathname);
 
                     // A nav item may carry a live count. Collapsed, the badge is
                     // the only signal there is, so it rides the icon in both
@@ -227,7 +234,7 @@ const Sidebar = () => {
                       <ListItemButton
                         component={NavLink}
                         to={item.path}
-                        sx={() => getNavLinkStyle(isActive)}
+                        sx={() => getNavLinkStyle(isActive, theme.palette.moduleAccents?.[item.path])}
                       >
                         <ListItemIcon>
                           {badgeCount > 0 ? (

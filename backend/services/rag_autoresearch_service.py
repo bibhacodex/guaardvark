@@ -8,18 +8,21 @@ import os
 import time
 import logging
 import uuid
-from datetime import datetime
 from threading import Lock
 
 from backend.config import (
     AUTORESEARCH_DEFAULT_PARAMS,
+    AUTORESEARCH_KEEP_MIN_DELTA,
     AUTORESEARCH_MAX_EXPERIMENT_DURATION,
+    AUTORESEARCH_EXPERIMENT_DEADLINE_HEADROOM,
+    AUTORESEARCH_EXPERIMENT_DEADLINE_UNMEASURED,
     AUTORESEARCH_MAX_EXPERIMENTS_PER_RUN,
     AUTORESEARCH_MIN_EXPERIMENT_INTERVAL,
     AUTORESEARCH_PHASE_PLATEAU_THRESHOLD,
 )
 from backend.services.rag_eval_harness import RAGEvalHarness
 from backend.services.rag_experiment_agent import RAGExperimentAgent
+from backend.utils.clock import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,7 @@ class RAGAutoresearchService:
         self._last_activity = time.time()
         self._lock = Lock()
         self._current_experiment_id = None
+        self._current_parameter = None
         # Seconds between experiments. An attribute (not the constant inline) so
         # tests can zero it; production leaves it at the config floor.
         self.experiment_interval = AUTORESEARCH_MIN_EXPERIMENT_INTERVAL
@@ -97,6 +101,41 @@ class RAGAutoresearchService:
 
     # --- Experiment execution ---
 
+    def _experiment_deadline_seconds(self, config: dict) -> float:
+        """Per-experiment wall-clock cap.
+
+        Measured: headroom x pairs x (judged-pair seconds + 2 x retrieval-pair
+        seconds, for the two F0 screens). Unmeasured: the generous
+        AUTORESEARCH_EXPERIMENT_DEADLINE_UNMEASURED, never the bare floor.
+        """
+        h = self.eval_harness
+        per = getattr(h, "avg_pair_seconds", None) or config.get("avg_pair_seconds")
+        retr = getattr(h, "avg_retrieval_pair_seconds", None) or config.get("avg_retrieval_pair_seconds") or 0.0
+        if not per:
+            return float(max(AUTORESEARCH_MAX_EXPERIMENT_DURATION, AUTORESEARCH_EXPERIMENT_DEADLINE_UNMEASURED))
+        try:
+            n_pairs = len(h._get_active_eval_pairs())
+        except Exception:
+            n_pairs = 0
+        scaled = AUTORESEARCH_EXPERIMENT_DEADLINE_HEADROOM * n_pairs * (float(per) + 2.0 * float(retr))
+        return max(float(AUTORESEARCH_MAX_EXPERIMENT_DURATION), scaled)
+
+    def _persist_timings(self, config: dict) -> None:
+        """Keep the harness's measured pair costs in the config so the next
+        run (a fresh worker process) starts with a real deadline."""
+        h = self.eval_harness
+        changed = False
+        for key in ("avg_pair_seconds", "avg_retrieval_pair_seconds"):
+            v = getattr(h, key, None)
+            if v and round(v, 2) != config.get(key):
+                config[key] = round(v, 2)
+                changed = True
+        if changed:
+            try:
+                self._save_config(config)
+            except Exception as e:
+                logger.debug(f"timing persist skipped: {e}")
+
     def run_single_experiment(self, run_tag: str = None,
                               promote_mode: str = "active") -> dict:
         """Execute one experiment cycle. Returns result dict.
@@ -107,7 +146,16 @@ class RAGAutoresearchService:
         run-end A/B confirmation to activate.
         """
         config = self._load_config()
+        from backend.services.rag_experiment_agent import MAX_PHASE
         phase = config.get("phase", 1)
+        if not isinstance(phase, int) or phase < 1 or phase > MAX_PHASE:
+            # Persisted by an older build (phase 3 while only phase 1 exists,
+            # 2026-08-30). Clamp and persist rather than propose nothing forever.
+            logger.warning(f"autoresearch config phase {phase!r} is not a known phase; resetting to {MAX_PHASE}")
+            phase = MAX_PHASE
+            config["phase"] = phase
+            config["phase_plateau_count"] = 0
+            self._save_config(config)
         baseline = config.get("baseline_score", 0.0)
         params = config.get("params", dict(AUTORESEARCH_DEFAULT_PARAMS))
 
@@ -129,6 +177,7 @@ class RAGAutoresearchService:
         proposal = self.agent.propose_experiment(history, params, phase)
         experiment_id = str(uuid.uuid4())
         self._current_experiment_id = experiment_id
+        self._current_parameter = proposal.get("parameter")
 
         param_name = proposal["parameter"]
         old_value = params.get(param_name)
@@ -151,14 +200,77 @@ class RAGAutoresearchService:
         test_params = dict(params)
         test_params[param_name] = new_value
 
-        # 5. Run eval
+        # 5. Two-fidelity eval: F0 retrieval screen, F1 judge subset, F2 full.
         t0 = time.time()
+        fidelity = 1
+        f0_lose = False
+        base_retr = {}
+        test_retr = {}
         try:
-            eval_result = self.eval_harness.run_full_eval(test_params)
+            self.eval_harness.begin_experiment_budget(
+                duration_s=self._experiment_deadline_seconds(config),
+            )
+            try:
+                base_retr = self.eval_harness.run_retrieval_eval(dict(params)) or {}
+                test_retr = self.eval_harness.run_retrieval_eval(test_params) or {}
+            except Exception as e:
+                logger.debug(f"F0 retrieval screen skipped: {e}")
+                base_retr, test_retr = {}, {}
+
+            f0_lose = (
+                (base_retr.get("num_scored") or 0) > 0
+                and (test_retr.get("num_scored") or 0) > 0
+                and (test_retr.get("mrr") or 0) < (base_retr.get("mrr") or 0)
+                and (test_retr.get("hit_rate_at_k") or 0)
+                    < (base_retr.get("hit_rate_at_k") or 0)
+            )
+            if f0_lose:
+                fidelity = 0
+                eval_result = {
+                    "composite_score": baseline,
+                    "num_pairs": test_retr.get("num_pairs") or 1,
+                    "details": [],
+                    "retrieval": test_retr,
+                    "parse_fail_ratio": 0.0,
+                    "parse_fail_crash": False,
+                }
+            else:
+                subset = self.eval_harness._select_judge_subset()
+                eval_result = self.eval_harness.run_full_eval(
+                    test_params, pairs=subset,
+                )
+                fidelity = 1
+                if eval_result.get("parse_fail_crash"):
+                    raise RuntimeError(
+                        "judge_parse_fail_ratio="
+                        f"{eval_result.get('parse_fail_ratio')}"
+                    )
+                f1_delta = (eval_result.get("composite_score") or 0.0) - baseline
+                if f1_delta >= AUTORESEARCH_KEEP_MIN_DELTA:
+                    try:
+                        n_active = len(self.eval_harness._get_active_eval_pairs())
+                    except Exception:
+                        n_active = len(subset or [])
+                    if n_active > len(subset or []) and not self.eval_harness._budget_ok():
+                        # The subset already spent the deadline; a full-set
+                        # confirmation would raise on its first pair. Keep the
+                        # F1 verdict and say so rather than crash (2026-08-30).
+                        eval_result["f2_skipped"] = "budget_exhausted"
+                        logger.info("F2 confirmation skipped — experiment budget exhausted after F1")
+                    elif n_active > len(subset or []):
+                        eval_result = self.eval_harness.run_full_eval(test_params)
+                        fidelity = 2
+                        if eval_result.get("parse_fail_crash"):
+                            raise RuntimeError(
+                                "judge_parse_fail_ratio="
+                                f"{eval_result.get('parse_fail_ratio')}"
+                            )
             new_score = eval_result["composite_score"]
             duration = time.time() - t0
+            self._persist_timings(config)
         except Exception as e:
             logger.error(f"Experiment crashed: {e}")
+            self._persist_timings(config)
             result = {
                 "experiment_id": experiment_id,
                 "parameter": param_name,
@@ -171,9 +283,12 @@ class RAGAutoresearchService:
                 "delta": 0.0,
                 "duration": time.time() - t0,
                 "phase": phase,
+                "fidelity": fidelity,
                 **provenance,
             }
             self._log_experiment(result)
+            self._current_experiment_id = None
+            self._current_parameter = None
             return result
 
         # 5b. A 0-pair eval "succeeds" with score 0.0 in about a millisecond and
@@ -198,28 +313,44 @@ class RAGAutoresearchService:
                 "delta": 0.0,
                 "duration": duration,
                 "phase": phase,
+                "fidelity": fidelity,
                 **provenance,
             }
             self._log_experiment(result)
+            self._current_experiment_id = None
+            self._current_parameter = None
             return result
 
-        # 6. Compare to baseline
+        # 6. Compare to baseline — min-delta matches run-end confirmation.
+        # Retrieval improvement can keep when composite does not drop.
+        retr = eval_result.get("retrieval") or test_retr or {}
         delta = round(new_score - baseline, 4)
-        status = "keep" if new_score > baseline else "discard"
+        status = self._decide_keep(
+            new_score, baseline, retr, base_retr, f0_lose=f0_lose,
+        )
 
         # 7. Keep or revert
+        promoted_id = None
         if status == "keep":
             config["params"][param_name] = new_value
             config["baseline_score"] = new_score
             config["phase_plateau_count"] = 0
             self._save_config(config)
-            self._promote_config(config, new_score, "local",
-                                 activate=(promote_mode == "active"))
-            logger.info(f"KEEP: {param_name}={new_value} score={new_score:.4f} (delta=+{delta:.4f})")
+            promoted_id = self._promote_config(
+                config, new_score, "local",
+                activate=(promote_mode == "active"),
+            )
+            logger.info(
+                f"KEEP: {param_name}={new_value} score={new_score:.4f} "
+                f"(delta=+{delta:.4f} fidelity={fidelity})"
+            )
         else:
             config["phase_plateau_count"] = config.get("phase_plateau_count", 0) + 1
             self._save_config(config)
-            logger.info(f"DISCARD: {param_name}={new_value} score={new_score:.4f} (delta={delta:.4f})")
+            logger.info(
+                f"DISCARD: {param_name}={new_value} score={new_score:.4f} "
+                f"(delta={delta:.4f} fidelity={fidelity})"
+            )
 
         result = {
             "experiment_id": experiment_id,
@@ -234,7 +365,9 @@ class RAGAutoresearchService:
             "duration": duration,
             "phase": phase,
             "eval_details": eval_result.get("details", []),
-            "retrieval_metrics": eval_result.get("retrieval"),
+            "retrieval_metrics": retr if retr else eval_result.get("retrieval"),
+            "fidelity": fidelity,
+            "config_id": promoted_id,
             **provenance,
         }
 
@@ -245,7 +378,29 @@ class RAGAutoresearchService:
         self._emit_socket_event(result)
 
         self._current_experiment_id = None
+        self._current_parameter = None
         return result
+
+    def _decide_keep(
+        self, new_score, baseline, new_retr, base_retr, f0_lose=False,
+    ) -> str:
+        """Keep only a real improvement: min-delta on composite, or retrieval
+        up with composite not dropping. F0 losers never keep."""
+        if f0_lose:
+            return "discard"
+        delta = (new_score or 0.0) - (baseline or 0.0)
+        retr_improved = False
+        if new_retr and base_retr:
+            retr_improved = (
+                (new_retr.get("mrr") or 0) > (base_retr.get("mrr") or 0)
+                or (new_retr.get("hit_rate_at_k") or 0)
+                    > (base_retr.get("hit_rate_at_k") or 0)
+            )
+        if delta >= AUTORESEARCH_KEEP_MIN_DELTA:
+            return "keep"
+        if retr_improved and delta >= 0:
+            return "keep"
+        return "discard"
 
     def run_loop(self, max_experiments: int = 0):
         """Run experiment loop until paused, disabled, capped, or plateaued.
@@ -316,6 +471,7 @@ class RAGAutoresearchService:
         finally:
             self._running = False
             self._current_experiment_id = None
+            self._current_parameter = None
             # The whole loop runs inside an app context pushed by the caller; tidy
             # the scoped session so a long-lived daemon doesn't leak connections.
             try:
@@ -423,7 +579,7 @@ class RAGAutoresearchService:
                 params=config["params"],
                 composite_score=score,
                 is_active=activate,
-                promoted_at=datetime.utcnow() if activate else None,
+                promoted_at=utcnow() if activate else None,
                 source=source,
                 status="promoted" if activate else "candidate",
             )
@@ -509,17 +665,65 @@ class RAGAutoresearchService:
             pass
 
     def get_status(self) -> dict:
-        """Current status for dashboard."""
+        """Current status for dashboard.
+
+        `running` is true if THIS process's loop is active OR a ResearchRun
+        row is pending/running — the overnight engine no longer sets
+        `_running` on this singleton.
+        """
         config = self._load_config()
+        active_run = None
+        eval_pair_count = 0
+        try:
+            from backend.models import ResearchRun, EvalPair
+            run = (
+                ResearchRun.query
+                .filter(ResearchRun.status.in_(("running", "pending")))
+                .order_by(ResearchRun.created_at.desc())
+                .first()
+            )
+            if run is not None:
+                active_run = run.to_dict()
+                remaining = None
+                if run.started_at and run.wall_clock_budget_s is not None:
+                    elapsed = (utcnow() - run.started_at).total_seconds()
+                    remaining = max(0, int(run.wall_clock_budget_s - elapsed))
+                active_run["budget_remaining_s"] = remaining
+            eval_pair_count = (
+                EvalPair.query.filter(EvalPair.is_active.isnot(False)).count()
+            )
+        except Exception:
+            pass
+        code_keeps = []
+        try:
+            from backend.models import PendingFix
+            rows = (
+                PendingFix.query
+                .filter(PendingFix.status.in_(("proposed", "approved")))
+                .order_by(PendingFix.created_at.desc())
+                .limit(20)
+                .all()
+            )
+            code_keeps = [
+                r.to_dict() for r in rows
+                if (r.fix_description or "").startswith("[autoresearch")
+            ]
+        except Exception:
+            pass
+        running = bool(self._running or active_run)
         return {
-            "running": self._running,
+            "running": running,
             "paused": self._paused,
             "current_experiment_id": self._current_experiment_id,
+            "current_parameter": self._current_parameter,
             "phase": config.get("phase", 1),
             "baseline_score": config.get("baseline_score", 0.0),
             "params": config.get("params", {}),
             "total_experiments": self._count_experiments(),
             "total_improvements": self._count_improvements(),
+            "active_run": active_run,
+            "code_keeps": code_keeps,
+            "eval_pair_count": eval_pair_count,
         }
 
     def _count_experiments(self) -> int:

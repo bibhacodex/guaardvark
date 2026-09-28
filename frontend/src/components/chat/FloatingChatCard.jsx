@@ -7,7 +7,6 @@ import {
   TextField,
   Chip,
   List,
-  ListItem,
   Grow,
   useTheme,
 } from "@mui/material";
@@ -16,12 +15,14 @@ import SendIcon from "@mui/icons-material/Send";
 import StopIcon from "@mui/icons-material/Stop";
 import MinimizeIcon from "@mui/icons-material/Remove";
 import AddIcon from "@mui/icons-material/Add";
+import AttachFileIcon from "@mui/icons-material/AttachFile";
 import ChatBubbleOutlineIcon from "@mui/icons-material/ChatBubbleOutline";
 import HearingIcon from "@mui/icons-material/Hearing";
 import Tooltip from "@mui/material/Tooltip";
 import { useFloatingChatStore } from "../../stores/useFloatingChatStore";
 import UnifiedChatService from "../../api/unifiedChatService";
 import StreamingMessage from "./StreamingMessage";
+import FloatingChatMessage from "./FloatingChatMessage";
 import { useUnifiedProgress } from "../../contexts/UnifiedProgressContext";
 import VoiceChatButton from "../voice/VoiceChatButton";
 import ContinuousVoiceChat from "../voice/ContinuousVoiceChat";
@@ -30,10 +31,47 @@ import { useVoiceSettings } from "../../hooks/useVoiceSettings";
 import useSlashCommands from "../../hooks/useSlashCommands";
 import SlashCommandPopup from "./SlashCommandPopup";
 import { debugLog } from "../../utils/debugLog";
+import { contextChipLabel } from "../../utils/contextChipLabel";
+import { StatusPill } from "../settings/ui";
+import {
+  attachmentExceedsLimit,
+  chatErrorMessage,
+  downscaleChatAttachment,
+  fetchAttachmentMaxBytes,
+  formatAttachmentSize,
+  refuseAttachmentMessage,
+} from "../../utils/chatAttachment";
 
 const MIN_WIDTH = 280;
 const MIN_HEIGHT = 300;
 const DOUBLE_CLICK_MS = 400;
+const VIEWPORT_MARGIN = 8; // keep this much gap between the card and the window edge
+const COLLAPSED_HEIGHT = 48; // header-only height used for bounds while collapsed
+
+/**
+ * Fit the card's persisted geometry inside the current viewport.
+ *
+ * Position and size live in localStorage, so a spot chosen on a large window
+ * is replayed verbatim on a smaller one and can leave most of the card
+ * off-screen. Shrink the size to what the window can hold (a tiny window may
+ * override the MIN_* floors), then pull the position back so every edge is
+ * visible. Returns the same object references when nothing needs to change so
+ * callers can skip redundant store writes.
+ */
+const fitToViewport = (position, size, collapsed) => {
+  const maxW = Math.max(1, window.innerWidth - VIEWPORT_MARGIN * 2);
+  const maxH = Math.max(1, window.innerHeight - VIEWPORT_MARGIN * 2);
+  const w = Math.min(Math.max(MIN_WIDTH, size.w), maxW);
+  const h = Math.min(Math.max(MIN_HEIGHT, size.h), maxH);
+  const visibleH = collapsed ? Math.min(COLLAPSED_HEIGHT, maxH) : h;
+
+  const x = Math.max(VIEWPORT_MARGIN, Math.min(position.x, window.innerWidth - w - VIEWPORT_MARGIN));
+  const y = Math.max(VIEWPORT_MARGIN, Math.min(position.y, window.innerHeight - visibleH - VIEWPORT_MARGIN));
+
+  const nextSize = w === size.w && h === size.h ? size : { w, h };
+  const nextPosition = x === position.x && y === position.y ? position : { x, y };
+  return { position: nextPosition, size: nextSize };
+};
 
 const FloatingChatCard = () => {
   const theme = useTheme();
@@ -58,6 +96,7 @@ const FloatingChatCard = () => {
   const clearError = useFloatingChatStore((s) => s.clearError);
   const sessionId = useFloatingChatStore((s) => s.sessionId);
   const pageContext = useFloatingChatStore((s) => s.pageContext);
+  const entityLabel = useFloatingChatStore((s) => s.entityLabel);
 
   // Listener mode state
   const listenerModeEnabled = useAppStore((s) => s.listenerModeEnabled);
@@ -105,6 +144,21 @@ const FloatingChatCard = () => {
     };
   }, [sessionId, socketRef?.current]);
 
+  // chat:error on the composer. Raw socket so it does not overwrite
+  // StreamingMessage's UnifiedChatService.onError listener.
+  useEffect(() => {
+    const socket = socketRef?.current;
+    if (!socket || !sessionId) return;
+    const handleChatError = (data) => {
+      if (!data || (data.session_id && data.session_id !== sessionId)) return;
+      setError(chatErrorMessage(data));
+    };
+    socket.on("chat:error", handleChatError);
+    return () => {
+      socket.off("chat:error", handleChatError);
+    };
+  }, [sessionId, socketRef, setError]);
+
   // Hydrate session mode from backend on sessionId change so `/agent` state
   // survives reloads / re-mounts. Without this, the floating card's
   // `inAgentMode` is always false and `agent_screen_active` falls back to
@@ -136,12 +190,23 @@ const FloatingChatCard = () => {
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [resizeStart, setResizeStart] = useState({ x: 0, y: 0, w: 0, h: 0 });
   const [inputText, setInputText] = useState("");
+  const [attachment, setAttachment] = useState(null);
+  const [attachmentMaxBytes, setAttachmentMaxBytes] = useState(null);
 
   const lastClickRef = useRef(0);
   const cardRef = useRef(null);
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
+  const fileRef = useRef(null);
   const streamingMessageRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchAttachmentMaxBytes().then((max) => {
+      if (!cancelled) setAttachmentMaxBytes(max);
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   // Terminal-style sent-message history (Up/Down to recall).
   const messageHistoryRef = useRef([]);
@@ -217,54 +282,87 @@ const FloatingChatCard = () => {
     }
   }, [position, size.w, size.h, setPosition]);
 
+  // Keep the card inside the viewport whenever it opens or the window resizes.
+  // Runs against the store directly so the resize listener never goes stale.
+  useEffect(() => {
+    if (!isOpen) return;
+    const fit = () => {
+      const s = useFloatingChatStore.getState();
+      if (s.position.x === -1 && s.position.y === -1) return; // default not yet applied
+      const next = fitToViewport(s.position, s.size, s.collapsed);
+      if (next.size !== s.size) s.setSize(next.size);
+      if (next.position !== s.position) s.setPosition(next.position);
+    };
+    fit();
+    window.addEventListener("resize", fit);
+    return () => window.removeEventListener("resize", fit);
+  }, [isOpen, collapsed, position, size]);
+
   // Auto-scroll to bottom when messages change
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Build context prefix for messages
-  const buildContextPrefix = useCallback(() => {
-    if (!pageContext || pageContext.page === "Chat" || pageContext.page === "Unknown") {
-      return "";
+  const handleAttachImage = useCallback(async (file) => {
+    if (!file || !file.type?.startsWith("image/")) return;
+    try {
+      const resized = await downscaleChatAttachment(file);
+      setAttachment({
+        file: resized.file,
+        preview: resized.preview,
+        byteLength: resized.byteLength,
+        mimeType: resized.mimeType,
+      });
+      clearError();
+    } catch (err) {
+      setError(err?.message || "Could not prepare this image");
     }
-    let prefix = `[Context: User is viewing the ${pageContext.page} page`;
-    if (pageContext.entityType && pageContext.entityId) {
-      prefix += `, ${pageContext.entityType} ID: ${pageContext.entityId}`;
-    }
-    prefix += "]\n\n";
-    return prefix;
-  }, [pageContext]);
+  }, [clearError, setError]);
 
   // Send message handler — uses UnifiedChatService (Socket.IO streaming)
   const handleSendMessage = useCallback(async (overrideText) => {
     const text = overrideText || inputText;
-    if (!text.trim() || isSending) return;
+    const pending = attachment;
+    if ((!text.trim() && !pending) || isSending) return;
+
+    if (pending && attachmentExceedsLimit(pending.byteLength, attachmentMaxBytes)) {
+      setError(refuseAttachmentMessage(pending.byteLength, attachmentMaxBytes));
+      return;
+    }
 
     pushHistory(text);
 
+    const content = text.trim() || (pending ? `Describe this image: ${pending.file.name}` : "");
     const userMessage = {
       id: `user_${Date.now()}`,
       role: "user",
-      content: text,
+      content,
+      imageUrl: pending?.preview,
+      imageFileName: pending?.file?.name,
       timestamp: new Date().toISOString(),
     };
     addMessage(userMessage);
     if (!overrideText) setInputText("");
+    setAttachment(null);
 
     setIsSending(true);
     clearError();
 
-    const contextPrefix = buildContextPrefix();
-    const messageToSend = contextPrefix + text;
+    const imageBase64 = pending?.preview?.includes(",")
+      ? pending.preview.split(",")[1]
+      : null;
 
     if (unifiedChatService) {
       // Primary path: Socket.IO streaming via UnifiedChatService
       setIsStreamingMessage(true);
 
       try {
-        await unifiedChatService.sendMessage(sessionId, messageToSend, {
+        // Page awareness travels as an option so the engine's context providers
+        // can render it — keeping the saved message text exactly what was typed.
+        await unifiedChatService.sendMessage(sessionId, content, {
           use_rag: true,
-        });
+          page_context: pageContext,
+        }, imageBase64);
       } catch (err) {
         console.error("FloatingChat: Unified send failed:", err);
         setIsStreamingMessage(false);
@@ -290,7 +388,19 @@ const FloatingChatCard = () => {
       });
       setError(errorText);
     }
-  }, [inputText, isSending, sessionId, buildContextPrefix, addMessage, setIsSending, clearError, setError, unifiedChatService, pushHistory]);
+  }, [inputText, attachment, attachmentMaxBytes, isSending, sessionId, pageContext, addMessage, setIsSending, clearError, setError, unifiedChatService, pushHistory]);
+
+  // The input is disabled while a reply streams, which makes the browser drop
+  // focus. Restore it when sending finishes so the user can keep typing without
+  // clicking back into the field. Because this card floats over other pages,
+  // only reclaim focus if nothing else on the page has taken it meanwhile.
+  useEffect(() => {
+    if (isSending || !isOpen) return;
+    const active = document.activeElement;
+    const focusIsFree =
+      !active || active === document.body || cardRef.current?.contains(active);
+    if (focusIsFree) inputRef.current?.focus();
+  }, [isSending, isOpen]);
 
   // Slash command hook — popup state, filtering, keyboard nav, command execution
   // Initialized after handleSendMessage so the reference is valid
@@ -313,12 +423,15 @@ const FloatingChatCard = () => {
     setIsStreamingMessage(false);
     setIsSending(false);
 
-    if (result.content) {
+    if (result.content || result.thinking) {
       addMessage({
         id: `asst_unified_${Date.now()}`,
         role: "assistant",
-        content: result.content,
+        content: result.content || "",
         toolCalls: result.toolCalls || [],
+        thinking: result.thinking || "",
+        truncated: result.truncated === true,
+        synthesized: result.synthesized === true,
         timestamp: new Date().toISOString(),
       });
     }
@@ -344,7 +457,7 @@ const FloatingChatCard = () => {
             .join("\n")
         : "";
       const body = (partial.content || "").trim();
-      const hasAnything = body || stepText || (partial.toolCalls?.length || 0) > 0;
+      const hasAnything = body || stepText || (partial.toolCalls?.length || 0) > 0 || partial.thinking;
       if (hasAnything) {
         const composed = [
           body,
@@ -355,6 +468,8 @@ const FloatingChatCard = () => {
           role: "assistant",
           content: composed || "(stopped before any output)",
           toolCalls: partial.toolCalls || [],
+          thinking: partial.thinking || "",
+          truncated: false,
           timestamp: new Date().toISOString(),
           status: "aborted",
         });
@@ -490,9 +605,11 @@ const FloatingChatCard = () => {
         });
       }
       if (isResizing) {
+        const maxW = window.innerWidth - position.x - VIEWPORT_MARGIN;
+        const maxH = window.innerHeight - position.y - VIEWPORT_MARGIN;
         setSize({
-          w: Math.max(MIN_WIDTH, resizeStart.w + (e.clientX - resizeStart.x)),
-          h: Math.max(MIN_HEIGHT, resizeStart.h + (e.clientY - resizeStart.y)),
+          w: Math.min(Math.max(MIN_WIDTH, resizeStart.w + (e.clientX - resizeStart.x)), maxW),
+          h: Math.min(Math.max(MIN_HEIGHT, resizeStart.h + (e.clientY - resizeStart.y)), maxH),
         });
       }
     };
@@ -508,7 +625,7 @@ const FloatingChatCard = () => {
       document.removeEventListener("mousemove", handleMouseMove);
       document.removeEventListener("mouseup", handleMouseUp);
     };
-  }, [isDragging, isResizing, dragOffset, resizeStart, setPosition, setSize]);
+  }, [isDragging, isResizing, dragOffset, resizeStart, position, size.w, setPosition, setSize]);
 
   const formatTime = (timestamp) => {
     if (!timestamp) return "";
@@ -519,12 +636,7 @@ const FloatingChatCard = () => {
   };
 
   // Page context chip label
-  const contextLabel =
-    pageContext && pageContext.page !== "Unknown" && pageContext.page !== "Chat"
-      ? pageContext.entityId
-        ? `${pageContext.page} #${pageContext.entityId}`
-        : pageContext.page
-      : null;
+  const contextLabel = contextChipLabel(pageContext, entityLabel);
 
   return (
     <Grow in={isOpen} unmountOnExit mountOnEnter>
@@ -648,60 +760,11 @@ const FloatingChatCard = () => {
 
               <List dense disablePadding>
                 {messages.slice(-15).map((msg) => (
-                  <ListItem
+                  <FloatingChatMessage
                     key={msg.id}
-                    disableGutters
-                    disablePadding
-                    sx={{
-                      flexDirection: "column",
-                      alignItems: msg.role === "user" ? "flex-end" : "flex-start",
-                      py: 0.5,
-                    }}
-                  >
-                    <Box
-                      sx={{
-                        maxWidth: "85%",
-                        bgcolor:
-                          msg.role === "user"
-                            ? "primary.main"
-                            : msg.role === "system"
-                            ? "error.dark"
-                            : theme.palette.mode === "dark"
-                            ? "rgba(255,255,255,0.06)"
-                            : "rgba(0,0,0,0.04)",
-                        color:
-                          msg.role === "user" || msg.role === "system"
-                            ? "#fff"
-                            : "text.primary",
-                        borderRadius: msg.role === "user" ? "12px 12px 2px 12px" : "12px 12px 12px 2px",
-                        px: 1.5,
-                        py: 0.75,
-                      }}
-                    >
-                      <Typography
-                        variant="body2"
-                        sx={{
-                          fontSize: "0.82rem",
-                          wordBreak: "break-word",
-                          whiteSpace: "pre-wrap",
-                          lineHeight: 1.5,
-                        }}
-                      >
-                        {msg.content || ""}
-                      </Typography>
-                    </Box>
-                    <Typography
-                      variant="caption"
-                      sx={{
-                        fontSize: "0.65rem",
-                        color: "text.disabled",
-                        mt: 0.25,
-                        px: 0.5,
-                      }}
-                    >
-                      {formatTime(msg.timestamp)}
-                    </Typography>
-                  </ListItem>
+                    message={msg}
+                    formatTime={formatTime}
+                  />
                 ))}
               </List>
 
@@ -733,6 +796,35 @@ const FloatingChatCard = () => {
               >
                 {error}
               </Typography>
+            )}
+
+            {attachment && (
+              <Box sx={{ display: "flex", alignItems: "center", gap: 1, px: 1.5, pb: 0.5 }}>
+                <Box
+                  component="img"
+                  src={attachment.preview}
+                  alt={attachment.file.name}
+                  sx={{ width: 40, height: 40, objectFit: "cover", borderRadius: 1 }}
+                />
+                <StatusPill
+                  label={formatAttachmentSize(attachment.byteLength)}
+                  tone={attachmentExceedsLimit(attachment.byteLength, attachmentMaxBytes) ? "error" : "neutral"}
+                  tooltip={
+                    attachmentExceedsLimit(attachment.byteLength, attachmentMaxBytes)
+                      ? refuseAttachmentMessage(attachment.byteLength, attachmentMaxBytes)
+                      : "Size after resize, as it will be sent"
+                  }
+                />
+                <IconButton
+                  size="small"
+                  className="floating-chat-btn"
+                  onClick={() => setAttachment(null)}
+                  aria-label="Remove image"
+                  sx={{ p: 0.25 }}
+                >
+                  <CloseIcon sx={{ fontSize: 14 }} />
+                </IconButton>
+              </Box>
             )}
 
             {/* Input */}
@@ -797,6 +889,29 @@ const FloatingChatCard = () => {
                 anchorEl={inputRef?.current}
                 open={slashCmds.popupVisible}
               />
+              <input
+                type="file"
+                hidden
+                ref={fileRef}
+                accept="image/*"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) handleAttachImage(file);
+                  e.target.value = "";
+                }}
+              />
+              <Tooltip title="Attach an image">
+                <IconButton
+                  className="floating-chat-btn"
+                  onClick={() => fileRef.current?.click()}
+                  disabled={isSending}
+                  size="small"
+                  aria-label="Attach an image"
+                  sx={{ p: 0.25, color: "text.secondary" }}
+                >
+                  <AttachFileIcon sx={{ fontSize: 16 }} />
+                </IconButton>
+              </Tooltip>
               <TextField
                 size="small"
                 placeholder="Type your message, paste an image, or use voice..."
@@ -806,6 +921,20 @@ const FloatingChatCard = () => {
                   slashCmds.handleInputChange(e.target.value);
                 }}
                 onKeyDown={handleKeyDown}
+                onPaste={(e) => {
+                  const items = e.clipboardData?.items;
+                  if (!items) return;
+                  for (let i = 0; i < items.length; i += 1) {
+                    if (items[i].type.startsWith("image/")) {
+                      const file = items[i].getAsFile();
+                      if (file) {
+                        handleAttachImage(file);
+                        e.preventDefault();
+                      }
+                      break;
+                    }
+                  }
+                }}
                 disabled={isSending}
                 multiline
                 maxRows={3}
@@ -820,7 +949,7 @@ const FloatingChatCard = () => {
               />
               <IconButton
                 onClick={isSending ? handleStop : handleFloatingSend}
-                disabled={!inputText.trim() && !isSending}
+                disabled={!inputText.trim() && !attachment && !isSending}
                 size="small"
                 color="primary"
               >

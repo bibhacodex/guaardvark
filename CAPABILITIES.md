@@ -11,7 +11,7 @@ This document is the comprehensive reference of everything Guaardvark can do (mo
 - [AI Chat & Conversation](#ai-chat--conversation)
 - [AgentBrain — Three-Tier Routing](#agentbrain--three-tier-routing)
 - [RAG & Document Intelligence](#rag--document-intelligence)
-- [RAG Autoresearch](#rag-autoresearch)
+- [Overnight research (RAG + code + Auto Improve)](#overnight-research-rag--code--auto-improve)
 - [Self-Improvement Engine](#self-improvement-engine)
 - [Lesson Pearls & Memory](#lesson-pearls--memory)
 - [Autonomous Screen Agents](#autonomous-screen-agents)
@@ -31,7 +31,7 @@ This document is the comprehensive reference of everything Guaardvark can do (mo
 - [Multi-Machine Interconnector](#multi-machine-interconnector)
 - [WordPress Integration](#wordpress-integration)
 - [Automation Tools](#automation-tools)
-- [CLI (llx)](#cli-llx)
+- [CLI (guaardvark)](#cli-guaardvark)
 - [Plugin System](#plugin-system)
 - [System Architecture](#system-architecture)
 - [Startup & Operations](#startup--operations)
@@ -106,7 +106,7 @@ A neural router that decides how much work a message deserves before any tools f
 Retrieval-Augmented Generation grounds chat responses in your actual documents.
 
 ### Retrieval Pipeline
-- **Hybrid search** — BM25 keyword matching + vector semantic search, combined for best results
+- **Hybrid search** — Postgres full-text keyword matching + vector semantic search, combined for best results
 - **Per-project indexes** — each project maintains its own vector store; global index for unassigned documents
 - **Content-aware chunking** — code files use AST-informed strategies; prose uses semantic splitting
 - **Entity extraction** — automatic identification of entities (people, orgs, concepts) and their relationships
@@ -126,21 +126,22 @@ Retrieval-Augmented Generation grounds chat responses in your actual documents.
 
 ---
 
-## RAG Autoresearch
+## Overnight research (RAG + code + Auto Improve)
 
-An autonomous optimization loop that continuously improves RAG retrieval quality.
+One director, three hands, one morning report. Default mode is **unified**.
 
-### How It Works
-1. **Eval harness** — generates evaluation pairs (query + expected answer) and scores retrieval with LLM-as-judge (relevance, grounding, completeness)
-2. **Experiment agent** — proposes parameter changes (chunk size, overlap, top-k, similarity threshold)
-3. **Orchestrator** — runs experiments, compares scores, keeps improvements, reverts regressions
-4. **Phase system** — Phase 1 (query-time params), Phase 2 (index-time params), Phase 3 (model-level)
+### Hands
+1. **Retrieval (RAG Autoresearch)** — two-fidelity eval (retrieval screen → judge subset → full confirmation), TPE-lite then LLM then random, keep bar `0.05` or retrieval-up-without-drop. Candidates activate only after run-end A/B.
+2. **Code-tuning** — swarm arms in isolated worktrees. Fitness is the RAG eval harness plus pytest (preserve-and-extend). Keeps become PendingFixes. **Never auto-merges to main.** Requires Auto Improve enabled and codebase unlocked; skipped (not a failed night) if swarm is down or the lock is on.
+3. **Auto Improve** — analysis-only pytest snapshot at diagnose. Apply is never invoked by the director.
 
-### Features
-- **Celery Beat scheduling** — idle detection triggers experiments when system isn't busy
-- **Crash protection** — 3 consecutive failures automatically stops the loop
-- **Dashboard card** — shows experiment status, history, and current optimization parameters
-- **Settings integration** — configure experiment limits, scoring thresholds, and scheduling
+### Allocation
+If query-time params have not plateaued: ~70% wall-clock RAG, 30% code. If plateaued: 30/70. Code half skipped with a reason when lock/SI/swarm block it.
+
+### Surfaces
+- Autoresearch page: Unified / Retrieval / Code, Stop, eval-pair regenerate, promotions, code-keep PendingFixes, ledger TSV
+- Dashboard Play starts a bounded unified run
+- Beat: at most one unified run per night inside `autoresearch_nightly_window` (opt-in)
 
 ---
 
@@ -266,11 +267,12 @@ A ReACT-loop agent that can autonomously work with code and the system.
 
 Guaardvark speaks Model Context Protocol — both as a server (exposing its tools to external clients) and as a client (calling tools from external MCP servers).
 
-### MCP Server (Phase 1)
-- **Stdio transport** — `backend/mcp/` runs an MCP server that any MCP-compatible client (Claude Desktop, Cursor, etc.) can connect to
-- **23 native tools exposed** — covers chat, RAG, file management, image generation, agent control
-- **58 output resources** — file contents, generated images, search results, etc., available via MCP's resource protocol
-- **Tested against Claude Desktop** — works end-to-end
+### MCP Server
+- **Stdio + streamable HTTP transports** — `python -m backend.mcp` (stdio, what clients spawn) or `python -m backend.mcp http` (loopback-only by default; no auth yet)
+- **One-command client setup** — `python -m backend.mcp install` writes the server entry into the configs of detected clients (Cursor, Claude Code, Grok, Claude Desktop, Zed, Gemini); `python -m backend.mcp doctor` self-tests the server and flags stale client configs
+- **43 native tools exposed under the default-deny policy** (of 87 registered) — covers chat, RAG, code intelligence, file management, generation, memory, web; `python -m backend.mcp list-tools` prints the live list
+- **Read-only output resources** — generated files under `data/outputs/` served as `guaardvark://outputs/...` (listing capped at 500 entries)
+- **Verified end-to-end** — smoke tests drive a real initialize/tools-list handshake over stdio
 
 ### MCP Client
 - **`mcp_connect` tool** — register external MCP servers at runtime
@@ -303,10 +305,14 @@ Full video generation pipeline running locally via ComfyUI with multiple model b
 - **CogVideoX 5B I2V** — image-to-video variant that animates a still image with text-guided motion
 - **LTX-2.3 Distilled FP8** — Lightricks LTX-2.3 for longer clips (~10s) on 16GB Ada; requires ComfyUI
 - **LTX-2.5 Distilled Int8** — Lightricks LTX-2.5 distilled (Gemma 4 + two-stage upsample) for ~10s clips on 16GB Ada; gated Hugging Face accept + ComfyUI ≥ 0.32.0; local weights only (no Partner Nodes / LTX Desktop)
+- **HunyuanVideo 13B T2V / I2V** (GGUF Q5) — Tencent HunyuanVideo, 24fps, ~3s clips, LLaVA encoder on CPU on 16GB cards
+- **MiniMax H3** (pruned Int8, 16GB; unpruned Int8 and BF16 rungs for 24GB and 48GB cards) — omni-modal: picture and native 32 kHz stereo audio in one pass (dialogue in 11 languages with lip sync, ambience, score), 24fps, 3–15s. Modes: text, first frame, last frame, first+last frame, and image or audio anchors at any frame. Speed profiles through the vendor's distilled LoRAs (8-step, 4-step at 768p). Ten style embeddings. Prompts are compiled into the model's structured format by `backend/services/h3_prompt_compiler.py`. Community license with territory terms shown in the Video Models modal.
+- **MiniMax H3 Reference** — the same model's reference build: up to 9 images, 3 clips and 3 audio files lock identity, motion, camera and voice, or edit and continue a clip; shares the encoder, VAEs and embeddings.
 
 #### Generation Modes
 - **Text-to-Video** — describe a scene in natural language and generate video from scratch
 - **Image-to-Video** — upload a reference image and animate it with motion direction prompts
+- **First + last frame, audio anchors, references** — on models that declare them (MiniMax H3): an end frame the clip lands on, a TTS line or song slice the model performs from a chosen frame, and reference images, clips and audio on the reference build. Every model declares its capabilities in `backend/services/video_model_registry.py`; the Video Generator, the chat tool `generate_video`, Film Crew and the music video pipeline read them instead of assuming a family.
 - **Batch generation** — queue multiple prompts via an in-process worker (one batch at a time; stage-level progress over WebSocket + HTTP poll)
 
 #### Quality Tiers (Post-Processing)
@@ -326,7 +332,7 @@ Full video generation pipeline running locally via ComfyUI with multiple model b
 - No LLM calls required — pure string concatenation for instant enhancement
 
 #### Video UI
-- **Preset-driven interface** — quality presets (Fast 10-step / Standard 30-step / High 40-step / Maximum 50-step), duration presets, motion presets, and aspect ratio presets
+- **Preset-driven interface** — quality presets (Fast at the model's step floor / Standard / High / Maximum), duration presets, motion presets, and aspect ratio presets
 - **Real-time progress** — live progress bar with percentage and step count during generation
 - **Video gallery** — browse, preview, rename, download, and delete generated videos
 - **Advanced Editor** — one-click launch to ComfyUI's full node-based workflow editor, themed with the Guaardvark color scheme
@@ -461,6 +467,17 @@ Five-agent swarm for coordinated media generation:
 ## GPU Image & Video Upscaling
 
 Dedicated upscaling plugin for sharpening generated content to 4K/8K.
+
+| Model | Scale | Size | Best For |
+|-------|-------|------|----------|
+| HAT-L SRx4 | 4x | 159 MB | Maximum quality restoration |
+| RealESRGAN x4plus | 4x | 64 MB | General-purpose, photorealistic |
+| RealESRGAN x2plus | 2x | 64 MB | Mild upscaling |
+| RealESRGAN x4plus (Anime) | 4x | 17 MB | Anime and stylized content |
+| realesr-animevideov3 | 4x | 6 MB | Video-optimized anime |
+| 4x-UltraSharp | 4x | 67 MB | Enhanced sharpness |
+| 4x NMKD-Superscale | 4x | 67 MB | Advanced super-scaling |
+| 4x Foolhardy Remacri | 4x | 67 MB | Texture-focused upscaling |
 
 ### Models
 - **Real-ESRGAN 2x / 4x** — proven anime/photo upscaler
@@ -659,29 +676,38 @@ GUAARDVARK_AGENT_BROWSER=firefox     # Override agent's browser
 
 ---
 
-## CLI (llx)
+## CLI (guaardvark)
 
-Full platform access from the terminal.
+Full platform access from the terminal. Command is `guaardvark` (`llx` is a deprecated alias).
 
 ### Installation
 ```bash
 cd cli && pip install -e .
-llx init
+guaardvark setup
 ```
 
 ### Commands
 ```bash
-llx status                      # System dashboard
-llx chat "explain this codebase" # Chat with RAG streaming
-llx chat --no-rag "hello"       # Direct LLM, no document context
-llx search "query"              # Semantic search across documents
-llx files list                  # Browse files
-llx files upload report.pdf     # Upload and index a file
-llx generate csv "50 ideas"     # Bulk content generation
-llx jobs watch JOB_ID           # Live job progress
-llx rules list                  # List system prompts
-llx                             # Interactive REPL
+guaardvark                          # Interactive REPL
+guaardvark status                   # System dashboard
+guaardvark chat "explain this codebase"
+guaardvark search "query"
+guaardvark files upload report.pdf
+guaardvark plugins list|start|stop
+guaardvark gpu status|release
+guaardvark mcp install --client cursor
+guaardvark audio tts "hello"
+guaardvark swarm run "fix the tests"
+guaardvark lessons begin
+guaardvark completion zsh
+guaardvark doctor --cli
 ```
+
+### REPL
+- Theme-aware prompt (`/theme`, including `day` and `auto`); compact banner on short terminals
+- Tab completion with or without `/`; `/help [query]`; “Did you mean…?”
+- `/imagine` inline preview (Kitty / iTerm / chafa); `/voice` local playback; `/agent shot`
+- Config: `~/.guaardvark/cli.json` (legacy `~/.llx/config.json` still read)
 
 ### Quality Roadmap (v2.5.3)
 - **Standardized JSON contracts** for all automation outputs

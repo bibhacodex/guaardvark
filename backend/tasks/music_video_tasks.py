@@ -12,7 +12,9 @@ The generating stage is special: it self-re-dispatches ONE clip per invocation
 crash-resumes per-clip, and lets other queued work interleave between clips.
 """
 import logging
+import json
 import os
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -37,6 +39,8 @@ PLUGIN_URL = "http://127.0.0.1:8207"   # video_editor plugin (analyze + assemble
 # tail-call hits "GPU cooling down" immediately. Also the retry delay for transient
 # GPU-busy / plugin-cooldown conditions.
 GPU_COOLDOWN_RETRY_S = 12
+# Longest a single clip may keep deferring on GPU-busy / plugin-unavailable before the stage fails.
+CLIP_DEFER_MAX_S = int(os.environ.get("GUAARDVARK_MV_CLIP_DEFER_MAX_S", str(3 * 3600)))
 
 
 def _settings(mv: MusicVideo) -> dict:
@@ -67,8 +71,13 @@ def _settings(mv: MusicVideo) -> dict:
     # Wan 2.2 I2V is generally the highest quality motion option available for the
     # storyboard → i2v flow.
     if not s.get("i2v_model"):
-        engine = s.get("i2v_engine", "wan")
-        s["i2v_model"] = "wan22-14b-i2v" if engine == "wan" else "cogvideox-5b-i2v"
+        engine = (s.get("i2v_engine") or "").strip().lower()
+        if engine in ("cogvideox", "cog", "svd"):
+            s["i2v_model"] = "cogvideox-5b-i2v"
+        else:
+            from backend.services.video_model_registry import resolve_active_video_model, DEFAULT_I2V_MODEL
+            picked, _err = resolve_active_video_model("i2v", surface="music-video")
+            s["i2v_model"] = picked or DEFAULT_I2V_MODEL
     s.setdefault("i2v_engine", "wan")  # keep for _max_clip_s etc.
     # Keyframe model — enforce the identity-lock invariant in the BACKEND, not just
     # as a fragile frontend onChange (MusicVideoPage promotes it on the consistency
@@ -155,13 +164,45 @@ def _settings(mv: MusicVideo) -> dict:
     return s
 
 
-def _max_clip_s(s: dict) -> float:
-    """Longest real forward clip the chosen i2v engine produces, in seconds.
+# Per-family clip clamps the i2v step has always used for the storyboard →
+# I2V flow (frames, fps); models that declare native_fps / max_frames in the
+# registry override them.
+_LEGACY_CLIP = {"wan": (17, 49, 16), "cogvideox": (14, 25, 7)}
 
-    Derived from the frame clamp in _generate_one_clip: WAN ≤49 frames @16fps,
-    CogVideoX ≤25 frames @7fps. The planner uses this × max_stretch as its cut
-    ceiling so a forward clip can always fill its slot without a reverse."""
-    return (49 / 16) if s.get("i2v_engine", "wan") == "wan" else (25 / 7)
+
+def _clip_profile(s: dict) -> dict:
+    """{min_frames, max_frames, fps, audio_out, model} for the chosen i2v model.
+
+    A model that declares its capabilities in the registry (native_fps,
+    max_frames, min_clip_s, max_clip_s, audio_out) is described from them; the
+    Wan and CogVideoX clamps stay for entries that do not."""
+    from backend.services.video_model_registry import model_capabilities, DEFAULT_I2V_MODEL
+    model = s.get("i2v_model") or DEFAULT_I2V_MODEL
+    caps = {}
+    try:
+        caps = model_capabilities(model) or {}
+    except Exception:  # noqa: BLE001 — the legacy clamps still apply
+        caps = {}
+    if caps.get("native_fps") and caps.get("max_frames"):
+        fps = int(caps["native_fps"])
+        min_frames = int(round(float(caps.get("min_clip_s") or 0) * fps)) or 5
+        return {
+            "model": model, "fps": fps, "min_frames": min_frames,
+            "max_frames": int(caps["max_frames"]), "audio_out": bool(caps.get("audio_out")),
+            "frame_rule": caps.get("frame_rule"),
+        }
+    lo, hi, fps = _LEGACY_CLIP["wan" if "wan" in model.lower() else "cogvideox"]
+    return {"model": model, "fps": fps, "min_frames": lo, "max_frames": hi, "audio_out": False, "frame_rule": None}
+
+
+def _max_clip_s(s: dict) -> float:
+    """Longest real forward clip the chosen i2v model produces, in seconds.
+
+    The planner uses this × max_stretch as its cut ceiling so a forward clip
+    can always fill its slot without a reverse. A native-audio model (MiniMax
+    H3) renders the whole cut in one pass, so its ceiling is its longest clip."""
+    prof = _clip_profile(s)
+    return prof["max_frames"] / prof["fps"]
 
 
 # Fraction of the full Clip Stretch budget applied to the *shortest* (highest-energy) cuts.
@@ -208,10 +249,34 @@ def _clip_dir(mv_id: int) -> Path:
     try:
         from backend.config import OUTPUT_DIR
     except Exception:
-        OUTPUT_DIR = os.path.join(os.getcwd(), "data", "outputs")
+        OUTPUT_DIR = str(Path(__file__).resolve().parents[2] / "data" / "outputs")
     d = Path(OUTPUT_DIR) / "videos" / f"music_video_{mv_id}" / "clips"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _song_lyrics_guidance(mv: MusicVideo) -> str | None:
+    """The song's lyrics as thematic direction for the director, when the
+    song was generated here and its Document carries them (ACE-Step and
+    MiniMax Music 3 write the same keys). The shots must never quote them:
+    the model would render the words as text."""
+    if not mv.song_document_id:
+        return None
+    try:
+        doc = db.session.get(Document, mv.song_document_id)
+        meta = doc.file_metadata if doc else None
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+        lyrics = (meta or {}).get("lyrics") or ""
+    except Exception:  # noqa: BLE001 — lyrics are a bonus, never a blocker
+        return None
+    lyrics = " ".join(str(lyrics).split())
+    if not lyrics:
+        return None
+    return (
+        "LYRICS of the song, as thematic source only (never quote them, never show text; "
+        f"use them for subject, mood and story arc): {lyrics[:1500]}"
+    )
 
 
 def _resolve_song_path(mv: MusicVideo) -> str | None:
@@ -452,6 +517,9 @@ def run_analyzer(mv_id: int):
             # BYTE-IDENTICAL migration of the fragile MV path (still temp 0.7/0.65). We can flip
             # MV to the CREATIVE profile later as a separate, tested change.
             from backend.services.director_service import plan as director_plan, DirectorBrief, DirectorMode
+            _lyrics_note = _song_lyrics_guidance(mv)
+            if _lyrics_note:
+                _dir_guidance = f"{_dir_guidance}\n{_lyrics_note}" if _dir_guidance else _lyrics_note
             _res = director_plan(DirectorBrief(
                 mode=DirectorMode.SONG_CUTPLAN,
                 style=mv.style_prompt,
@@ -515,7 +583,13 @@ def run_analyzer(mv_id: int):
             sp = shot_plans.get(idx, {})
             # Prefer the unique visual prompt from the detailed shot plan (produced by the Director from the treatment)
             # over the flat prompts list. This ensures we get the per-cut variation the model was instructed to create.
+            # The Director is told the caller appends the global style, so do it here; the flat
+            # `prompts` list already carries it from _ensure_distinct_and_energy_aware.
             shot_prompt = sp.get("prompt") or (prompts[idx] if idx < len(prompts) else mv.style_prompt)
+            if sp.get("prompt") and mv.style_prompt:
+                style_suffix = f", {mv.style_prompt}" if not mv.style_prompt.startswith(",") else mv.style_prompt
+                if not shot_prompt.rstrip().endswith(style_suffix.strip()):
+                    shot_prompt = f"{shot_prompt.rstrip().rstrip(',')}{style_suffix}"
             clip = {
                 "index": idx,
                 "start": c["start_s"],
@@ -576,12 +650,37 @@ def run_clip_generator(mv_id: int):
         _generate_one_clip(mv, target)
     except (GpuBusyError, PluginUnavailable) as e:
         # TRANSIENT — the GPU gate is cooling down / busy, or the plugin is still
-        # coming up. Do NOT fail the stage; re-dispatch this same clip after the
-        # cooldown clears. The clip is still pending, so we resume exactly here.
+        # coming up. Re-dispatch this same clip after the cooldown clears, but
+        # only for so long: a disabled plugin or a model that never fits would
+        # otherwise re-dispatch every 12 s forever.
+        since = float(target.get("deferred_since") or 0) or time.time()
+        if time.time() - since > CLIP_DEFER_MAX_S:
+            log.error("music_video %s clip %s could not start within %ss: %s",
+                      mv_id, target.get("index"), CLIP_DEFER_MAX_S, e)
+            MusicVideoService(db.session).fail_stage(
+                mv_id, stage="generating",
+                error=f"clip {target.get('index')} waited {int(CLIP_DEFER_MAX_S // 60)} min for the GPU/plugin: {e}",
+            )
+            return
+        target["deferred_since"] = since
+        mv.clips = clips
+        db.session.commit()
         log.info("music_video %s clip %s deferred (transient): %s", mv_id, target.get("index"), e)
         celery.send_task("music_video.run_clip_generator", args=[mv_id], countdown=GPU_COOLDOWN_RETRY_S)
         return
     except Exception as e:  # noqa: BLE001
+        err = str(e)
+        if "execution_interrupted" in err.lower() and not (mv.status or "").startswith("cancelled"):
+            log.warning("music_video %s clip %s interrupted; marking clip failed and continuing",
+                        mv_id, target.get("index"))
+            target["status"] = "failed"
+            target["error"] = err
+            mv.clips = list(clips)
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(mv, "clips")
+            db.session.commit()
+            celery.send_task("music_video.run_clip_generator", args=[mv_id], countdown=GPU_COOLDOWN_RETRY_S)
+            return
         log.exception("music_video %s clip %s generation failed", mv_id, target.get("index"))
         MusicVideoService(db.session).fail_stage(mv_id, stage="generating", error=str(e))
         return
@@ -662,17 +761,20 @@ def _generate_one_clip(mv: MusicVideo, clip: dict):
     # so users can pick via GUI (similar to VideoGeneratorPage). The still (keyframe)
     # is generated first (SDXL path when LoRA consistency is on), then fed to the chosen I2V.
     # Wan 2.2 I2V is preferred for quality when the user has the GPU budget.
-    i2v_model = s.get("i2v_model", "wan22-14b-i2v")
-    if "wan" in i2v_model.lower():
-        # Wan 2.2 14B (A14B) is a 16fps model — matches the engine's own default
-        # (comfyui_video_generator._create_wan22_i2v_workflow fps=16) and the
-        # VideoGeneratorPage. The old 24 here (the 5B TI2V rate) tagged the same
-        # frames 1.5x fast, so motion played sped-up vs the VideoGen page.
-        i2v_fps = 16
-        frames = max(17, min(49, int(round(motion_len_s * i2v_fps)) or 25))
-    else:
-        i2v_fps = 7
-        frames = max(14, min(25, int(round(motion_len_s * i2v_fps)) or 25))
+    prof = _clip_profile(s)
+    i2v_model = prof["model"]
+    # The model's own rate: Wan 2.2 14B is a 16fps model, CogVideoX 7fps, a
+    # registry model whatever it declares. Tagging frames at the wrong rate
+    # played motion sped-up or slowed against the Video Generator page.
+    i2v_fps = prof["fps"]
+    native_audio = prof["audio_out"]
+    if native_audio:
+        # The model renders picture and sound for the whole cut in one pass, so
+        # the motion length is the cut itself (capped at its longest clip); the
+        # fill step then trims to the slot and keeps the song as the master
+        # track. The song slice anchors the clip so its motion lands on the beat.
+        motion_len_s = min(base_slot_s, prof["max_frames"] / i2v_fps)
+    frames = max(prof["min_frames"], min(prof["max_frames"], int(round(motion_len_s * i2v_fps)) or prof["max_frames"]))
 
     # If the user has already curated storyboards (via the "thumbnails first" review
     # flow), reuse the reviewed storyboard image as the init for i2v instead of
@@ -782,6 +884,28 @@ def _generate_one_clip(mv: MusicVideo, clip: dict):
                 },
                 interpolation_multiplier=int(s["interpolation_multiplier"]),
             )
+            if native_audio:
+                # Native-audio path: the director's shot becomes the model's
+                # structured prompt and the song slice for this cut is anchored
+                # at frame 0 so the generated motion follows its beats. The
+                # clip's own soundtrack is dropped by the fill step; the song
+                # stays the master track.
+                from backend.services import h3_prompt_compiler as h3
+                song_path = _resolve_song_path(mv)
+                intent = h3.intent_from_cut(
+                    {"start_s": float(clip["start"]), "end_s": float(clip["end"])},
+                    clip_prompt, song_audio_index=1, style=s.get("prompt_style") or "cinematic",
+                )
+                compiled, diag = h3.compile(intent)
+                req_kwargs["prompt"] = compiled
+                req_kwargs["h3_intent"] = h3.intent_to_dict(intent)
+                req_kwargs["duration_frames"] = diag["frames"]
+                req_kwargs["interpolation_multiplier"] = 1
+                if song_path and os.path.exists(song_path):
+                    req_kwargs["guides"] = [{
+                        "kind": "audio", "path": song_path, "frame_idx": 0,
+                        "seek_s": float(clip["start"]), "duration_s": base_slot_s,
+                    }]
             if s.get("i2v_steps"):
                 req_kwargs["num_inference_steps"] = int(s["i2v_steps"])
             req = VideoGenerationRequest(**req_kwargs)
@@ -795,13 +919,9 @@ def _generate_one_clip(mv: MusicVideo, clip: dict):
                 raise RuntimeError("ComfyUI unavailable for music-video i2v clip render.")
             result = vg.generate_video(req)
             if not result.success or not result.video_path:
-                err = result.error or "no video produced"
-                if any(kw in (err or "").lower() for kw in ("oom", "out of memory", "cuda")):
-                    raise RuntimeError(
-                        f"{i2v_model} i2v OOM ({err}). Reduce i2v_steps/resolution, ensure VRAM free "
-                        "(Comfy /free), or lower interpolation. See media team audit for preflight."
-                    )
-                raise RuntimeError(f"{i2v_model} i2v failed: {err}")
+                from backend.services.job_types import RenderErrorKind, render_failed
+                raise RuntimeError(render_failed(
+                    f"{i2v_model} i2v", result.error_kind or (RenderErrorKind.OUTPUT_MISSING if result.success else None), result.error))
             wan_abs = resolve_generated_video_path(result, out_dir)
             if not wan_abs.exists():
                 raise RuntimeError(f"WAN output not found at resolved path: {wan_abs}")

@@ -58,6 +58,48 @@ class GpuBusyError(Exception):
     caller can surface it (UI banner) or fail the stage cleanly."""
 
 
+class GpuCapacityError(GpuBusyError):
+    """The estimate can never fit this card; retrying will not help."""
+
+
+class GpuOOMError(RuntimeError):
+    """CUDA/MPS ran out of memory during a render."""
+
+
+def is_cuda_oom(exc: BaseException) -> bool:
+    """True for torch/MPS out-of-memory errors, by type name or message."""
+    if type(exc).__name__ == "OutOfMemoryError" or isinstance(exc, GpuOOMError):
+        return True
+    msg = (str(exc) or "").lower()
+    return (
+        "out of memory" in msg
+        and any(k in msg for k in ("cuda", "cublas", "cudnn", "mps"))
+    ) or "cuda out of memory" in msg
+
+
+def classify_render_exception(exc: BaseException):
+    """The RenderErrorKind for an exception raised while a render runs in this
+    process: a GPU refusal, an OOM, ComfyUI unreachable, else UNKNOWN."""
+    from backend.services.job_types import RenderErrorKind, failure_kind
+
+    carried = failure_kind(exc) or next((failure_kind(a) for a in getattr(exc, "args", ()) if failure_kind(a)), None)
+    if carried:
+        return carried
+    if isinstance(exc, GpuCapacityError):
+        return RenderErrorKind.CARD_TOO_SMALL
+    if isinstance(exc, GpuBusyError):
+        return RenderErrorKind.VRAM_BUSY
+    if is_cuda_oom(exc):
+        return RenderErrorKind.OOM
+    try:
+        import requests
+        if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+            return RenderErrorKind.COMFYUI_DOWN
+    except ImportError:  # pragma: no cover - requests is a backend dependency
+        pass
+    return RenderErrorKind.UNKNOWN
+
+
 class JobOperationGate:
     """Thread-safe gate coordinating cross-surface job ops.
 
@@ -152,8 +194,14 @@ class JobOperationGate:
             self._in_progress[kind].add(str(native_id))
             return True, "GPU claimed exclusively"
 
-    def release_gpu_exclusive(self, kind: JobKind, native_id: str) -> None:
-        """Release a previously-claimed GPU-exclusive slot. Idempotent."""
+    def release_gpu_exclusive(
+        self, kind: JobKind, native_id: str, *, cooldown: bool = True
+    ) -> None:
+        """Release a previously-claimed GPU-exclusive slot. Idempotent.
+
+        ``cooldown=False`` clears the holder without starting the post-release
+        cooldown — for a claim that was refused before any work touched the card.
+        """
         with self._lock:
             if self._gpu_holder is None:
                 self._in_progress[kind].discard(str(native_id))
@@ -166,7 +214,8 @@ class JobOperationGate:
                 return
             self._gpu_holder = None
             self._holder_thread = None
-            self._gpu_last_released = time.monotonic()
+            if cooldown:
+                self._gpu_last_released = time.monotonic()
             self._in_progress[kind].discard(str(native_id))
 
     # ---- contextmanager ----------------------------------------------------
@@ -179,6 +228,7 @@ class JobOperationGate:
         *,
         on_busy: str = "raise",
         wait_timeout: float = 120.0,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Iterator[bool]:
         """Claim the GPU-exclusive slot for the duration of a ``with`` block.
 
@@ -194,7 +244,9 @@ class JobOperationGate:
           - "wait": poll up to ``wait_timeout`` seconds for the slot to free, then
             claim it — for SERIAL BACKGROUND queues (e.g. batch video) that should
             wait out a transient busy / the 8s post-release cooldown instead of
-            failing the job. Raises GpuBusyError only if it never frees in time.
+            failing the job. Raises GpuBusyError only if it never frees in time,
+            or as soon as ``cancel_event`` is set: a cancelled job must not sit
+            out the rest of the wait in front of the next one.
 
         Yields True when the exclusive slot was acquired, False in the
         degraded ("register") path. Release is idempotent and always runs in
@@ -208,6 +260,9 @@ class JobOperationGate:
             import time as _t
             deadline = _t.monotonic() + max(0.0, wait_timeout)
             while not acquired and _t.monotonic() < deadline:
+                if cancel_event is not None and cancel_event.is_set():
+                    reason = f"cancelled while waiting for the GPU ({reason})"
+                    break
                 _t.sleep(min(1.0, max(0.05, deadline - _t.monotonic())))
                 acquired, reason = self.try_claim_gpu_exclusive(kind, native_id)
             if acquired:

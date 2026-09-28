@@ -62,6 +62,16 @@ def _eprint(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _pick_device() -> str:
+    """CUDA > MPS > cpu. Lets ACE-Step run on Apple Silicon (MPS) as well as NVIDIA."""
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def _respond(payload: dict[str, Any]) -> None:
     """Single JSON line on stdout — terminator is implicit \\n from print."""
     sys.stdout.write(json.dumps(payload) + "\n")
@@ -73,12 +83,26 @@ def _do_load(model_id: str) -> dict[str, Any]:
     if _pipeline is not None:
         return {"ok": True}
 
-    _eprint(f"[run_acestep] loading {model_id} (first run downloads ~10 GB)...")
+    _eprint(f"[run_acestep] loading {model_id} from local cache...")
     import torch
     _torch = torch
 
-    if not torch.cuda.is_available():
-        return {"ok": False, "error": "CUDA not available — ACE-Step requires a GPU"}
+    dev = _pick_device()
+    if dev == "cpu":
+        return {"ok": False, "error": "No GPU (CUDA or MPS) available — ACE-Step requires a GPU"}
+
+    try:
+        from huggingface_hub import snapshot_download
+        local = snapshot_download(model_id, local_files_only=True)
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": (
+                "ACE-Step weights are not on this machine. "
+                "Open Audio Studio → Manage models and Install ACE-Step. "
+                f"({e})"
+            ),
+        }
 
     try:
         from acestep.pipeline_ace_step import ACEStepPipeline
@@ -90,18 +114,18 @@ def _do_load(model_id: str) -> dict[str, Any]:
 
     try:
         _pipeline = ACEStepPipeline(
-            checkpoint_path=model_id,
-            device="cuda",
-            torch_dtype=torch.float16,
+            checkpoint_dir=local,
+            dtype="float16",
         )
     except TypeError:
         # Older ACE-Step releases use a different constructor — be tolerant.
         _pipeline = ACEStepPipeline.from_pretrained(
-            model_id,
+            local,
             torch_dtype=torch.float16,
-        ).to("cuda")
+            local_files_only=True,
+        ).to(dev)
 
-    _eprint(f"[run_acestep] {model_id} loaded (fp16, cuda)")
+    _eprint(f"[run_acestep] {model_id} loaded (fp16, {dev})")
     return {"ok": True}
 
 
@@ -236,7 +260,10 @@ def _do_unload() -> dict[str, Any]:
     del _pipeline
     _pipeline = None
     if _torch is not None:
-        _torch.cuda.empty_cache()
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+        elif hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available():
+            _torch.mps.empty_cache()
     _eprint("[run_acestep] unloaded")
     return {"ok": True}
 

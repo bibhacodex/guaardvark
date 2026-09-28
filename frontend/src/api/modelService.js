@@ -8,9 +8,11 @@ export const getAvailableModels = async () => {
     const data = await handleResponse(response);
     if (typeof data === "object" && data !== null && data.error)
       throw new Error(data.error);
-    // Handle new standardized response format
-    if (data?.success && data?.message?.models) {
-      return Array.isArray(data.message.models) ? data.message.models : [];
+    // Standard envelope: the payload is under data. Older backends put it
+    // under message (the arguments were reversed), so accept both.
+    const payload = data?.data?.models ? data.data : data?.message?.models ? data.message : null;
+    if (data?.success && payload) {
+      return Array.isArray(payload.models) ? payload.models : [];
     }
     // Handle old format for backward compatibility
     return Array.isArray(data?.models) ? data.models : [];
@@ -29,7 +31,7 @@ export const getCurrentModel = async () => {
     const data = await handleResponse(response);
     if (typeof data === "object" && data !== null && data.error)
       throw new Error(data.error);
-    // Handle new standardized response format
+    // Standard envelope with an older-backend fallback (see getAvailableModels).
     if (data?.success && data?.message?.model) {
       return data.message.model;
     }
@@ -67,80 +69,6 @@ export const setModel = async (modelName) => {
     console.error("modelService: Error setting model:", err.message);
     throw err;
   }
-};
-
-// --- Cloud Models (LLM provider: local Ollama vs hosted Mistral) ---
-// Backed by /api/llm/* — GET /llm/provider is the single source of truth.
-// Some endpoints wrap their payload in a `data` envelope; unwrap defensively.
-const unwrapProvider = (data) =>
-  data?.data !== undefined ? data.data : data;
-
-// GET /api/llm/provider -> single source of truth for the Cloud Models UI.
-// { cloud_models_enabled, provider, cloud_active, mistral_model, providers: [...] }
-export const getLlmProvider = async () => {
-  const response = await fetch(`${BASE_URL}/llm/provider`);
-  const data = await handleResponse(response);
-  if (data?.error) throw new Error(data?.error?.message || data.error);
-  return unwrapProvider(data);
-};
-
-// POST /api/llm/cloud-enabled -> master switch. Returns new provider_state.
-export const setCloudModelsEnabled = async (enabled) => {
-  const response = await fetch(`${BASE_URL}/llm/cloud-enabled`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled }),
-  });
-  const data = await handleResponse(response);
-  if (data?.error) throw new Error(data?.error?.message || data.error);
-  return unwrapProvider(data);
-};
-
-// POST /api/llm/provider -> set active chat provider. Returns new provider_state.
-// 400 if cloud disabled or the provider's key is missing.
-export const setLlmProvider = async (provider) => {
-  const response = await fetch(`${BASE_URL}/llm/provider`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ provider }),
-  });
-  const data = await handleResponse(response);
-  if (data?.error) throw new Error(data?.error?.message || data.error);
-  return unwrapProvider(data);
-};
-
-// GET /api/llm/provider/models?provider=mistral -> [{ name, id }]
-export const getProviderModels = async (provider = "mistral") => {
-  const response = await fetch(
-    `${BASE_URL}/llm/provider/models?provider=${encodeURIComponent(provider)}`,
-  );
-  const data = await handleResponse(response);
-  if (data?.error) throw new Error(data?.error?.message || data.error);
-  const unwrapped = unwrapProvider(data);
-  return Array.isArray(unwrapped?.models) ? unwrapped.models : [];
-};
-
-// POST /api/llm/provider/mistral-model -> set active Mistral model.
-export const setMistralModel = async (model) => {
-  const response = await fetch(`${BASE_URL}/llm/provider/mistral-model`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model }),
-  });
-  const data = await handleResponse(response);
-  if (data?.error) throw new Error(data?.error?.message || data.error);
-  return unwrapProvider(data);
-};
-
-// POST /api/llm/provider/test -> live round-trip.
-// { connected, response, model } or an error.
-export const testProviderConnection = async () => {
-  const response = await fetch(`${BASE_URL}/llm/provider/test`, {
-    method: "POST",
-  });
-  const data = await handleResponse(response);
-  if (data?.error) throw new Error(data?.error?.message || data.error);
-  return unwrapProvider(data);
 };
 
 export const getModelStatus = async () => {

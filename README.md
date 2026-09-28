@@ -1,49 +1,94 @@
 <p align="center">
-  <img src="docs/screenshots/og-image.jpg" alt="Guaardvark — Secure Offline AI Platform" width="640">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/media/guaardvark-banner-dark.png">
+    <img src="docs/media/guaardvark-banner-light.png" alt="Guaardvark AI System — www.guaardvark.com" width="480">
+  </picture>
 </p>
+
+<!-- hero-video rotation: swap the bare user-attachments URL below.
+     Asset registry: https://github.com/guaardvark/guaardvark/issues/64
+     batman:    c6d9d18b-cfff-4ae2-8220-dc7f329fee5d
+     bladevark: 158c431c-0ff8-4b25-a1b2-b5fbebdc81d4
+     batvark:   b8f28582-6c1d-45b8-862e-9206a28cf103 -->
+
+<div align="center">
+
+https://github.com/user-attachments/assets/c6d9d18b-cfff-4ae2-8220-dc7f329fee5d
+
+</div>
 
 # Guaardvark
 
-**See the [VERSION](VERSION) file for the current release** · [guaardvark.com](https://guaardvark.com)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/guaardvark/guaardvark/actions/workflows/ci.yml/badge.svg)](https://github.com/guaardvark/guaardvark/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/guaardvark?label=PyPI&color=blue)](https://pypi.org/project/guaardvark/)
+[![Glama](https://glama.ai/mcp/servers/guaardvark/guaardvark/badges/score.svg)](https://glama.ai/mcp/servers/guaardvark/guaardvark)
+[![GitHub stars](https://img.shields.io/github/stars/guaardvark/guaardvark?style=social)](https://github.com/guaardvark/guaardvark/stargazers)
+[![GitHub issues](https://img.shields.io/github/issues/guaardvark/guaardvark)](https://github.com/guaardvark/guaardvark/issues)
+[![Sponsor](https://img.shields.io/badge/Sponsor-Guaardvark-ff69b4?logo=github-sponsors)](https://github.com/sponsors/guaardvark)
 
-The self-hosted, offline-first AI workstation. Autonomous agents that see a real virtual desktop and control apps. A three-tier neural router (AgentBrain). Parallel coding agent swarms in isolated git worktrees. Local video (Wan 2.2, CogVideoX), 4K/8K upscaling, full-song music + neural voice, RAG over your documents, voice chat, and a 70+ tool engine — everything on your hardware. Your machine. Your data. Your rules.
+**The self-hosted AI studio.** Coding agents and 20-agent swarms in isolated git worktrees, screen agents with their own real desktop, self-tuning RAG, continuous voice chat — and a full media pipeline: video, image, full-song music, neural voice. One install, one GPU, everything on your machine. Your machine. Your data. Your rules.
 
-**Install with one command:**
+**Works with your coding agent.** Claude Code, Cursor, Codex, OpenClaw and Gemini CLI drive every flow above through the built-in MCP server and fifteen [agent skills](.agents/skills/README.md): "make a music video from this song", "film this script", "train a LoRA of this character", "swarm this refactor" — the agent queues the job on your GPU and polls it to the finished file.
+
+**Runs on Linux with one NVIDIA card** (16 GB for video). Apple Silicon is supported with GPU features arriving through Metal (what works today is in [INSTALL.md](INSTALL.md#install-macos-apple-silicon)); Windows through WSL2 is being verified.
+
+**Install** (one command, then open the Studio):
 
 ```bash
 curl -fsSL https://guaardvark.com/install.sh | bash
 ```
 
-See [Quick Start](#quick-start) for details and manual install options.
+**Add it to Claude Code** (two lines, no clone):
+
+```
+/plugin marketplace add guaardvark/guaardvark
+/plugin install guaardvark@guaardvark
+```
+
+**See the [VERSION](VERSION) file for the current release** · [guaardvark.com](https://guaardvark.com) · [Quick Start](#quick-start) for manual install options.
 
 > **For the exhaustive feature list, models, surfaces, and plugin details, see [CAPABILITIES.md](CAPABILITIES.md).** This README focuses on the marquee experience, quick start, and what makes Guaardvark different.
 
-## ▶ Watch Guaardvark build a music video — end to end, on one local GPU
+## What's in the box
 
-<p align="center">
-  <a href="https://www.youtube.com/shorts/rh0LJRK_jAM">
-    <img src="docs/screenshots/music-video-hero.jpg" alt="Watch: Guaardvark generates a beat-synced music video end-to-end (real frame from the demo)" width="440">
-  </a>
-</p>
+| | | See it |
+|---|---|---|
+| **Media studio** | 11 local video models across five families (Wan 2.2, CogVideoX, LTX, HunyuanVideo, MiniMax H3 with native audio), image generation, full-song music, neural voice with consent-gated cloning, 4K/8K upscaling | Eps [5](https://www.youtube.com/watch?v=s9I_0gD9Iko) · [6](https://www.youtube.com/watch?v=9rae9IJhXow) · [7](https://www.youtube.com/watch?v=BXlm7p-SxtU) |
+| **Directors** | A beat-synced music-video director, a 5-role Film Crew, an auto-editing video editor — and the walkthrough director that produced this README's own video series | Eps [8](https://www.youtube.com/watch?v=l2LqKA9GQDc) · [9](https://www.youtube.com/watch?v=sq104u9N4Qg) |
+| **Coding agent & code intelligence** | Monaco editor, AST-aware analysis and dependency graphs, System Mapper: a live constellation of the whole codebase | Ep [14](https://www.youtube.com/watch?v=yEy1tVKxsF0) |
+| **Agent swarms** | Up to 20 parallel coding agents in isolated git worktrees with dependency-aware merging; fully-local backend via Ollama | [CAPABILITIES.md](CAPABILITIES.md) |
+| **Screen agents** | A real Ubuntu/XFCE desktop of their own, vision + closed-loop servo clicking, live VNC viewer on any page | Ep [4](https://www.youtube.com/watch?v=3VfHrJmqYos) |
+| **Knowledge** | Hybrid RAG on pgvector with cross-encoder reranking, layout-aware document parsing with page-level citations, retrieval that shows its chunks and scores, Autoresearch that tunes retrieval overnight | Ep [3](https://www.youtube.com/watch?v=pT_J93qTCL0) |
+| **Voice & channels** | Continuous voice chat, a three-tier chat brain, Discord bot, supervised outreach, MCP in both directions, a 25-module CLI | Ep [2](https://www.youtube.com/watch?v=5HcSAf96j_M) |
+| **Self-running platform** | Self-improvement behind guardian review and kill switches, rules engine, jobs & scheduling, schema-aware backups, GPU orchestrator, multi-machine Interconnector | Eps [11](https://www.youtube.com/watch?v=7kHvi_2vT6U) · [12](https://www.youtube.com/watch?v=IMEnss9gjl4) |
 
-<p align="center"><em>Real screen recordings of the system working — click to watch on YouTube.</em></p>
+> **The aardvark** (/ˈɑːrd.vɑːrk/; *Orycteropus afer*) is a medium-sized, burrowing, nocturnal mammal native to Africa. The aardvark is the only living member of the genus *Orycteropus*, the family Orycteropodidae and the order Tubulidentata. It is found over much of the southern two-thirds of the African continent, avoiding areas that are mainly rocky. A nocturnal feeder, the aardvark subsists on ants and termites (myrmecophagy) by using its sharp claws and powerful legs to dig the insects out of their hills, and its long snout to sniff out food. It digs a burrow in which to live and rear its young.
+>
+> — [Wikipedia](https://en.wikipedia.org/wiki/Aardvark), CC BY-SA
 
-One style prompt and a short narrative, then **go**. Guaardvark wrote every shot prompt, generated the storyboards, rendered the clips, and assembled the cuts — **timing them to the beat after analyzing the song's audio** (`.mp3` / `.wav`). Every frame was generated locally on a single desktop GPU.
+**The Guaardvark** (/ˈɡwɑːrd.vɑːrk/; *Workstationus selfhosticus*) is a burrowing, nocturnal AI system native to consumer hardware. The Guaardvark is the only living member of the repository [github.com/guaardvark/guaardvark](https://github.com/guaardvark/guaardvark), the family LocalAI, and the order AutonomousAgents. It is found across most of the modern desktop, avoiding regions that are mainly cloud. A nocturnal feeder, the Guaardvark subsists on prompts and unstructured data (promptophagy) by using its sixty-odd tools and a swarm of parallel coding agents to dig bugs out of their codebases, and a retrieval index to sniff out knowledge in the dark. It is fiercely territorial about its single GPU, admitting one process to the card at a time and evicting any language model found loitering there. It digs isolated git worktrees in which to work, and rears its images, video, music, and cloned voices entirely on your own machine.
 
-> **Full disclosure (every claim here is real):** the glitch effect was the one manual touch, added in Shotcut — Guaardvark did the prompting, generation, beat detection, and assembly. Native filters, transitions, and effects are coming in a future release. The song was made in Suno; Guaardvark's own music + neural-voice generation (including consent-gated voice cloning) is being wired into this pipeline next.
+## ▶ The Walkthrough Series — every feature, on camera
 
-**And media generation is one of the _smaller_ parts of what Guaardvark does** — agent swarms, a coding agent, voice chat, RAG, system mapping, a project manager, a backup system, and a 70+ tool engine are all below.
+Short, unscripted-feeling screen recordings of the real system doing real work — narrated by a voice the system cloned itself (that's Episode 7). Twelve episodes are live: the first series covers the twelve subsystems, and a second series picks up what shipped since.
 
-## Highlights (as of latest release)
+| | |
+|:---:|:---:|
+| [![One Chat Box, Three Different Brains — Guaardvark Ep 2](https://img.youtube.com/vi/5HcSAf96j_M/maxresdefault.jpg)](https://www.youtube.com/watch?v=5HcSAf96j_M)<br>**Ep 2 — Chat Brain:** one chat box, three speeds | [![Your Files Get a Desktop — Guaardvark Ep 3](https://img.youtube.com/vi/pT_J93qTCL0/maxresdefault.jpg)](https://www.youtube.com/watch?v=pT_J93qTCL0)<br>**Ep 3 — File Desktop:** your files get a desktop, plus RAG that shows its work |
+| [![The Agent Behind the Glass — Guaardvark Ep 4](https://img.youtube.com/vi/3VfHrJmqYos/maxresdefault.jpg)](https://www.youtube.com/watch?v=3VfHrJmqYos)<br>**Ep 4 — Screen Agent:** its own desktop, eyes, and hands | [![Local Image Gen — Guaardvark Ep 5](https://img.youtube.com/vi/s9I_0gD9Iko/maxresdefault.jpg)](https://www.youtube.com/watch?v=s9I_0gD9Iko)<br>**Ep 5 — Image Gen:** one prompt, a whole story |
+| [![Local Video Generation — Guaardvark Ep 6](https://img.youtube.com/vi/9rae9IJhXow/maxresdefault.jpg)](https://www.youtube.com/watch?v=9rae9IJhXow)<br>**Ep 6 — Video Gen:** seven models, one GPU | [![Local Voice Cloning — Guaardvark Ep 7](https://img.youtube.com/vi/BXlm7p-SxtU/maxresdefault.jpg)](https://www.youtube.com/watch?v=BXlm7p-SxtU)<br>**Ep 7 — Voice Clone:** consent-gated, self-checking |
+| [![Local AI Music Video — Guaardvark Ep 8](https://img.youtube.com/vi/l2LqKA9GQDc/maxresdefault.jpg)](https://www.youtube.com/watch?v=l2LqKA9GQDc)<br>**Ep 8 — Music Video:** drop a song, get a film | [![Local AI Film Crew — Guaardvark Ep 9](https://img.youtube.com/vi/sq104u9N4Qg/maxresdefault.jpg)](https://www.youtube.com/watch?v=sq104u9N4Qg)<br>**Ep 9 — Film Crew:** script, cast, storyboard, cut |
+| [![The System That Fixes Itself — Guaardvark Ep 11](https://img.youtube.com/vi/7kHvi_2vT6U/maxresdefault.jpg)](https://www.youtube.com/watch?v=7kHvi_2vT6U)<br>**Ep 11 — Self-Repair:** it fixes its own code, behind a gate you control | [![Command Center — Guaardvark Ep 12](https://img.youtube.com/vi/IMEnss9gjl4/maxresdefault.jpg)](https://www.youtube.com/watch?v=IMEnss9gjl4)<br>**Ep 12 — Command Center:** see everything, gate everything, kill everything |
+| [![The New Front Door — Guaardvark Ep 13](https://img.youtube.com/vi/3-3XHJHHVmA/maxresdefault.jpg)](https://www.youtube.com/watch?v=3-3XHJHHVmA)<br>**Ep 13 — The New Front Door:** the Workspaces bar, and everything new since the first series | [![A Map of Everything — Guaardvark Ep 14](https://img.youtube.com/vi/yEy1tVKxsF0/maxresdefault.jpg)](https://www.youtube.com/watch?v=yEy1tVKxsF0)<br>**Ep 14 — System Map:** every module, drawn from its real imports; findings that carry their own fix |
 
-- **Video & Audio Production** — Wan 2.2 (T2V + I2V, 5B default + 14B MoE), CogVideoX-5B, LTX-2.3 + LTX-2.5; ACE-Step full-song generation with LLM tag polish; Chatterbox/Kokoro neural voice + Piper; explicit consent-gated voice cloning; frame-by-frame 4K/8K upscaling.
-- **AgentBrain + Screen Agents** — Reflex/Instinct/Deliberation routing. Agents drive a real Ubuntu/XFCE desktop on a virtual display (`:99`), see with vision models (Gemma4 native `box_2d`), use closed-loop servo targeting, and stream per-step reasoning.
-- **Swarm Orchestrator & Film Crew** — Up to 20 parallel agents in isolated git worktrees with dependency-aware merging. Five-role production pipeline (Screenwriter → Casting (LoRAs) → Cinematographer → Storyboard → Editor).
-- **Self-Improvement & Safety** — Scheduled/reactive/directed bug detection + agent fixes with verification. Optional "Uncle Claude" (Anthropic) guardian review + codebase lock + Pending Fixes queue. Cross-machine learning via Interconnector.
-- **MCP (both directions)** — Stdio MCP server with default-deny policy (desktop/agent/system/browser tools hidden by default). Exposes dozens of tools + read-only output resources. Also calls external MCP servers.
-- **Supervised Outreach** — Draft + grade + human-approve pipeline for Reddit (fully wired), Discord/Twitter/Facebook (in flight). Persona, cadence gates, full audit log, kill switch.
-- **RAG + Code Intelligence** — Hybrid retrieval, AST-aware code chunking, per-project indexes, repo dependency graphs, `get_repository_map` / `read_ast_node` tools, System Mapper constellation view.
-- **GPU Orchestration** — System Resource Orchestrator arbitrates VRAM across plugins (Ollama, ComfyUI, Audio Foundry, etc.). CPU offload, predictive preload, conflict detection.
+**[▶ Watch the full playlist](https://www.youtube.com/playlist?list=PLYycooXIy1Qs)** — Episode 1 (the full tour) and Episode 10 (the video editor) are on the way.
+
+### More demos
+
+**The beat-synced music video** — [watch on YouTube](https://www.youtube.com/shorts/rh0LJRK_jAM). One style prompt and a short narrative, then **go**: Guaardvark wrote every shot prompt, generated the storyboards, rendered the clips, and assembled the cuts to the beat it detected in the song. *(Full disclosure: the glitch effect was the one manual touch, added in Shotcut; the song was made in Suno — Guaardvark's own music generation is being wired into this pipeline.)*
+
+> Full visual gallery (dashboard, video generator, swarm planner, agents, plugins, media library, etc.) is available on [guaardvark.com](https://guaardvark.com).
 
 ---
 
@@ -65,7 +110,7 @@ One style prompt and a short narrative, then **go**. Guaardvark wrote every shot
 - MCP server + client integration (Claude Desktop, Cursor, etc.).
 
 **Knowledge, Code & Workflow**
-- Strong RAG (hybrid BM25 + vector, AST code chunking, entity extraction, RAG Autoresearch, per-project isolation).
+- Strong RAG (hybrid keyword + vector search on pgvector, cross-encoder reranking, AST code chunking, layout-aware PDF/DOCX parsing, entity extraction, RAG Autoresearch, per-project isolation).
 - Monaco code editor + Code Analyzer + per-repo indexing + dependency graphs + System Mapper (constellation view of the whole codebase).
 - Full desktop-grade file/project/client/website/notes/media management with cross-links and recursive indexing.
 - Task scheduler (Celery beat), Rules & Prompts (portable bundles), Interconnector for multi-machine clusters (master/client, approval gates, learning broadcast).
@@ -95,40 +140,43 @@ See [CAPABILITIES.md](CAPABILITIES.md) for the complete enumerated list (models,
 | **Multi-machine clusters** | "Talk to sales"                            | Built-in. Master/client, approval gates   |
 | **Lock-in**               | Migrate at your own risk                   | It's your computer. Move it whenever.     |
 
-### Why local?
+## How Guaardvark compares
 
-|                          | Cloud platforms                            | **Guaardvark**                            |
-|--------------------------|--------------------------------------------|-------------------------------------------|
-| **Where your data lives** | Their servers                              | Your machine. Period.                     |
-| **Per-token / per-minute fees** | Always on the meter                  | Free. Generate all night if you want.     |
-| **Content policy**        | Their rules                                | Your rules.                               |
-| **Custom models / LoRAs** | Whatever they expose                       | Any GGUF, any LoRA, any embedding model   |
-| **Works offline**         | No                                         | Yes. Flight Mode tested end-to-end.       |
-| **Agents drive a real desktop** | Sandboxed browsers                   | Real Ubuntu/XFCE on your hardware         |
-| **Swarms of parallel agents** | Per-task billing scales nastily        | 20 agents in parallel; only cost is power |
-| **Multi-machine clusters** | "Talk to sales"                            | Built-in. Master/client, approval gates   |
-| **Lock-in**               | Migrate at your own risk                   | It's your computer. Move it whenever.     |
+The local-AI ecosystem has excellent tools for every slice: chat UIs, RAG second-brains, node-graph media pipelines, coding agents, assistant gateways. Guaardvark's bet is different — **one install on one GPU that is the whole studio**, with a single GPU orchestrator arbitrating all of it.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![CI](https://github.com/guaardvark/guaardvark/actions/workflows/ci.yml/badge.svg)](https://github.com/guaardvark/guaardvark/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/guaardvark?label=PyPI&color=blue)](https://pypi.org/project/guaardvark/)
-[![GitHub stars](https://img.shields.io/github/stars/guaardvark/guaardvark?style=social)](https://github.com/guaardvark/guaardvark/stargazers)
-[![GitHub issues](https://img.shields.io/github/issues/guaardvark/guaardvark)](https://github.com/guaardvark/guaardvark/issues)
-[![Sponsor](https://img.shields.io/badge/Sponsor-Guaardvark-ff69b4?logo=github-sponsors)](https://github.com/sponsors/guaardvark)
+| Capability | Chat UIs | RAG apps | Node graphs | Coding agents | Assistant gateways | **Guaardvark** |
+|---|:---:|:---:|:---:|:---:|:---:|:---|
+| Local chat + RAG | core | core | — | — | via tools | core ([Ep 3](https://www.youtube.com/watch?v=pT_J93qTCL0)) |
+| Media production (video · image · music · voice) | — | — | image/video graphs | — | via connected tools | core, with director engines ([Eps 5–9](https://www.youtube.com/playlist?list=PLYycooXIy1Qs)) |
+| Agents on a real desktop | — | — | — | — | browser/tool use | core ([Ep 4](https://www.youtube.com/watch?v=3VfHrJmqYos)) |
+| Parallel coding swarms | — | — | — | usually one agent | — | up to 20 in git worktrees |
+| Self-improvement behind human gates | — | — | — | — | — | core ([Ep 11](https://www.youtube.com/watch?v=7kHvi_2vT6U)) |
+| One-GPU resource arbitration | — | — | — | — | — | core ([Ep 12](https://www.youtube.com/watch?v=IMEnss9gjl4)) |
+| Integration / plugin ecosystem breadth | varies | varies | **enormous** | growing | **enormous** | smaller — 10 first-party plugins, plus MCP both ways |
+| Hosted / mobile option | often | often | often | often | often | none, by design — it's your machine |
 
-```bash
-git clone https://github.com/guaardvark/guaardvark.git && cd guaardvark && ./start.sh
-```
+*Columns describe the typical shape of each category, not any single project — several projects exceed their category in places. The Guaardvark column links to walkthrough episodes where you can watch the claim happen.*
 
-One command. Installs everything. Starts all services. Done.
+If all you need is one slice, use the excellent specialist: a chat UI like Open WebUI, a node graph like ComfyUI (Guaardvark hands off to it with one click), a RAG workspace like AnythingLLM. Guaardvark is for when you want the whole studio on one box.
 
-### More demos — *Gotham Rising*, an AI-generated short film
+### Agent-driven media production, side by side
 
-Another piece made entirely with Guaardvark. Every frame generated on a single desktop GPU. No cloud. No stock footage. No API keys.
+A newer category: the coding agent runs the studio. Facts checked 2026-09-11 from each project's repository; stars move, the shape does not.
 
-[![Gotham Rising — AI-Generated Short Film](https://img.youtube.com/vi/8MdtM3HurJo/maxresdefault.jpg)](https://www.youtube.com/watch?v=8MdtM3HurJo)
+| | OpenMontage | Nomi | Maestro | Comfy MCP | Promptus / LocalForge / SimpliGen | **Guaardvark** |
+|---|---|---|---|---|---|---|
+| What it is | 12 video pipelines driven by Claude Code, Cursor, Codex | Desktop video workbench with 25 MCP tools | Local video, image, music, voice with a director mode | Official MCP for ComfyUI | One-click local image + video apps, $30–$97 one-time | The whole studio, driven by your agent or the Studio UI |
+| Generation runs | mostly cloud APIs, local models optional | your ComfyUI or cloud providers | local (a Wan2GP fork) | your ComfyUI, or Comfy Cloud on subscription | local | local |
+| Agent driving it | yes (skills + CLI) | yes (MCP) | no (in-app planner) | yes (generation only) | no | yes (MCP + skills) and the built-in agent brain |
+| Music, voice, voice clone | via cloud TTS/Suno | — | music + voice | audio nodes | — | ACE-Step songs, three TTS engines, consent-gated clone |
+| Film crew, music-video director | pipelines, storyboard board | storyboard + timeline | director mode | — | — | 5-role Film Crew, beat-synced director, video editor |
+| Coding swarm, screen agents, outreach, RAG | — | — | — | — | — | core |
+| LoRA training, upscaling, add any HF model by URL | — | — | LoRA browser | — | model manager | core, in the Studio |
+| OS | mac, Linux, Windows | mac, Windows | NVIDIA via Pinokio | any | Windows, mac (LocalForge: Linux too) | Linux; Apple Silicon partial (Metal); WSL2 in verification |
+| License | AGPL-3.0 | AGPL-3.0 | WanGP non-commercial | open source | proprietary | MIT |
+| Repository stars, 2026-09-11 | 57k | 0.5k | 0.5k | (part of ComfyUI, 133k) | — | 0.2k |
 
-> Full visual gallery (dashboard, video generator, swarm planner, agents, plugins, media library, etc.) is available on [guaardvark.com](https://guaardvark.com).
+*Every cell is a claim you can check in the linked repositories; corrections welcome in an issue.*
 
 ---
 
@@ -161,7 +209,7 @@ Every message is routed through a three-tier decision engine that picks the fast
 
 ### Autonomous Screen Agents
 
-Guaardvark agents control a **real Ubuntu desktop** (Xvfb + XFCE at 1024×1024) — exactly what the model would see if you VNC'd into the box from another machine. Same Applications menu, same desktop icons, same taskbar. Agents see the screen through vision models, move the mouse, click buttons, type text, navigate browsers, and verify their own actions.
+Guaardvark agents control a **real Ubuntu desktop** (Xvfb + XFCE at 1000×1000) — exactly what the model would see if you VNC'd into the box from another machine. Same Applications menu, same desktop icons, same taskbar. Agents see the screen through vision models, move the mouse, click buttons, type text, navigate browsers, and verify their own actions.
 
 - **Real XFCE session** — not a custom widget panel. `xfce4-session` runs on the virtual display via a scrubbed environment, with isolated `XDG_DESKTOP_DIR` and `XDG_CONFIG_HOME` so the agent's desktop, file manager, and configs never collide with the user's. Vision models recognize the layout instantly because it's standard Ubuntu.
 - **Unified vision brain** — Gemma4 sees the screen, decides the next action, and emits click coordinates (native `box_2d`) in a single inference call. Per-model scale factors are tracked and updated by the self-improvement loop.
@@ -192,6 +240,86 @@ Launch multiple AI coding agents in parallel, each working in an isolated git wo
 - **Up to 20 concurrent agents** — configurable limit with automatic slot management
 - **Live dashboard** — real-time status, per-task logs, cost breakdown, elapsed time, disk usage
 
+### Self-Improving AI
+
+The system runs its own test suite, identifies failures, dispatches an AI agent to read the code and fix the bugs, verifies the fix, and broadcasts the learning to other instances. No human in the loop.
+
+- **Three modes** — Scheduled (every 6 hours), Reactive (triggered by repeated 500 errors), Directed (manual tasks)
+- **Guardian review** — Uncle Claude (Anthropic API) reviews code changes for safety before applying, with risk levels and halt directives
+- **Verification loop** — re-runs tests after every fix to confirm it worked
+- **Pending fixes queue** — stage, review, approve, or reject proposed changes
+- **Cross-machine learning** — fixes propagate to all connected instances via the Interconnector
+
+### RAG That Actually Works
+
+Chat grounded in your documents. Upload files, build a knowledge base, and ask questions. The AI reads and understands your content — not just keyword matching.
+
+- **Hybrid retrieval** — Postgres full-text keyword + vector semantic search, fused with a per-query weighting that leans keyword-ward for identifier-like queries and semantic-ward for prose
+- **Cross-encoder reranking** — a reranker reads the query and passage *together* and reorders the candidates, which a bi-encoder cannot do; it is admitted against free VRAM and falls back to CPU rather than competing with image or video generation
+- **Smart chunking** — code files get AST-informed chunking (a function stays one chunk instead of being split mid-body), prose gets semantic splitting
+- **Layout-aware document parsing** — PDFs, DOCX and PPTX are parsed for reading order, section headers and page positions, so a retrieved passage can cite the page it came from. (Scanned documents need OCR, which is not installed by default — they report that rather than indexing as empty.)
+- **Grounded citations** — every chunk carries its source file, section breadcrumb and page, and that context is written into the embedded text as well, so a passage lifted out of the middle of a document still says where it came from
+- **Postgres-backed vector store** — embeddings live in pgvector alongside the rest of your data, with an ANN index and a persisted full-text index; they are covered by the same database backups
+- **Index profiles** — the same documents can be projected more than one way (fewer, larger passages for a small local model; finer-grained ones for an external client), switched in Settings
+- **Corpus-level summaries** — a recursive summarisation pass answers "what are the themes across all of this", which passage search structurally cannot
+- **Multiple embedding models** — switch between lightweight (300M) and high-quality (4B+) via UI
+- **Entity extraction** — automatic entity and relationship indexing
+- **Per-project isolation** — each project has its own knowledge base and chat context
+- **Retrieval that shows its work** — live retrieval tests display the actual chunks and scores behind an answer ([Episode 3](https://www.youtube.com/watch?v=pT_J93qTCL0)), instead of just asserting one. Every query can also return a trace of which retrieval legs actually ran, so a degraded answer is distinguishable from a bad one
+
+**Autoresearch — retrieval that tunes itself.** An autonomous optimization loop runs overnight experiments on your corpus: it proposes changes to chunking and retrieval parameters, evaluates them with an LLM-as-judge harness, keeps wins, and reverts regressions — bounded by a wall-clock budget, a run ledger, and a circuit breaker ([Episode 11](https://www.youtube.com/watch?v=7kHvi_2vT6U)). Your retrieval gets better while you sleep, and the morning report says exactly what changed and why.
+
+### Even the file manager is better
+
+A client's Linux desktop player refused to play a video — the distro was missing the right codec plugin. They dropped the same file into Guaardvark's file desktop and it just played. No codec pack involved: the backend range-streams files inline (`download_document` in `backend/api/files_api.py`) into the browser's own decoders, which ship with H.264/VP9 support regardless of what the desktop has installed. The same mechanism means PDFs start painting before they finish downloading and video seeking works from the first byte.
+
+### Code Intelligence & the System Mapper
+
+- **Monaco code editor** with multi-file tabs and an AI assistant pane.
+- **AST-aware code intelligence** — repository maps, dependency graphs, and structure-aware code search (`get_repository_map`, `read_ast_node`, `search_code` — also exposed over MCP).
+- **System Mapper** — a live, force-directed constellation of the entire codebase computed from real imports (1,300+ modules on camera in [Episode 14](https://www.youtube.com/watch?v=yEy1tVKxsF0)), with lifecycle tagging (active / dormant / auto-loaded / test / script / config), ranked findings you can dispatch to the self-improvement agent, and findings whose remedy is mechanical staged as an exact proposal for your review.
+- **Guarded self-coding** — every AI code write funnels through a single verified exact-replacement gate, behind the codebase lock.
+
+### Model Context Protocol (MCP)
+
+Guaardvark speaks MCP both ways — exposes its tools to any MCP client (Claude Code, Cursor, Grok, Claude Desktop, Zed, Gemini, etc.) and can call tools from connected external MCP servers.
+
+- **One-command setup** — `python -m backend.mcp install` detects the agent clients on your machine and writes the `guaardvark` server entry into their configs (existing files are backed up, other entries untouched). `python -m backend.mcp doctor` diagnoses a broken setup: server self-test, a real stdio handshake, and a scan of client configs for stale paths.
+- **Claude Code plugin** — two lines, no clone: `/plugin marketplace add guaardvark/guaardvark` then `/plugin install guaardvark@guaardvark`. It asks for the path of your Guaardvark checkout, wires the MCP server from there, and loads every skill below as `/guaardvark:<skill>`.
+- **Agent skills** — `.agents/skills/` ships one skill per flow (images, video, music video, Film Crew, voice, music, upscaling, Cast/LoRA training, Hugging Face model onboarding, swarm, knowledge, code, outreach, ops) in the [Agent Skills](https://agentskills.io) format, so Claude Code, Cursor, Codex and OpenClaw know which tool or route to call for each job. `python -m backend.mcp install --skills` links them into `~/.claude/skills`; other agents read `.agents/skills/` from the checkout. Start with `setup`.
+- **As a server** — `python -m backend.mcp` (stdio, the default) or `python -m backend.mcp http` (streamable HTTP on `127.0.0.1:8788/mcp`; loopback-only by default since there is no auth yet). Strong default-deny policy (see `backend/mcp/config.py`): categories such as `desktop`, `agent_control`, `system`, `browser`, `test_execution`, and `mcp` meta-tools are denied by default. Dozens of safer tools (chat, RAG, files, generation, memory, etc.) plus read-only `guaardvark://outputs/` resources are exposed — `python -m backend.mcp list-tools` prints the live list. Generation tools queue by default over MCP and hand back a batch id (`get_generation_status` reads it); every call runs on a worker thread under an enforced timeout (`GUAARDVARK_MCP_TIMEOUT`, 120 s; 30 min when a caller asks to wait for a render). Verified end-to-end by an initialize/tools-list handshake in the smoke tests.
+- **As a client** — `mcp_connect` / `mcp_execute` + live tool inventory so the chat LLM can discover and use tools from other MCP servers by name.
+- Audit logging, timeouts, and circuit breakers are built in.
+
+### Outreach System — Supervised AI for Social-Media Engagement
+
+A supervised, auditable framework for drafting and posting authentic comments on Reddit, Discord, Twitter/X, and Facebook — using your own indexed knowledge as the source of truth for citations and context. The point isn't volume. It's keeping up with engagement on your own products and topics, with the agent handling the legwork.
+
+**How it works**:
+
+1. **Discover** — the agent scouts target threads either by URL (you paste one into the New Draft modal) or by walking platform-specific entry points (subscribed subreddits, Discord channels, Twitter feeds, Facebook groups).
+2. **Context** — for each candidate post, the agent fetches the OP body and top comments. Reddit goes through the JSON API (fast, no scrape). Discord, Twitter, and Facebook go through the agent's logged-in Firefox session over CDP/BiDi, with a vision-model fallback when DOM selectors drift after a platform redesign.
+3. **Draft** — your local LLM composes a reply grounded in the thread context plus citations from your indexed documents (clients, projects, products, examples — whatever you've fed the knowledge base).
+4. **Grade** — every draft is scored against a relevance + quality rubric. Anything below threshold is dropped before it reaches the queue. Generic "great post!" replies don't survive grading.
+5. **Review** — drafts land in a queue. In supervised mode (the default), nothing posts without your approval. Edit, save, approve, reject — your call on each one.
+6. **Post** — approved drafts post via the logged-in browser session (Reddit/YouTube servo) or Discord API, cadence-gated. Natural language from chat (`/outreach …`) or `llx outreach "…"` runs recon+draft; posting still needs approve while supervised. Twitter/Facebook drafting works; auto-post for those platforms is not wired.
+
+**Three layers of safety**:
+
+- **Kill switch** at the system level. Flip it off and every outreach pipeline — drafting, queueing, posting — stops mid-flight. Nothing escapes.
+- **Supervised mode** is the default. Drafts queue, never auto-post. You approve each one explicitly.
+- **Cadence gates** — at most 1 post per 30 minutes per platform, configurable. Prevents bot-shaped behavior and respects platform anti-spam expectations.
+
+**Audit log** — every action (scout, draft, grade, approve, reject, post, fail) is recorded in a JSONL audit trail with timestamps, draft IDs, and outcomes. Exportable for compliance or post-hoc review.
+
+**Persona system** — a single configurable persona (voice, expertise areas, citation style, what to never say) shapes every draft for consistency. Your replies sound like you, not like an LLM.
+
+**Manual draft mode** — paste a thread URL, the agent auto-scouts the context, the LLM seeds a draft, you edit and save. Full human control with the agent doing the legwork (scouting, context-fetching, citation suggestion).
+
+**On-demand passes** — instead of waiting for the cron, fire a pass for a specific platform or subreddit on demand from the UI. Useful for active engagement around a launch or a thread you spotted.
+
+**Why it's not spam** — outreach is anchored on your own knowledge base. Citations point at YOUR documentation, YOUR examples. The system grades drafts for genuine relevance and refuses to engage when it can't add value. The cadence gate keeps the volume human-paced. Supervised mode keeps the human in the loop. The result is closer to "an assistant that helps you keep up with engagement on your own products and topics" than "an outbound bot."
+
 ### Film Crew — End-to-End Production Pipeline
 
 Five specialized agents collaborate to turn a one-line idea into a finished video. Built on the Swarm Orchestrator, so every role runs in parallel where possible and merges back deterministically.
@@ -206,7 +334,7 @@ Five specialized agents collaborate to turn a one-line idea into a finished vide
 
 The **LoRA Trainer plugin** ships alongside — train character/environment/prop LoRAs from reference images on your local GPU (bf16, ~46 MB per LoRA) and route them automatically to the Casting agent.
 
-### Music Video — Beat-Synced, Automatic (the hero clip above)
+### Music Video — Beat-Synced, Automatic
 
 Give it a song (`.mp3` / `.wav`), a style prompt, and a short narrative — Guaardvark does the rest:
 
@@ -217,14 +345,6 @@ Give it a song (`.mp3` / `.wav`), a style prompt, and a short narrative — Guaa
 - **Honest about the edges** — native filters/transitions/effects aren't in yet (the demo's glitch effect was added manually in Shotcut); that's on the near-term roadmap.
 
 **Linux & macOS:** The final assembly step needs `melt` (MLT) from Shotcut. ffmpeg is pre-installed by the platform bootstrap. Full commands (brew/apt/flatpak/snap) are in `plugins/video_editor/README.md`.
-
-### Model Context Protocol (MCP)
-
-Guaardvark speaks MCP both ways — exposes its tools to any MCP client (Claude Desktop, Cursor, IDE plugins, etc.) and can call tools from connected external MCP servers.
-
-- **As a server** — `python -m backend.mcp` (stdio). Strong default-deny policy (see `backend/mcp/config.py`): categories such as `desktop`, `agent_control`, `system`, `browser`, `test_execution`, and `mcp` meta-tools are denied by default. Dozens of safer tools (chat, RAG, files, generation, memory, etc.) plus read-only `guaardvark://outputs/` resources are exposed. Fully tested with Claude Desktop and similar clients.
-- **As a client** — `mcp_connect` / `mcp_execute` + live tool inventory so the chat LLM can discover and use tools from other MCP servers by name.
-- Audit logging, timeouts, and circuit breakers are built in.
 
 ### Video Generation Pipeline
 
@@ -239,12 +359,17 @@ State-of-the-art video generation running entirely on your GPU. No cloud APIs, n
 | **CogVideoX-5B I2V** | Image-to-Video | 6s (49 frames @ 8fps) | 720x480 | 16GB |
 | **LTX-2.3 Distilled FP8** | Text + Image-to-Video | ~10s (161 frames @ 16fps) | 768x512 | ~14GB |
 | **LTX-2.5 Distilled Int8** | Text + Image-to-Video | ~10s (161 frames @ 16fps) | 768x512 | ~14GB |
+| **HunyuanVideo 13B** (GGUF Q5) | Text-to-Video | ~3s (73 frames @ 24fps, up to 129) | 848x480 | ~11GB |
+| **HunyuanVideo 13B I2V** (GGUF Q5) | Image-to-Video | ~3s (73 frames @ 24fps, up to 129) | 848x480 | ~11GB |
+| **MiniMax H3** (pruned Int8) | Text, first-frame, last-frame and first+last-frame → Video **with its own stereo soundtrack** (dialogue, ambience, score) | ~7s offered (175 frames @ 24fps; the model trains to 15s) | 864x480 default, 1344x768 max | 16GB card; measured 6.5 min for a 5s clip at 864x480, 20 steps, on a 16 GB RTX 40-series card |
+| **MiniMax H3 Reference** (pruned Int8) | Up to 9 images, 3 clips and 3 audio files → Video with soundtrack (identity, motion, voice, editing) | same | same | same |
 
 - **Resolution options** — 512px, 576px, 720px, 1280px, 1920px (1080p), and custom dimensions (aligned per model)
-- **Quality tiers** — Fast (10 steps), Standard (30), High (40), Maximum (50)
+- **Quality tiers** — Fast (10 steps), Standard (30), High (40), Maximum (50); a model declares the fewest steps it renders well at and a preset below that floor is raised to it (Wan and MiniMax H3: 20). MiniMax H3 also offers turbo speed profiles (8 and 4 steps) through its distilled LoRAs, installed from Manage Video Models.
+- **MiniMax H3** — a video model that generates picture and sound in one pass. Its prompt is compiled into the model's structured format (numbered shots with cut times, speaker ids, tagged dialogue) by Guaardvark, and the Film Crew renders each scene as one spoken window on it. Licensed under the MiniMax H3 Community License, which names the EU, UK, South Korea and USA as territories that need MiniMax's application form; the Video Models modal shows the license and the link, and posts carrying H3 clips add a "Generated with MiniMax H3" line.
 - **Frame interpolation** — 1x raw, 2x doubled FPS, 2x + upscale for cinema-quality output
 - **Prompt enhancement** — Cinematic, Realistic, Artistic, Anime, or raw
-- **Low VRAM mode** — automatically reduces resolution, frames, and inference steps for 8–12GB GPUs (mutually exclusive with High consistency)
+- **Low VRAM mode** — reduces resolution, frames, and inference steps to keep 16GB cards inside budget (mutually exclusive with High consistency); video generation itself needs a 16GB-class card — see [docs/HARDWARE.md](docs/HARDWARE.md)
 - **Batch processing** — queue multiple videos from a prompt list via an in-process worker (one batch at a time; ComfyUI primary, offline CogVideoX fallback)
 - **ComfyUI integration** — one-click launch to the node editor for custom workflows; Wan/LTX require ComfyUI. LTX-2.5 needs ComfyUI ≥ 0.32.0 and a one-time license accept on [Lightricks/LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) (`HF_TOKEN` in `.env`); after download, generation stays local.
 
@@ -280,73 +405,7 @@ A built-in non-linear editor for stitching generated clips, layering text, and r
 
 ### GPU Image Upscaling — 4K and 8K Output
 
-Upscale images and video frames to 4K (3840px) or 8K (7680px) resolution using GPU-accelerated super-resolution models.
-
-| Model | Scale | Size | Best For |
-|-------|-------|------|----------|
-| HAT-L SRx4 | 4x | 159 MB | Maximum quality restoration |
-| RealESRGAN x4plus | 4x | 64 MB | General-purpose, photorealistic |
-| RealESRGAN x2plus | 2x | 64 MB | Mild upscaling |
-| RealESRGAN x4plus (Anime) | 4x | 17 MB | Anime and stylized content |
-| realesr-animevideov3 | 4x | 6 MB | Video-optimized anime |
-| 4x-UltraSharp | 4x | 67 MB | Enhanced sharpness |
-| 4x NMKD-Superscale | 4x | 67 MB | Advanced super-scaling |
-| 4x Foolhardy Remacri | 4x | 67 MB | Texture-focused upscaling |
-
-- **Two-pass mode** — run the model twice for maximum quality
-- **Precision control** — FP16 (standard GPUs), BF16 (Ampere+), torch.compile for up to 3x speedup
-- **Video upscaling** — frame-by-frame processing with progress tracking for MP4, MKV, AVI, MOV, WebM
-- **Watch folder** — optional auto-processing of new files dropped into a directory
-
-### RAG That Actually Works
-
-Chat grounded in your documents. Upload files, build a knowledge base, and ask questions. The AI reads and understands your content — not just keyword matching.
-
-- **Hybrid retrieval** — BM25 keyword + vector semantic search combined
-- **Smart chunking** — code files get AST-informed chunking, prose gets semantic splitting
-- **Multiple embedding models** — switch between lightweight (300M) and high-quality (4B+) via UI
-- **RAG Autoresearch** — autonomous optimization loop that experiments with parameters, keeps improvements, reverts regressions
-- **Entity extraction** — automatic entity and relationship indexing
-- **Per-project isolation** — each project has its own knowledge base and chat context
-
-### Self-Improving AI
-
-The system runs its own test suite, identifies failures, dispatches an AI agent to read the code and fix the bugs, verifies the fix, and broadcasts the learning to other instances. No human in the loop.
-
-- **Three modes** — Scheduled (every 6 hours), Reactive (triggered by repeated 500 errors), Directed (manual tasks)
-- **Guardian review** — Uncle Claude (Anthropic API) reviews code changes for safety before applying, with risk levels and halt directives
-- **Verification loop** — re-runs tests after every fix to confirm it worked
-- **Pending fixes queue** — stage, review, approve, or reject proposed changes
-- **Cross-machine learning** — fixes propagate to all connected instances via the Interconnector
-
-### Outreach System — Supervised AI for Social-Media Engagement
-
-A supervised, auditable framework for drafting and posting authentic comments on Reddit, Discord, Twitter/X, and Facebook — using your own indexed knowledge as the source of truth for citations and context. The point isn't volume. It's keeping up with engagement on your own products and topics, with the agent handling the legwork.
-
-**How it works**:
-
-1. **Discover** — the agent scouts target threads either by URL (you paste one into the New Draft modal) or by walking platform-specific entry points (subscribed subreddits, Discord channels, Twitter feeds, Facebook groups).
-2. **Context** — for each candidate post, the agent fetches the OP body and top comments. Reddit goes through the JSON API (fast, no scrape). Discord, Twitter, and Facebook go through the agent's logged-in Firefox session over CDP/BiDi, with a vision-model fallback when DOM selectors drift after a platform redesign.
-3. **Draft** — your local LLM composes a reply grounded in the thread context plus citations from your indexed documents (clients, projects, products, examples — whatever you've fed the knowledge base).
-4. **Grade** — every draft is scored against a relevance + quality rubric. Anything below threshold is dropped before it reaches the queue. Generic "great post!" replies don't survive grading.
-5. **Review** — drafts land in a queue. In supervised mode (the default), nothing posts without your approval. Edit, save, approve, reject — your call on each one.
-6. **Post** — approved drafts post via the logged-in browser session (Reddit/YouTube servo) or Discord API, cadence-gated. Natural language from chat (`/outreach …`) or `llx outreach "…"` runs recon+draft; posting still needs approve while supervised. Twitter/Facebook drafting works; auto-post for those platforms is not wired.
-
-**Three layers of safety**:
-
-- **Kill switch** at the system level. Flip it off and every outreach pipeline — drafting, queueing, posting — stops mid-flight. Nothing escapes.
-- **Supervised mode** is the default. Drafts queue, never auto-post. You approve each one explicitly.
-- **Cadence gates** — at most 1 post per 30 minutes per platform, configurable. Prevents bot-shaped behavior and respects platform anti-spam expectations.
-
-**Audit log** — every action (scout, draft, grade, approve, reject, post, fail) is recorded in a JSONL audit trail with timestamps, draft IDs, and outcomes. Exportable for compliance or post-hoc review.
-
-**Persona system** — a single configurable persona (voice, expertise areas, citation style, what to never say) shapes every draft for consistency. Your replies sound like you, not like an LLM.
-
-**Manual draft mode** — paste a thread URL, the agent auto-scouts the context, the LLM seeds a draft, you edit and save. Full human control with the agent doing the legwork (scouting, context-fetching, citation suggestion).
-
-**On-demand passes** — instead of waiting for the cron, fire a pass for a specific platform or subreddit on demand from the UI. Useful for active engagement around a launch or a thread you spotted.
-
-**Why it's not spam** — outreach is anchored on your own knowledge base. Citations point at YOUR documentation, YOUR examples. The system grades drafts for genuine relevance and refuses to engage when it can't add value. The cadence gate keeps the volume human-paced. Supervised mode keeps the human in the loop. The result is closer to "an assistant that helps you keep up with engagement on your own products and topics" than "an outbound bot."
+Upscale images and video frames to 4K (3840px) or 8K (7680px) with GPU-accelerated super-resolution — eight models from HAT-L (maximum-quality restoration) to anime-tuned Real-ESRGAN variants, two-pass mode, FP16/BF16 precision with `torch.compile`, frame-by-frame video upscaling, and an optional watch folder. The full model table is in [CAPABILITIES.md](CAPABILITIES.md#gpu-image--video-upscaling).
 
 ---
 
@@ -379,16 +438,32 @@ First run handles everything: Python 3.12, venv, Node dependencies, PostgreSQL, 
 | Service | URL (defaults; see `.env` for `VITE_PORT` / `FLASK_PORT`) |
 |---------|-----|
 | Web UI | http://localhost:5173 |
-| API | http://localhost:5000 |
-| Health Check | http://localhost:5000/api/health |
+| API | http://localhost:5000 (macOS: 5055) |
+| Health Check | http://localhost:5000/api/health (macOS: 5055) |
 
 ```bash
 ./start.sh                    # Full startup with health checks
-./start.sh --fast             # Skip dependency checks
+./start.sh --fast             # Reuse venv + node_modules as they are: no installs, no frontend build, no preflight
 ./start.sh --test             # Health diagnostics
 ./start.sh --plugins          # Start all enabled plugins
-./stop.sh                     # Stop all services
+./start.sh --external-ollama  # You run Ollama yourself; never started or stopped by these scripts
+./stop.sh                     # Stop Guaardvark (and only the Ollama that start.sh launched)
+./stop.sh --keep-ollama       # Stop Guaardvark, leave Ollama running whoever started it
+./stop.sh --all               # Also stop your own `ollama serve` and the systemd service
 ```
+
+Ollama already running before `./start.sh` is adopted, not restarted, and left running on
+`./stop.sh`. To make either policy permanent, flip the switches in Settings → Product Profile →
+Ollama, or set `GUAARDVARK_OLLAMA_KEEP_RUNNING=1` / `GUAARDVARK_OLLAMA_EXTERNAL=1` in `.env`.
+
+### Pick a profile
+
+The first start asks what Guaardvark is for here. **Creator** lists the media workflow — image,
+video, audio, Film Crew, LoRA, upscaling — and leaves agents, the knowledge index, outreach and
+automation installed but out of the way; **Workstation** is everything. Either is a starting
+point, not a ceiling: switch in Settings → Product Profile, or `./start.sh --profile creator`.
+Details in [`backend/profiles/README.md`](backend/profiles/README.md); building a distribution of
+your own is [`docs/EXTENSIONS.md`](docs/EXTENSIONS.md).
 
 ### Install via PyPI
 
@@ -396,39 +471,44 @@ First run handles everything: Python 3.12, venv, Node dependencies, PostgreSQL, 
 pip install guaardvark
 ```
 
-The CLI connects to a running Guaardvark instance or launches a lightweight embedded server automatically.
+The package is the `guaardvark` command. It talks to a running backend on the configured port, or starts one with `start.sh` from a checkout it finds through `GUAARDVARK_ROOT` or the current directory; with no checkout it stops with "Guaardvark installation not found". An MCP client can start the server with `guaardvark mcp serve` from a pip install plus a checkout.
 
 ---
 
 ## CLI
 
-~40 commands/subcommands (24 command modules) with tab completion and fuzzy matching. The PyPI package is `guaardvark`; the command is often `llx` when working from the source tree (`cd cli && pip install -e .`).
+Typer + Rich + prompt_toolkit. The PyPI package and the command are `guaardvark` (`llx` is a deprecated alias). Tab completion works with or without a leading `/`; `/help imagine` shows one command; unknown commands suggest a close match.
 
 ```bash
-guaardvark                              # Interactive REPL (or `llx`)
+guaardvark                              # Interactive REPL
 guaardvark status                       # System dashboard
 guaardvark chat "explain this codebase" # Chat with RAG context
 guaardvark search "query"               # Semantic search
 guaardvark files upload report.pdf      # Upload and index
+guaardvark plugins list                 # ComfyUI / Ollama / …
+guaardvark gpu status                   # VRAM and owner lock
+guaardvark mcp install --client cursor  # Wire Guaardvark into Cursor
+guaardvark completion zsh               # Shell completion script
 ```
+
+Config: `~/.guaardvark/cli.json` (legacy `~/.llx/config.json` is still read). Themes: `default`, `teal`, `musk`, `hacker`, `vader`, `guaardvark`, `day`, `auto`. Short terminals get a compact aardvark banner.
 
 ### REPL Slash Commands (examples)
 
 ```
-/imagine <prompt>       Generate an image from text
+/imagine <prompt>       Generate an image (inline preview in Kitty/iTerm)
 /video <prompt>         Generate a video from text
-/voice <text>           Text-to-speech output
-/agent                  Toggle autonomous agent mode
-/web                    Open the web UI
+/voice <text>           Text-to-speech (plays locally)
+/agent [on|off|shot]    Screen-agent mode; shot = desktop screenshot
+/web [images|chat]      Open the web UI on the real frontend port
 /ingest <path>          Index files or directories for RAG
-/search <query>         Semantic search over indexed documents
-/models list            List available Ollama models
-/remember <text>        Save to persistent memory
-/memory list|search     Browse saved memories
-/backup create          Create a system backup
-/jobs list|watch        Monitor background tasks
-/config                 View or change settings
-/help                   Full command reference
+/plugins list|start     GPU / service plugins
+/gpu status|release     VRAM and owner lock
+/audio tts|music|sfx    Audio Foundry
+/swarm run <prompt>     Parallel agents in worktrees
+/lessons begin|end      Lesson pearls
+/skills                 List SKILL.md files
+/help [query]           Full command reference, or one command
 ```
 
 ---
@@ -444,15 +524,38 @@ guaardvark files upload report.pdf      # Upload and index
 | Ollama | latest | Local LLM inference |
 | CUDA GPU | 8GB+ VRAM | 16GB recommended for video generation |
 
+**Which tier is your machine?** See **[docs/HARDWARE.md](docs/HARDWARE.md)** for what runs CPU-only, on 8–12 GB, on the 16 GB design target, and with 24 GB+ of headroom.
+
 ### GPU Memory Guide
 
 | Feature | Minimum | Recommended |
 |---------|---------|-------------|
 | Chat + RAG | 4GB | 8GB |
 | Image generation | 6GB | 12GB |
-| Wan 2.2 video | 11GB | 16GB |
+| Wan 2.2 video | 16GB* | 16GB |
 | CogVideoX-5B video | 16GB | 20GB |
 | Upscaling | 0.5GB | 2–4GB |
+
+\* Wan's weights fit in ~11GB, but the generation preflight requires a 16GB-class card for every current video family — see [docs/HARDWARE.md](docs/HARDWARE.md).
+
+### Making It Fast
+
+Chat and agent latency are dominated by a few settings, all in **Settings**
+unless noted. Defaults favor visibility while you learn the system; flip
+these once you trust it:
+
+- **Thinking mode off** — extended reasoning (`/thinking`, or the
+  chat-thinking default under Settings) adds a long deliberation pass to
+  every turn. Off, simple turns answer in a second or two.
+- **Developer toggles off** — *RAG Debug*, *Verbose Logging*, and *LLM
+  Debug* each add per-request work. Leave them off outside debugging
+  sessions.
+- **Pick one reliable model and stay on it** — every model switch evicts
+  and reloads weights on the GPU (seconds to a minute). A single mid-size
+  model that stays resident beats a bigger one that thrashes.
+- **Mind the VRAM neighbors** — renders wait politely for the card, but
+  idle services holding VRAM (voice models, image pipelines) slow
+  everything's admission. The Plugins page shows who's holding what.
 
 ---
 
@@ -467,7 +570,7 @@ Flask (~90+ API modules, auto-discovered) + GraphQL + Socket.IO
     +-- AgentBrain (3-tier routing: Reflex → Instinct → Deliberation)
     |
 Service Layer (many modules; plugin sidecars for heavy GPU work)
-|-- Agent Executor (ReACT + ~70 tool classes + BrainState)
+|-- Agent Executor (ReACT + ~60 tool classes + BrainState)
 |-- Screen Control (See-Think-Act-Verify + live reasoning stream)
 |-- RAG + Autoresearch + Entity extraction
 |-- Self-Improvement (detect/fix/verify/broadcast + guardian)
@@ -535,6 +638,8 @@ Guaardvark is built with love by a solo developer. If it's useful to you:
 
 Star the repo if you find it interesting — it helps with visibility.
 
+Questions, install trouble, or feedback: **support@guaardvark.com**. Press, partnerships, and business: **info@guaardvark.com**.
+
 ---
 
 ## Get Involved
@@ -545,7 +650,7 @@ Guaardvark is open source (MIT) and built in public. Whether you want to try the
 
 | Where | What |
 |-------|------|
-| **Discord** | Chat with people *and* with Guaardvark itself (local chat, `/imagine` images, search, status, demos). Invite: *(add permanent invite once the bot token is restored — see maintainer notes)*. |
+| **Discord** | The Discord bot ships as a plugin — connect it to your own server for local chat, `/imagine` images, and search against your own install (see `plugins/discord/`). |
 | **GitHub Issues** | Bugs, features, and labeled starter work |
 | **GitHub Discussions** | Longer-form questions if enabled |
 
@@ -556,21 +661,12 @@ git clone https://github.com/guaardvark/guaardvark.git && cd guaardvark
 ./start.sh
 ```
 
-Web UI → http://localhost:5173 · API → http://localhost:5000  
-Details: [INSTALL.md](INSTALL.md) · full feature list: [CAPABILITIES.md](CAPABILITIES.md)
+Web UI → http://localhost:5173 · API → http://localhost:5000 (macOS: 5055)  
+Details: [INSTALL.md](INSTALL.md) · [agent mental model](docs/AGENT_MENTAL_MODEL.md) · full feature list: [CAPABILITIES.md](CAPABILITIES.md)
 
 ### 3. Pick a good first issue
 
-Start here — each issue has acceptance criteria and a clear **out of scope** list:
-
-| Issue | What you do | Risk |
-|-------|-------------|------|
-| [#46](https://github.com/guaardvark/guaardvark/issues/46) | Add browser-basic **agent recipes** (JSON only) | Low |
-| [#47](https://github.com/guaardvark/guaardvark/issues/47) | Write `docs/AGENT_MENTAL_MODEL.md` | Low |
-| [#48](https://github.com/guaardvark/guaardvark/issues/48) | CLI: `guaardvark recipes list/show/validate` | Low |
-| [#49](https://github.com/guaardvark/guaardvark/issues/49) | Document **hardware / VRAM tiers** | Low |
-
-All open starters: [`good first issue`](https://github.com/guaardvark/guaardvark/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+Starter issues carry the [`good first issue`](https://github.com/guaardvark/guaardvark/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) label, each with acceptance criteria and a clear **out of scope** list. When none are open, the safe zones below are the best place to start.
 
 We aim to review serious PRs within **24–48 hours**.
 
@@ -591,7 +687,7 @@ Full setup, style, and PR expectations: **[CONTRIBUTING.md](CONTRIBUTING.md)**
 ### 5. Other ways to help (no code required)
 
 - Star the repo and share a short demo (screen agent, Film Crew, or Discord `/imagine`)
-- Report install friction with GPU model + logs from `logs/`
+- Report install friction with GPU model + logs from `logs/` (an issue, or email support@guaardvark.com)
 - Suggest recipes or workflows you wish worked out of the box
 - Support development: [Ko-fi](https://ko-fi.com/albenze) · [Sponsors](https://github.com/sponsors/guaardvark) · [PayPal](https://paypal.me/albenze)
 
@@ -601,6 +697,10 @@ Full setup, style, and PR expectations: **[CONTRIBUTING.md](CONTRIBUTING.md)**
 
 [MIT License](LICENSE) — Copyright (c) 2025-2026 Albenze, Inc.
 
+"Guaardvark"™ and the Guaardvark logo are trademarks of Albenze, Inc. The MIT License covers the code, not the name; see [TRADEMARK.md](TRADEMARK.md) for what you may do with the name without asking.
+
 <p align="center">
   <em>Guaardvark mascot</em>
 </p>
+
+<!-- mcp-name: io.github.guaardvark/guaardvark -->

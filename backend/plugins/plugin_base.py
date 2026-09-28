@@ -1,5 +1,6 @@
 
 import json
+import os
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
@@ -71,7 +72,13 @@ class PluginConfig:
             'timeout': self.timeout,
             'fallback_enabled': self.fallback_enabled,
         }
-        result.update(self.extra)
+        # `extra` must not shadow the canonical fields. Anything that landed in
+        # extra under one of these names is stale (it got there by being posted
+        # back from the UI, which sends the whole config object), and letting it
+        # win would freeze default_enabled at whatever was last submitted.
+        for key, value in self.extra.items():
+            if key not in result:
+                result[key] = value
         return result
 
 
@@ -91,6 +98,10 @@ class PluginMetadata:
     config: PluginConfig = field(default_factory=PluginConfig)
     requirements: Dict[str, bool] = field(default_factory=dict)
     endpoints: Dict[str, str] = field(default_factory=dict)
+    # Proves the process answering the health endpoint is THIS checkout's, not
+    # another install's service parked on the same port. Read by
+    # PluginManager._instance_check; see plugins/comfyui/plugin.json for the shape.
+    instance_check: Dict[str, Any] = field(default_factory=dict)
     
     @classmethod
     def from_json_file(cls, json_path: Path) -> 'PluginMetadata':
@@ -113,6 +124,18 @@ class PluginMetadata:
                 except (OSError, ValueError) as e:
                     logger.warning(f"Ignoring invalid {local_path}: {e}")
 
+            # The active profile may override the fresh-install default
+            # (creator ships ComfyUI on). Carried as one env string so
+            # start.sh's shell reader sees exactly the same answer; the
+            # user's own toggle in plugin_state.json still wins over both.
+            profile_defaults = os.environ.get('GUAARDVARK_PROFILE_PLUGIN_DEFAULTS')
+            if profile_defaults:
+                from backend.profiles import parse_plugin_defaults
+                plugin_id = data.get('id', json_path.parent.name)
+                override = parse_plugin_defaults(profile_defaults).get(plugin_id)
+                if override is not None:
+                    data.setdefault('config', {})['default_enabled'] = override
+
             config_data = data.pop('config', {})
             config = PluginConfig.from_dict(config_data)
             
@@ -131,6 +154,7 @@ class PluginMetadata:
                 config=config,
                 requirements=data.get('requirements', {}),
                 endpoints=data.get('endpoints', {}),
+                instance_check=data.get('instance_check') or {},
             )
         except Exception as e:
             logger.error(f"Failed to load plugin metadata from {json_path}: {e}")
@@ -152,6 +176,7 @@ class PluginMetadata:
             'config': self.config.to_dict(),
             'requirements': self.requirements,
             'endpoints': self.endpoints,
+            'instance_check': self.instance_check,
         }
     
     def save(self, json_path: Path):

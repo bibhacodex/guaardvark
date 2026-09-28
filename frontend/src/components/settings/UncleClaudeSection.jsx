@@ -1,40 +1,31 @@
 import React, { useState, useEffect, useCallback } from "react";
 import {
   Box,
-  Typography,
-  Switch,
-  Button,
   LinearProgress,
   Select,
   MenuItem,
   FormControl,
+  InputLabel,
   Alert,
   CircularProgress,
-  Stack,
-  Tooltip,
 } from "@mui/material";
-import {
-  Psychology as PsychologyIcon,
-  Shield as ShieldIcon,
-  Lock as LockIcon,
-  LockOpen as LockOpenIcon,
-  PlayArrow as PlayIcon,
-} from "@mui/icons-material";
-import SettingsSection from "./SettingsSection";
-import SettingsRow from "./SettingsRow";
+import { PlayArrow as PlayIcon } from "@mui/icons-material";
 import FixesModal from "./FixesModal";
 import ScanProgressModal from "./ScanProgressModal";
-import { StatusChip, UNCLE_GOLD } from "../../utils/familyColors";
+import { UNCLE_GOLD } from "../../utils/familyColors";
+import { ActionButton, Cluster, Hint, Line, Sep, SettingChip, StatusPill } from "./ui";
 import { claudeAdvisorService } from "../../api/claudeAdvisorService";
 import { selfImprovementService } from "../../api/selfImprovementService";
 
-export default function UncleClaudeSection({ compact = false }) {
+export default function UncleClaudeSection() {
   const [status, setStatus] = useState(null);
   const [siStatus, setSiStatus] = useState(null);
   const [loading, setLoading] = useState(true);
   const [testResult, setTestResult] = useState(null);
   const [testing, setTesting] = useState(false);
   const [scanOpen, setScanOpen] = useState(false);
+  const [scanInBackground, setScanInBackground] = useState(false);
+  const [scanCancelled, setScanCancelled] = useState(false);
   const [fixesOpen, setFixesOpen] = useState(false);
 
   const fetchStatus = useCallback(async () => {
@@ -97,6 +88,8 @@ export default function UncleClaudeSection({ compact = false }) {
   };
 
   const handleOpenScan = () => {
+    setScanInBackground(false);
+    setScanCancelled(false);
     setScanOpen(true);
   };
 
@@ -104,6 +97,11 @@ export default function UncleClaudeSection({ compact = false }) {
   // fresh closure on every render would re-dispatch the scan.
   const handleScanComplete = useCallback((run) => {
     fetchStatus();
+    setScanInBackground(false);
+    if (run?.status === "cancelled") {
+      setScanCancelled(true);
+      return;
+    }
     const proposedAnything =
       (run?.changes_made && run.changes_made.length > 0) ||
       run?.status === "success";
@@ -114,182 +112,128 @@ export default function UncleClaudeSection({ compact = false }) {
   }, [fetchStatus]);
 
   if (loading) {
-    return (
-      <Box sx={{ py: 2 }}>
-        <CircularProgress size={24} />
-      </Box>
-    );
+    return <CircularProgress size={16} />;
   }
 
   const usage = status?.usage || {};
   const budgetPercent = usage.budget_used_percent || 0;
-
-  const Wrapper = compact ? Box : SettingsSection;
-  const wrapperProps = (title) => compact ? {} : { title };
+  const runs = siStatus?.total_fixes || 0;
+  const connection = !status?.available
+    ? { tone: "warn", label: "Not configured" }
+    : testResult === null
+      ? { tone: "ok", label: "API key set" }
+      : testResult.success
+        ? { tone: "ok", label: "Verified" }
+        : { tone: "error", label: "Connection failed" };
 
   return (
-    <Box sx={compact ? {} : { mt: 3 }}>
-      <Wrapper {...wrapperProps("UNCLE CLAUDE (MENTOR API)")}>
-        {/* Connection Status — honest indicator, no placebo */}
-        <SettingsRow label="Connection" icon={<PsychologyIcon />}>
-          <Stack direction="row" spacing={1} alignItems="center">
-            {status?.available ? (
-              <StatusChip
-                source="uncle_claude"
-                status={testResult === null ? "enabled" : testResult.success ? "connected" : "offline"}
-                label={testResult === null ? "API Key Set" : testResult.success ? "Verified" : "Connection Failed"}
-              />
-            ) : (
-              <StatusChip
-                source="uncle_claude"
-                status="offline"
-                label="Not Configured"
-              />
-            )}
-            {status?.model && (
-              <Typography variant="caption" color="text.secondary">
-                {status.model}
-              </Typography>
-            )}
-            <Button
-              size="small"
-              variant="outlined"
-              onClick={handleTestConnection}
-              disabled={testing || !status?.available}
-              startIcon={testing ? <CircularProgress size={14} /> : <PlayIcon />}
-              sx={{ ml: 1 }}
-            >
-              {testing ? "Testing..." : "Test Connection"}
-            </Button>
-          </Stack>
-        </SettingsRow>
-
-        {testResult && (
-          <Alert
-            severity={testResult.success ? "success" : "error"}
-            sx={{ my: 1 }}
-            onClose={() => setTestResult(null)}
+    <Box sx={{ display: "flex", flexDirection: "column", gap: 1.25 }}>
+      <Cluster label="Uncle Claude" note="mentor API">
+        <Line>
+          <StatusPill tone={connection.tone} label={connection.label} />
+          {status?.model && <Hint>{status.model}</Hint>}
+          <ActionButton
+            onClick={handleTestConnection}
+            loading={testing}
+            disabled={!status?.available}
+            startIcon={<PlayIcon />}
+            tooltip="Sends one request to Anthropic. It counts against the token budget."
           >
-            {testResult.message}
-          </Alert>
-        )}
-
-        {/* Token Budget */}
-        <SettingsRow label="Token Budget" stacked>
-          <Box>
-            <Stack direction="row" justifyContent="space-between" sx={{ mb: 0.5 }}>
-              <Typography variant="caption">
-                {(usage.total_tokens || 0).toLocaleString()} / {(usage.monthly_budget || 0).toLocaleString()}
-              </Typography>
-              <Typography variant="caption" color="text.secondary">
-                {budgetPercent}% used
-              </Typography>
-            </Stack>
-            <LinearProgress
-              variant="determinate"
-              value={Math.min(budgetPercent, 100)}
-              sx={{
-                height: 6,
-                borderRadius: 3,
-                bgcolor: "action.hover",
-                "& .MuiLinearProgress-bar": {
-                  bgcolor: budgetPercent > 80 ? "error.main" : budgetPercent > 50 ? "warning.main" : UNCLE_GOLD,
-                },
-              }}
-            />
-          </Box>
-        </SettingsRow>
-
-        {/* Escalation Mode */}
-        <SettingsRow label="Escalation Mode">
-          <FormControl size="small" sx={{ minWidth: 180 }}>
+            Test connection
+          </ActionButton>
+          <Sep />
+          <FormControl size="small" sx={{ minWidth: 210 }}>
+            <InputLabel id="uncle-escalation-label">Escalation</InputLabel>
             <Select
+              labelId="uncle-escalation-label"
+              label="Escalation"
               value={status?.escalation_mode || "manual"}
               onChange={handleEscalationModeChange}
             >
               <MenuItem value="manual">Manual (user triggers)</MenuItem>
               <MenuItem value="smart">Smart (auto when local fails)</MenuItem>
-              <MenuItem value="always">Always (every query)</MenuItem>
+              <MenuItem value="always">Always (every query, paid)</MenuItem>
             </Select>
           </FormControl>
-        </SettingsRow>
-      </Wrapper>
-
-      <Wrapper {...wrapperProps("SELF-IMPROVEMENT & KILL SWITCH")} sx={compact ? { mt: 2 } : { mt: 3 }}>
-        {/* Self-Improvement Toggle */}
-        <SettingsRow label="Self-Improvement" icon={<ShieldIcon />}>
-          <Switch
-            checked={siStatus?.enabled || false}
-            onChange={handleToggleSelfImprovement}
-            color="primary"
+        </Line>
+        {testResult && (
+          <Alert severity={testResult.success ? "success" : "error"} sx={{ py: 0.25 }} onClose={() => setTestResult(null)}>
+            {testResult.message}
+          </Alert>
+        )}
+        <Line>
+          <Hint>
+            {(usage.total_tokens || 0).toLocaleString()} / {(usage.monthly_budget || 0).toLocaleString()} tokens ·{" "}
+            {budgetPercent}% used
+          </Hint>
+          <LinearProgress
+            variant="determinate"
+            value={Math.min(budgetPercent, 100)}
+            sx={{
+              width: 140,
+              height: 5,
+              borderRadius: 3,
+              bgcolor: "action.hover",
+              "& .MuiLinearProgress-bar": {
+                bgcolor: budgetPercent > 80 ? "error.main" : budgetPercent > 50 ? "warning.main" : UNCLE_GOLD,
+              },
+            }}
           />
-        </SettingsRow>
+        </Line>
+      </Cluster>
 
-        {/* Codebase Lock */}
-        <SettingsRow label="Codebase Protection">
-          <Stack direction="row" spacing={1} alignItems="center">
-            <StatusChip
-              source="nephew"
-              status={siStatus?.codebase_locked ? "locked" : "enabled"}
-              label={siStatus?.codebase_locked ? "Locked" : "Unlocked"}
-            />
-            <Tooltip title={siStatus?.codebase_locked ? "Unlock to allow autonomous edits" : "Lock to prevent autonomous edits"}>
-              <Button
-                size="small"
-                variant={siStatus?.codebase_locked ? "contained" : "outlined"}
-                color={siStatus?.codebase_locked ? "error" : "primary"}
-                onClick={handleToggleCodebaseLock}
-                startIcon={siStatus?.codebase_locked ? <LockOpenIcon /> : <LockIcon />}
-              >
-                {siStatus?.codebase_locked ? "Unlock" : "Lock"}
-              </Button>
-            </Tooltip>
-          </Stack>
-        </SettingsRow>
-
-        {/* Last run summary */}
-        <SettingsRow
-          label={
-            siStatus?.last_run
-              ? `Last run: ${new Date(siStatus.last_run.timestamp).toLocaleString()} (${siStatus.last_run.status})`
-              : "No runs yet"
-          }
-        >
-          {siStatus?.enabled && !siStatus?.codebase_locked && (
-            <Button
-              size="small"
-              variant="outlined"
-              onClick={handleOpenScan}
-              disabled={scanOpen}
-              startIcon={scanOpen ? <CircularProgress size={14} /> : <PlayIcon />}
-            >
-              {scanOpen ? "Running..." : "Run Self-Check"}
-            </Button>
-          )}
-        </SettingsRow>
-
-        {/* Fixes — clickable to open the details modal */}
-        <SettingsRow label="Fixes">
-          <Button
-            size="small"
-            variant="text"
-            onClick={() => setFixesOpen(true)}
-            sx={{ textTransform: "none" }}
+      <Cluster label="Self-improvement">
+        <Line>
+          <SettingChip
+            label="Self-improvement"
+            on={!!siStatus?.enabled}
+            onToggle={handleToggleSelfImprovement}
+            tooltip="Lets the mentor scan the codebase and propose fixes for review."
+          />
+          <SettingChip
+            label="Codebase locked"
+            on={!!siStatus?.codebase_locked}
+            onToggle={handleToggleCodebaseLock}
+            tooltip={siStatus?.codebase_locked ? "Autonomous edits are blocked. Turn off to allow them." : "Turn on to block every autonomous edit to the source tree."}
+          />
+          <Sep />
+          <ActionButton
+            onClick={handleOpenScan}
+            loading={scanOpen}
+            disabled={!siStatus?.enabled || !!siStatus?.codebase_locked}
+            startIcon={<PlayIcon />}
+            tooltip={
+              !siStatus?.enabled
+                ? "Turn on self-improvement first"
+                : siStatus?.codebase_locked
+                  ? "Unlock the codebase first"
+                  : "Runs the checks now. Cancel asks the server to stop; closing the view leaves the scan running."
+            }
           >
-            {siStatus?.total_fixes || 0} fix{(siStatus?.total_fixes || 0) === 1 ? "" : "es"} — view details
-          </Button>
-        </SettingsRow>
-      </Wrapper>
-
-      {siStatus?.codebase_locked && (
-        <Alert severity="warning" variant="outlined" sx={{ mt: 2 }}>
-          Codebase is locked. Autonomous edits are blocked.
-        </Alert>
-      )}
+            Run self-check
+          </ActionButton>
+          <ActionButton kind="link" onClick={() => setFixesOpen(true)}>
+            Review fixes
+          </ActionButton>
+        </Line>
+        <Hint>
+          {siStatus?.last_run
+            ? `Last run ${new Date(siStatus.last_run.timestamp).toLocaleString()} (${siStatus.last_run.status}) · ${runs} successful run${runs === 1 ? "" : "s"}.`
+            : "No runs yet."}
+          {siStatus?.codebase_locked ? " Codebase is locked: autonomous edits are blocked." : ""}
+        </Hint>
+        {scanCancelled && (
+          <StatusPill tone="neutral" label="Cancelled" />
+        )}
+        {scanInBackground && !scanCancelled && (
+          <StatusPill tone="info" label="Scan continues in the background" />
+        )}
+      </Cluster>
 
       <ScanProgressModal
         open={scanOpen}
         onClose={() => setScanOpen(false)}
+        onBackground={() => setScanInBackground(true)}
         onComplete={handleScanComplete}
       />
       <FixesModal

@@ -1,6 +1,6 @@
 
 import React, { Suspense, lazy } from "react";
-import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
+import { BrowserRouter as Router, Routes, Route, Navigate } from "react-router-dom";
 import useNavigationCancel from "./hooks/useNavigationCancel";
 import useGpuIntent from "./hooks/useGpuIntent";
 import useKeyboardForwarding from "./hooks/useKeyboardForwarding";
@@ -15,8 +15,12 @@ import { spacing } from "./theme/tokens";
 import { useAppStore } from "./stores/useAppStore";
 import { BrandLogo } from "./components/branding";
 import brand from "./config/brand";
+import { landingRouteFor } from "./config/profile";
+import { NAV_CHROME, navChromeWidth } from "./config/navCatalog";
+import { extensionRoutes, extensionHeaders, extensionLandingRoute } from "./extensions";
 
 import TrainingFloater from "./components/agent/TrainingFloater";
+import FirstRunProfileDialog from "./components/modals/FirstRunProfileDialog";
 
 // Eagerly loaded — core navigation targets
 import DashboardPage from "./pages/DashboardPage";
@@ -32,6 +36,8 @@ const DocumentsPage = lazy(() => import("./pages/DocumentsPage"));
 const RulesPage = lazy(() => import("./pages/RulesPage"));
 const ToolsPage = lazy(() => import("./pages/ToolsPage"));
 const AgentsPage = lazy(() => import("./pages/AgentsPage"));
+const AgentMemoryPage = lazy(() => import("./pages/AgentMemoryPage"));
+const MCPServersPage = lazy(() => import("./pages/MCPServersPage"));
 const WebsitesPage = lazy(() => import("./pages/WebsitesPage"));
 const WebsiteDetailPage = lazy(() => import("./pages/WebsiteDetailPage"));
 const FileGenerationPage = lazy(() => import("./pages/FileGenerationPage"));
@@ -41,7 +47,6 @@ const UploadPage = lazy(() => import("./pages/UploadPage"));
 const TrainingPage = lazy(() => import("./pages/TrainingPage"));
 const ImagesPage = lazy(() => import("./pages/ImagesPage"));
 const AudioFoundryPage = lazy(() => import("./pages/AudioFoundryPage"));
-const VideoGeneratorPage = lazy(() => import("./pages/VideoGeneratorPage"));
 const VideoTextOverlayPage = lazy(() => import("./pages/VideoTextOverlayPage"));
 const VideoEditorPage = lazy(() => import("./pages/VideoEditorPage"));
 const BulkImportDocumentsPage = lazy(() => import("./pages/BulkImportDocumentsPage"));
@@ -65,6 +70,7 @@ const MusicVideoPage = lazy(() => import("./pages/MusicVideoPage"));
 const CastStudioPage = lazy(() => import("./pages/CastStudioPage"));
 const CastMemberPage = lazy(() => import("./pages/CastMemberPage"));
 import Sidebar from "./components/layout/Sidebar";
+import SoftwareNav from "./components/layout/SoftwareNav";
 import ProgressFooterBar from "./components/layout/ProgressFooterBar";
 import { StatusProvider } from "./contexts/StatusContext";
 import { HealthProvider } from "./contexts/HealthContext";
@@ -91,11 +97,22 @@ const AppLayout = ({ children }) => {
   useGpuIntent();
 
   const sidebarExpanded = useAppStore((state) => state.sidebarExpanded);
-  const drawerWidth = sidebarExpanded ? spacing.sidebarExpanded : spacing.sidebarCollapsed;
+  const navChrome = useAppStore((state) => state.navChrome) || NAV_CHROME.SIDEBAR;
+  const isSoftware = navChrome === NAV_CHROME.SOFTWARE;
+  const drawerWidth = navChromeWidth(navChrome, sidebarExpanded);
+  // Layout slot: an extension may add a header bar above every page.
+  const headers = extensionHeaders();
 
   return (
-    <Box sx={{ display: "flex", height: "100vh", overflow: "hidden" }}>
-      <Sidebar />
+    <Box
+      sx={{
+        display: "flex",
+        flexDirection: isSoftware ? "column" : "row",
+        height: "100vh",
+        overflow: "hidden",
+      }}
+    >
+      {isSoftware ? <SoftwareNav /> : <Sidebar />}
       <Box
         component="main"
         data-main-content
@@ -103,8 +120,10 @@ const AppLayout = ({ children }) => {
           flexGrow: 1,
           display: "flex",
           flexDirection: "column",
-          width: `calc(100% - ${drawerWidth}px)`,
-          height: "100vh",
+          width: isSoftware ? "100%" : `calc(100% - ${drawerWidth}px)`,
+          height: isSoftware ? undefined : "100vh",
+          minHeight: 0,
+          minWidth: 0,
           overflow: "hidden",
           position: "relative",
           transition: theme.transitions.create("width", {
@@ -122,6 +141,9 @@ const AppLayout = ({ children }) => {
             pb: `${spacing.footerHeight}px`,
           }}
         >
+          {headers.map((Header, i) => (
+            <Header key={i} />
+          ))}
           {children}
         </Box>
         <ProgressFooterBar />
@@ -142,6 +164,10 @@ const AppContainer = () => {
     themes[themeName]?.theme ||
     themes[brand.defaultThemeKey]?.theme ||
     themes["guaardvark"].theme;
+  // A profile may land somewhere other than the dashboard (creator: /images).
+  // The dashboard stays reachable at /dashboard — unlisted, not removed.
+  const profile = useAppStore((state) => state.profile);
+  const landingRoute = landingRouteFor(profile) || extensionLandingRoute();
   const fetchSystemInfo = useAppStore((state) => state.fetchSystemInfo);
   const systemName = useAppStore((state) => state.systemName);
 
@@ -171,6 +197,30 @@ const AppContainer = () => {
     }
   }, [systemName]);
 
+  // index.css declares these as static values, so body and scrollbars kept the
+  // old dark defaults no matter which theme was chosen. Publish the active
+  // palette to them, and to the browser chrome colour.
+  React.useEffect(() => {
+    const { palette } = theme;
+    const root = document.documentElement;
+    const vars = {
+      "--bg-default": palette.background.default,
+      "--bg-paper": palette.background.paper,
+      "--text-primary": palette.text.primary,
+      "--text-secondary": palette.text.secondary,
+      "--divider": palette.divider,
+      "--scrollbar-track": palette.background.paper,
+      "--scrollbar-thumb": palette.divider,
+      "--scrollbar-thumb-hover": palette.action.hover,
+      "--scrollbar-thumb-active": palette.primary.main,
+    };
+    Object.entries(vars).forEach(([name, value]) => {
+      if (value) root.style.setProperty(name, value);
+    });
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", palette.background.default);
+  }, [theme]);
+
   return (
     <MuiThemeProvider theme={theme}>
       <CssBaseline />
@@ -186,16 +236,21 @@ const AppContainer = () => {
                 <SnackbarProvider>
                   <UncleNotificationListener />
                   <ErrorProvider>
+                    <FirstRunProfileDialog />
                     <Suspense fallback={<Box sx={{ display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", height: "100vh", gap: 2 }}><BrandLogo size={64} animate /><CircularProgress size={24} /></Box>}>
                     <Routes>
                       <Route
                         path="/"
                         element={
-                          <AppLayout>
-                            <ErrorBoundary>
-                              <DashboardPage />
-                            </ErrorBoundary>
-                          </AppLayout>
+                          landingRoute ? (
+                            <Navigate to={landingRoute} replace />
+                          ) : (
+                            <AppLayout>
+                              <ErrorBoundary>
+                                <DashboardPage />
+                              </ErrorBoundary>
+                            </AppLayout>
+                          )
                         }
                       />
                       <Route
@@ -337,7 +392,27 @@ const AppContainer = () => {
                         element={
                           <AppLayout>
                             <ErrorBoundary>
-                              <VideoGeneratorPage />
+                              <ImagesPage />
+                            </ErrorBoundary>
+                          </AppLayout>
+                        }
+                      />
+                      <Route
+                        path="/infographic"
+                        element={
+                          <AppLayout>
+                            <ErrorBoundary>
+                              <ImagesPage />
+                            </ErrorBoundary>
+                          </AppLayout>
+                        }
+                      />
+                      <Route
+                        path="/upscaling"
+                        element={
+                          <AppLayout>
+                            <ErrorBoundary>
+                              <ImagesPage />
                             </ErrorBoundary>
                           </AppLayout>
                         }
@@ -393,6 +468,22 @@ const AppContainer = () => {
                         element={
                           <AppLayout>
                             <AgentsPage />
+                          </AppLayout>
+                        }
+                      />
+                      <Route
+                        path="/agents/memory"
+                        element={
+                          <AppLayout>
+                            <AgentMemoryPage />
+                          </AppLayout>
+                        }
+                      />
+                      <Route
+                        path="/agents/mcp"
+                        element={
+                          <AppLayout>
+                            <MCPServersPage />
                           </AppLayout>
                         }
                       />
@@ -610,6 +701,18 @@ const AppContainer = () => {
                           </AppLayout>
                         }
                       />
+                      {/* Extension routes (extensions/<id>/frontend/index.jsx), ahead of the catch-all. */}
+                      {extensionRoutes().map((r) => (
+                        <Route
+                          key={r.path}
+                          path={r.path}
+                          element={
+                            <AppLayout>
+                              {r.errorBoundary ? <ErrorBoundary>{r.element}</ErrorBoundary> : r.element}
+                            </AppLayout>
+                          }
+                        />
+                      ))}
                       <Route
                         path="*"
                         element={

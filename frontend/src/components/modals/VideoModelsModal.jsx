@@ -22,17 +22,28 @@ import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import MemoryIcon from "@mui/icons-material/Memory";
 import axios from "axios";
 
-const GENERATION_TYPES = new Set(["wan", "cogvideox", "ltx"]);
+import { GENERATION_TYPES } from "../../constants/videoGeneratorPresets";
+import { ActionButton, ConfirmActionDialog, SettingChip } from "../settings/ui";
+import AddVideoModelDialog from "./AddVideoModelDialog";
+
 const TYPE_LABELS = {
   wan: "Video",
   cogvideox: "Video",
   ltx: "Video",
+  hunyuan: "Video",
+  minimax: "Video",
   facerestore: "Face restore",
   upscaler: "Upscale",
   flux: "Keyframe image",
   vae: "Dependency",
   encoder: "Dependency",
-  lora: "Dependency",
+  clip_vision: "Dependency",
+  lora: "Speed / identity LoRA",
+  embedding: "Dependency",
+  audio: "Music",
+  "qwen-edit": "Image editing",
+  pulid: "Image editing",
+  editing: "Image editing",
 };
 
 const VideoModelsModal = ({ open, onClose, showMessage, highlightModelId }) => {
@@ -51,6 +62,9 @@ const VideoModelsModal = ({ open, onClose, showMessage, highlightModelId }) => {
     total_gb: 0,
   });
   const [error, setError] = useState(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [removeTarget, setRemoveTarget] = useState(null);
+  const [removeBusy, setRemoveBusy] = useState(false);
 
   // The parent passes a fresh `showMessage` closure on every render. Keep it in a
   // ref so our fetch callbacks (and the effects that depend on them) stay stable —
@@ -126,6 +140,27 @@ const VideoModelsModal = ({ open, onClose, showMessage, highlightModelId }) => {
     }
   }, [open, highlightModelId, loading, models]);
 
+  const handleRemove = async () => {
+    if (!removeTarget) return;
+    setRemoveBusy(true);
+    try {
+      const res = await axios.delete(`/api/batch-video/models/user/${encodeURIComponent(removeTarget.id)}`, {
+        params: { delete_files: removeTarget.deleteFiles !== false },
+      });
+      if (res.data.success) {
+        showMessageRef.current?.(`Removed ${removeTarget.name}`, "success");
+        setRemoveTarget(null);
+        fetchModels();
+      } else {
+        showMessageRef.current?.(res.data.error?.message || res.data.message || "Could not remove", "error");
+      }
+    } catch (err) {
+      showMessageRef.current?.(err.response?.data?.error?.message || err.message || "Could not remove", "error");
+    } finally {
+      setRemoveBusy(false);
+    }
+  };
+
   const handleDownload = async (modelId) => {
     try {
       const res = await axios.post("/api/batch-video/models/download", { model_id: modelId });
@@ -162,7 +197,7 @@ const VideoModelsModal = ({ open, onClose, showMessage, highlightModelId }) => {
   const renderModelRow = (model) => {
     const isThis = isDownloading && currentModel === model.id;
     const isHighlight = !!highlightModelId && model.id === highlightModelId;
-    const typeLabel = TYPE_LABELS[model.type] || model.type;
+    const typeLabel = model.user && model.type === "encoder" ? "Text encoder" : TYPE_LABELS[model.type] || model.type;
     return (
       <ListItem
         key={model.id}
@@ -201,9 +236,43 @@ const VideoModelsModal = ({ open, onClose, showMessage, highlightModelId }) => {
                   variant="outlined"
                 />
               )}
+              {model.license?.name && (
+                <Chip
+                  label={model.license.name}
+                  size="small"
+                  color="warning"
+                  variant="outlined"
+                  title={model.license.note || ""}
+                  sx={{ height: 20, fontSize: "0.65rem" }}
+                />
+              )}
             </Box>
           }
-          secondary={model.description}
+          secondary={
+            model.license?.note ? (
+              <>
+                {model.description}
+                <Typography component="span" variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+                  {model.license.note}{" "}
+                  {model.license.form_url && (
+                    <a href={model.license.form_url} target="_blank" rel="noreferrer noopener">
+                      Application form
+                    </a>
+                  )}
+                  {model.license.url && (
+                    <>
+                      {" · "}
+                      <a href={model.license.url} target="_blank" rel="noreferrer noopener">
+                        License text
+                      </a>
+                    </>
+                  )}
+                </Typography>
+              </>
+            ) : (
+              model.description
+            )
+          }
         />
 
         <Box sx={{ ml: 2, minWidth: 120, textAlign: "right" }}>
@@ -224,13 +293,24 @@ const VideoModelsModal = ({ open, onClose, showMessage, highlightModelId }) => {
               </Typography>
             </Box>
           ) : (model.is_ready ?? model.is_downloaded) ? (
-            <Chip
-              icon={<CheckCircleIcon />}
-              label="Installed"
-              color="success"
-              size="small"
-              variant="outlined"
-            />
+            <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 0.5 }}>
+              <Chip
+                icon={<CheckCircleIcon />}
+                label="Installed"
+                color="success"
+                size="small"
+                variant="outlined"
+              />
+              {model.user && (
+                <ActionButton
+                  kind="destructive"
+                  onClick={() => setRemoveTarget({ ...model, deleteFiles: true })}
+                  disabled={isDownloading}
+                >
+                  Remove
+                </ActionButton>
+              )}
+            </Box>
           ) : (
             <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 0.5 }}>
               <Button
@@ -242,6 +322,15 @@ const VideoModelsModal = ({ open, onClose, showMessage, highlightModelId }) => {
               >
                 {model.install_size_gb ? `Install (${model.install_size_gb} GB)` : "Install"}
               </Button>
+              {model.user && (
+                <ActionButton
+                  kind="destructive"
+                  onClick={() => setRemoveTarget({ ...model, deleteFiles: true })}
+                  disabled={isDownloading}
+                >
+                  Remove
+                </ActionButton>
+              )}
               {model.requires?.length > 0 && (
                 <Typography variant="caption" color="text.secondary" noWrap>
                   includes {model.requires.length} required file{model.requires.length > 1 ? "s" : ""}
@@ -322,10 +411,40 @@ const VideoModelsModal = ({ open, onClose, showMessage, highlightModelId }) => {
         )}
       </DialogContent>
       <DialogActions>
+        <ActionButton onClick={() => setAddOpen(true)} disabled={isDownloading}>
+          Add new model
+        </ActionButton>
         <Button onClick={onClose} disabled={isDownloading}>
           {isDownloading ? "Downloading..." : "Close"}
         </Button>
       </DialogActions>
+      <AddVideoModelDialog
+        open={addOpen}
+        onClose={() => setAddOpen(false)}
+        models={models}
+        showMessage={showMessageRef.current}
+        onAdded={() => {
+          fetchModels();
+          fetchDownloadStatus();
+        }}
+      />
+      <ConfirmActionDialog
+        open={Boolean(removeTarget)}
+        title={`Remove ${removeTarget?.name || "this model"}?`}
+        description="Drops it from your catalog. Downloaded files under ComfyUI/models go away unless you turn that off."
+        extra={
+          <SettingChip
+            label="Delete downloaded files"
+            on={removeTarget?.deleteFiles !== false}
+            onToggle={(next) => setRemoveTarget((t) => (t ? { ...t, deleteFiles: next } : t))}
+          />
+        }
+        keeps="the shipped Video Models list"
+        confirmLabel="Remove"
+        busy={removeBusy}
+        onConfirm={handleRemove}
+        onClose={() => !removeBusy && setRemoveTarget(null)}
+      />
     </Dialog>
   );
 };

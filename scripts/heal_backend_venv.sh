@@ -23,6 +23,9 @@ VENV_PIP="$VENV_DIR/bin/pip"
 LOG_DIR="$REPO_ROOT/logs"
 LOG_FILE="$LOG_DIR/heal_backend_venv.log"
 
+# shellcheck source=lib/venv_pins.sh
+. "$SCRIPT_DIR/lib/venv_pins.sh"
+
 SKIP_CV=0
 COMFYUI_ONLY=0
 RESTART_COMFYUI=1
@@ -96,7 +99,7 @@ ensure_python_headers() {
 
 # Same pip network hardening as start.sh: default 15s socket timeout is too
 # tight for multi-hundred-MB wheels; a transient read timeout must not kill
-# the heal (ALPACA 2026-08-13). PIP_RESUME_RETRIES is ignored by pip < 25.1.
+# the heal (observed 2026-08-13). PIP_RESUME_RETRIES is ignored by pip < 25.1.
 export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-60}"
 export PIP_RETRIES="${PIP_RETRIES:-5}"
 export PIP_RESUME_RETRIES="${PIP_RESUME_RETRIES:-5}"
@@ -131,12 +134,16 @@ pip_install_req() {
 }
 
 repin_numpy_setuptools() {
-    log "Re-pinning numpy<2 and setuptools (ML stack guard)..."
-    "$VENV_PIP" install --no-deps --force-reinstall \
-        'numpy<2.0,>=1.26.4' 'setuptools>=80.9.0,<81' 2>&1 | tail -3 || true
-    # Keep opencv on the project pin if CV deps bumped it to 5.x
-    if "$VENV_PYTHON" -c 'import cv2' >/dev/null 2>&1; then
-        "$VENV_PIP" install 'opencv-python==4.8.1.78' --quiet 2>&1 | tail -2 || true
+    # Offline probe first; --force-reinstall needs the index even for a no-op,
+    # and this runs after every step (scripts/lib/venv_pins.sh).
+    local bad
+    bad="$(venv_pins_violated "$VENV_PYTHON" "${GV_ML_PINS[@]}")" || true
+    if [ -n "$bad" ]; then
+        log "Re-pinning ${bad//$'\n'/ } (ML stack guard)..."
+        # shellcheck disable=SC2086  # one spec per line, no spaces inside a spec
+        "$VENV_PIP" install --no-deps --force-reinstall $bad 2>&1 | tail -3 || true
+    else
+        log "numpy/setuptools pins already hold — no re-pin needed."
     fi
 }
 
@@ -167,8 +174,30 @@ heal_pytorch() {
     "$VENV_PIP" uninstall -y flash-attn flash_attn xformers 2>/dev/null | tail -1 || true
 }
 
+# Reconciler ids named in logs/.dep_reconcile_failed, comma-joined; empty when
+# there is no sentinel. Entries look like "  - <id>: <message>", and an id may
+# itself contain a colon (isolated_plugin_venv:<plugin>), so the id ends at the
+# first ": " rather than the first ":".
+sentinel_reconciler_ids() {
+    local sentinel="$REPO_ROOT/logs/.dep_reconcile_failed"
+    [ -f "$sentinel" ] || return 0
+    sed -n 's/^[[:space:]]*- \([^[:space:]]*\): .*$/\1/p' "$sentinel" | sort -u | paste -sd, -
+}
+
 heal_dep_reconciler() {
-    log "=== Step 3: dep reconciler (backend_venv + cli_venv) ==="
+    # The venv reconcilers always run. On top of those, re-run whatever the
+    # failure sentinel names: the reconciler only clears the sentinel for the
+    # ids a run covers, so a scoped run that skipped the failing step
+    # (plugin_bundle, frontend, an isolated plugin venv) left preflight RED no
+    # matter how many times this script was re-run — the loop reported on
+    # issue #41.
+    local only="backend_venv,cli_venv"
+    local named
+    named="$(sentinel_reconciler_ids)"
+    if [ -n "$named" ]; then
+        only="$only,$named"
+    fi
+    log "=== Step 3: dep reconciler ($only) ==="
     if [ -x "$REPO_ROOT/scripts/dep_reconciler.py" ] || [ -f "$REPO_ROOT/scripts/dep_reconciler.py" ]; then
         # MUST run under the venv python: the reconcilers pip-install via
         # sys.executable, so `python3 ...` here made every install hit PEP 668
@@ -177,7 +206,7 @@ heal_dep_reconciler() {
         # cli_venv exit 1). dep_reconciler.py now also self-re-execs as a
         # backstop, but call it correctly regardless.
         "$VENV_PYTHON" "$REPO_ROOT/scripts/dep_reconciler.py" \
-            --force --only backend_venv,cli_venv --repo-root "$REPO_ROOT" 2>&1 | tail -15 \
+            --force --only "$only" --repo-root "$REPO_ROOT" 2>&1 | tail -15 \
             || log "WARNING: dep_reconciler reported issues (see logs/dep_reconciler.log)"
     fi
     repin_numpy_setuptools
@@ -188,16 +217,13 @@ heal_cv_optional() {
         log "Skipping requirements-cv.txt (--skip-cv)"
         return 0
     fi
-    local arch want=0
-    arch="$(uname -m 2>/dev/null || echo unknown)"
-    if [ "${GUAARDVARK_INSTALL_CV:-0}" = "1" ]; then
-        want=1
-    elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1 \
-         && [ "$arch" != "aarch64" ] && [ "$arch" != "arm64" ]; then
-        want=1
-    fi
-    if [ "$want" -ne 1 ]; then
-        log "Skipping requirements-cv.txt (no NVIDIA GPU or ARM). Force with GUAARDVARK_INSTALL_CV=1"
+    # Opt-in only (matches start.sh): install when forced, or repair a stack an
+    # earlier opt-in already put in this venv. No auto-install on mere GPU
+    # presence — that made every fresh GPU box pay a multi-hundred-MB stack for
+    # two optional features (face-restore + anatomy/ControlNet).
+    if [ "${GUAARDVARK_INSTALL_CV:-0}" != "1" ] \
+       && ! "$VENV_PIP" show gfpgan >/dev/null 2>&1; then
+        log "Skipping requirements-cv.txt (not opted in, not installed). Opt in with GUAARDVARK_INSTALL_CV=1"
         return 0
     fi
     log "=== Step 4: optional CV / face restoration (requirements-cv.txt) ==="
@@ -215,10 +241,35 @@ heal_cv_optional() {
 
 heal_comfyui_deps() {
     log "=== Step 5: ComfyUI + custom-node deps (backend venv) ==="
+    # ComfyUI is optional and may run outside the checkout (Comfy Desktop, a
+    # shared install). Without plugins/comfyui/ComfyUI there is nothing to heal;
+    # under `set -e` the installer's "not found" error used to end the whole
+    # heal here, before verification ran (#41).
+    if [ ! -f "$REPO_ROOT/plugins/comfyui/ComfyUI/main.py" ]; then
+        if [ "$COMFYUI_ONLY" -eq 1 ]; then
+            log "ERROR: ComfyUI is not installed under plugins/comfyui/ComfyUI; nothing to heal."
+            exit 1
+        fi
+        log "ComfyUI is not installed under plugins/comfyui (external ComfyUI, or not installed yet) — skipping."
+        return 0
+    fi
     export GUAARDVARK_HEAL_FORCE=1
     export VENV_PYTHON
     bash "$REPO_ROOT/plugins/comfyui/scripts/install_deps.sh"
     repin_numpy_setuptools
+}
+
+# macOS on an external/exFAT volume leaves "._name" AppleDouble sidecars next to
+# files; a "._x.py" breaks transformers' import scan and blueprint discovery.
+# See scripts/platform/strip_appledouble.sh. No-op on Linux.
+strip_appledouble_sidecars() {
+    local script="$REPO_ROOT/scripts/platform/strip_appledouble.sh"
+    [ -f "$script" ] || return 0
+    local n
+    n=$(bash "$script" "$REPO_ROOT" 2>/dev/null || echo 0)
+    if [ "${n:-0}" -gt 0 ]; then
+        log "Removed $n AppleDouble '._*' sidecar file(s) from the checkout (they break Python import scans)."
+    fi
 }
 
 verify_heal() {
@@ -318,6 +369,7 @@ main() {
     # Belt-and-braces: repin once more after the restart's install_deps re-run,
     # so verify below judges the venv state that will actually serve traffic.
     repin_numpy_setuptools
+    strip_appledouble_sidecars
     verify_heal || exit 1
 
     log "========== heal_backend_venv DONE =========="

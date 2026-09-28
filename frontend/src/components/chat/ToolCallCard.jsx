@@ -2,7 +2,7 @@
  * ToolCallCard - Inline collapsible card for a single tool call + result.
  * Displayed within a message bubble during unified chat streaming.
  */
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import PropTypes from "prop-types";
 import {
   Box,
@@ -13,13 +13,6 @@ import {
   CircularProgress,
   Button,
   ButtonGroup,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-  Paper,
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
@@ -36,41 +29,16 @@ import Tooltip from "@mui/material/Tooltip";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { a11yDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { BASE_URL } from "../../api/apiClient";
+import { ActionButton } from "../settings/ui";
+import { guardedMediaSrc } from "../../utils/assetGuard";
+import ArtifactCard, { CSVTable, artifactShape } from "./ArtifactCard";
+import { consentImageSrc } from "./consentApproval";
 
 // Tools that get thumbs up/down feedback — agent actions the user can judge
 const FEEDBACK_TOOLS = new Set(["agent_task_execute", "agent_screen_capture"]);
 
-const CSVTable = ({ csvString }) => {
-  if (!csvString || !csvString.includes(",")) return null;
-  const lines = csvString.trim().split("\n");
-  if (lines.length < 1) return null;
-  
-  const headers = lines[0].split(",").map(h => h.trim());
-  const rows = lines.slice(1).map(line => line.split(",").map(c => c.trim()));
-  
-  return (
-    <TableContainer component={Paper} variant="outlined" sx={{ my: 0.5, maxHeight: 200, overflow: "auto" }}>
-      <Table size="small" stickyHeader>
-        <TableHead>
-          <TableRow sx={{ bgcolor: "action.hover" }}>
-            {headers.map((h, i) => (
-              <TableCell key={i} sx={{ py: 0.25, px: 0.5, fontSize: "0.6rem", fontWeight: "bold" }}>{h}</TableCell>
-            ))}
-          </TableRow>
-        </TableHead>
-        <TableBody>
-          {rows.map((row, i) => (
-            <TableRow key={i}>
-              {row.map((cell, j) => (
-                <TableCell key={j} sx={{ py: 0.25, px: 0.5, fontSize: "0.6rem" }}>{cell}</TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </TableContainer>
-  );
-};
+const CONSENT_COPY =
+  "By approving, you confirm you have the right to use this person's likeness — your own photo, or a Cast subject you uploaded.";
 
 const ToolCallCard = ({
   toolName,
@@ -82,10 +50,26 @@ const ToolCallCard = ({
   outputChunks,
   requiresApproval,
   onApproval,
+  consent,
+  consentImage,
+  consentPrompt,
+  messageId,
+  requestId,
+  cardKey,
 }) => {
-  const [expanded, setExpanded] = useState(false);
+  const artifact = result?.artifact || null;
+  // A card that produced a file opens by default so the file is visible in the thread.
+  const [expanded, setExpanded] = useState(Boolean(artifact));
   const [feedback, setFeedback] = useState(null); // null | "up" | "down"
+  const [taughtNote, setTaughtNote] = useState("");
   const [responded, setResponded] = useState(false);
+
+  // Keyed on identity, not the object, so a parent that rebuilds `result` each
+  // render cannot re-open a card the user has collapsed.
+  const artifactKey = artifact ? `${artifact.filename}:${artifact.size_bytes}` : null;
+  useEffect(() => {
+    if (artifactKey) setExpanded(true);
+  }, [artifactKey]);
 
   const showFeedback = FEEDBACK_TOOLS.has(toolName) && result && !isPending;
 
@@ -96,29 +80,39 @@ const ToolCallCard = ({
 
   const handleFeedback = async (positive) => {
     const newFeedback = positive ? "up" : "down";
-    // Toggle off if same button clicked again
-    if (feedback === newFeedback) {
-      setFeedback(null);
-      return;
-    }
-    setFeedback(newFeedback);
+    // Clicking the lit thumb withdraws the verdict; the backend reverses
+    // what it taught.
+    const verdict = feedback === newFeedback ? "none" : newFeedback;
+    const previous = feedback;
+    setFeedback(verdict === "none" ? null : verdict);
     try {
-      await fetch(`${BASE_URL}/agent-control/feedback`, {
+      const res = await fetch(`${BASE_URL}/agent-control/feedback`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          positive,
+          verdict,
+          kind: `tool:${toolName}@${cardKey ?? "0.0"}`,
+          type: "tool_action",
+          message_id: messageId ?? null,
+          request_id: requestId ?? null,
           tool_name: toolName,
           task: params?.task || toolName,
           session_id: sessionId || null,
           steps: result?.metadata?.steps || null,
           time_seconds: result?.metadata?.time_seconds || (durationMs ? durationMs / 1000 : null),
           model: "",
+          why_text: null,
+          why_tags: [],
         }),
       });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data?.success === false) throw new Error(data?.error || `HTTP ${res.status}`);
+      const labels = (data?.taught || []).map((t) => t?.label).filter(Boolean);
+      setTaughtNote(labels.join(" · "));
+      if (labels.length) setTimeout(() => setTaughtNote(""), 5000);
     } catch (err) {
-
       console.error("Feedback submit failed:", err);
+      setFeedback(previous);
     }
   };
 
@@ -238,19 +232,73 @@ const ToolCallCard = ({
         <Box sx={{ px: 1.5, pb: 1, fontSize: "0.7rem" }}>
           {/* Approval UI */}
           {requiresApproval && !responded && (
-            <Box sx={{ mb: 1, p: 1, bgcolor: "background.paper", borderRadius: 1, border: "1px solid", borderColor: "error.main" }}>
-              <Typography variant="caption" sx={{ fontWeight: 600, color: "error.main", display: "block", mb: 1 }}>
-                This action requires your approval. Do you want to proceed?
-              </Typography>
-              <ButtonGroup size="small" fullWidth variant="contained">
-                <Button color="success" startIcon={<CheckCircleIcon />} onClick={() => handleApproval(true)}>
-                  Approve
-                </Button>
-                <Button color="error" startIcon={<ErrorIcon />} onClick={() => handleApproval(false)}>
-                  Reject
-                </Button>
-              </ButtonGroup>
-            </Box>
+            consent ? (
+              <Box
+                data-testid="consent-approval-card"
+                sx={{ mb: 1, p: 1.25, bgcolor: "background.paper", borderRadius: 1, border: "1px solid", borderColor: "divider" }}
+              >
+                <Typography variant="body2" sx={{ display: "block", mb: 1, lineHeight: 1.45 }}>
+                  {CONSENT_COPY}
+                </Typography>
+                {(consentImage || consentPrompt) && (
+                  <Box sx={{ display: "flex", gap: 1, alignItems: "flex-start", mb: 1 }}>
+                    {consentImageSrc(consentImage) && (
+                      <Box
+                        component="img"
+                        src={guardedMediaSrc(consentImageSrc(consentImage))}
+                        alt="Reference likeness"
+                        sx={{
+                          width: 72,
+                          height: 72,
+                          objectFit: "cover",
+                          borderRadius: 1,
+                          border: "1px solid",
+                          borderColor: "divider",
+                          flexShrink: 0,
+                        }}
+                      />
+                    )}
+                    <Box sx={{ minWidth: 0 }}>
+                      {consentPrompt && (
+                        <Typography variant="body2" sx={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                          {consentPrompt}
+                        </Typography>
+                      )}
+                      {consentImage && !consentImageSrc(consentImage) && (
+                        <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.25 }}>
+                          Reference: {consentImage}
+                        </Typography>
+                      )}
+                    </Box>
+                  </Box>
+                )}
+                <Box sx={{ display: "flex", gap: 1, alignItems: "center", flexWrap: "wrap" }}>
+                  <ActionButton kind="primary" onClick={() => handleApproval(true)}>
+                    I have the right to use this likeness
+                  </ActionButton>
+                  <ActionButton kind="link" onClick={() => handleApproval(false)}>
+                    Decline
+                  </ActionButton>
+                </Box>
+              </Box>
+            ) : (
+              <Box
+                data-testid="tool-approval-card"
+                sx={{ mb: 1, p: 1, bgcolor: "background.paper", borderRadius: 1, border: "1px solid", borderColor: "error.main" }}
+              >
+                <Typography variant="caption" sx={{ fontWeight: 600, color: "error.main", display: "block", mb: 1 }}>
+                  This action requires your approval. Do you want to proceed?
+                </Typography>
+                <ButtonGroup size="small" fullWidth variant="contained">
+                  <Button color="success" startIcon={<CheckCircleIcon />} onClick={() => handleApproval(true)}>
+                    Approve
+                  </Button>
+                  <Button color="error" startIcon={<ErrorIcon />} onClick={() => handleApproval(false)}>
+                    Reject
+                  </Button>
+                </ButtonGroup>
+              </Box>
+            )
           )}
 
           {/* Parameters */}
@@ -283,7 +331,7 @@ const ToolCallCard = ({
           )}
 
           {/* Streaming/Final Result */}
-          {(outputChunks || result) && (
+          {(outputChunks || result) && !artifact && (
             <Box>
               <Typography
                 variant="caption"
@@ -331,6 +379,8 @@ const ToolCallCard = ({
             </Box>
           )}
 
+          {artifact && <ArtifactCard artifact={artifact} />}
+
           {/* Thumbs up/down feedback for agent tasks */}
           {showFeedback && (
             <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mt: 0.5, justifyContent: "flex-end" }}>
@@ -365,6 +415,11 @@ const ToolCallCard = ({
               </Tooltip>
             </Box>
           )}
+          {showFeedback && taughtNote && (
+            <Typography variant="caption" sx={{ display: "block", textAlign: "right", fontSize: "0.65rem", color: "text.secondary" }}>
+              {taughtNote}
+            </Typography>
+          )}
         </Box>
       </Collapse>
     </Box>
@@ -378,13 +433,21 @@ ToolCallCard.propTypes = {
     success: PropTypes.bool,
     output: PropTypes.string,
     error: PropTypes.string,
+    artifact: artifactShape,
   }),
   durationMs: PropTypes.number,
   isPending: PropTypes.bool,
   sessionId: PropTypes.string,
+  // The reply this card belongs to, so a thumb names the row.
+  messageId: PropTypes.number,
+  requestId: PropTypes.string,
+  cardKey: PropTypes.string,
   outputChunks: PropTypes.string,
   requiresApproval: PropTypes.bool,
   onApproval: PropTypes.func,
+  consent: PropTypes.bool,
+  consentImage: PropTypes.string,
+  consentPrompt: PropTypes.string,
 };
 
 export default ToolCallCard;

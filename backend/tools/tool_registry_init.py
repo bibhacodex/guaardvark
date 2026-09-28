@@ -6,6 +6,7 @@ This module should be imported during application startup.
 """
 
 import logging
+import os
 from typing import List, Optional, Dict
 
 from backend.services.agent_tools import (
@@ -110,6 +111,13 @@ def register_code_tools() -> List[str]:
         registered.append("analyze_code")
         _tool_categories["analyze_code"] = category
         logger.debug("Registered: CodeAnalysisTool")
+
+        from backend.tools.code_search_tools import SearchCodebaseTool
+
+        register_tool(SearchCodebaseTool())
+        registered.append("search_codebase")
+        _tool_categories["search_codebase"] = category
+        logger.debug("Registered: SearchCodebaseTool")
 
         from backend.tools.agent_tools.code_manipulation_tools import CODE_MANIPULATION_TOOLS
 
@@ -356,51 +364,24 @@ def register_desktop_tools() -> List[str]:
 
 
 def register_mcp_tools() -> List[str]:
-    """Register MCP (Model Context Protocol) tools"""
+    """Register MCP (Model Context Protocol) meta-tools.
+
+    Per-server tools (mcp__<server>__<tool>) are registered dynamically by
+    backend.tools.mcp_tools.install_proxy_sync when servers connect.
+    """
     global _tool_categories
     registered = []
     category = "mcp"
 
     try:
-        from backend.tools.mcp_tools import (
-            MCPListServersTool,
-            MCPConnectTool,
-            MCPDisconnectTool,
-            MCPListToolsTool,
-            MCPExecuteTool,
-            MCPGetStateTool,
-        )
+        from backend.tools.mcp_tools import META_TOOL_CLASSES
 
-        register_tool(MCPListServersTool())
-        registered.append("mcp_list_servers")
-        _tool_categories["mcp_list_servers"] = category
-        logger.debug("Registered: MCPListServersTool")
-
-        register_tool(MCPConnectTool())
-        registered.append("mcp_connect")
-        _tool_categories["mcp_connect"] = category
-        logger.debug("Registered: MCPConnectTool")
-
-        register_tool(MCPDisconnectTool())
-        registered.append("mcp_disconnect")
-        _tool_categories["mcp_disconnect"] = category
-        logger.debug("Registered: MCPDisconnectTool")
-
-        register_tool(MCPListToolsTool())
-        registered.append("mcp_list_tools")
-        _tool_categories["mcp_list_tools"] = category
-        logger.debug("Registered: MCPListToolsTool")
-
-        register_tool(MCPExecuteTool())
-        registered.append("mcp_execute")
-        _tool_categories["mcp_execute"] = category
-        logger.debug("Registered: MCPExecuteTool")
-
-        register_tool(MCPGetStateTool())
-        registered.append("mcp_get_state")
-        _tool_categories["mcp_get_state"] = category
-        logger.debug("Registered: MCPGetStateTool")
-
+        for cls in META_TOOL_CLASSES:
+            tool = cls()
+            register_tool(tool)
+            registered.append(tool.name)
+            _tool_categories[tool.name] = category
+        logger.info(f"Registered MCP meta-tools: {', '.join(registered)}")
     except ImportError as e:
         logger.error(f"Failed to import MCP tools: {e}")
     except Exception as e:
@@ -481,6 +462,19 @@ def register_rag_tools() -> List[str]:
         _tool_categories["search_knowledge_base"] = category
         logger.debug("Registered: KnowledgeSearchTool")
 
+        # Navigation surface. Search alone is a lookup primitive: without these there
+        # is no way to ask what the corpus contains, what a document is made of, or
+        # what the collection covers overall. Same category as search, so the MCP
+        # policy gate treats them identically.
+        from backend.tools.knowledge_tools import KNOWLEDGE_NAV_TOOLS
+
+        for tool_cls in KNOWLEDGE_NAV_TOOLS:
+            tool = tool_cls()
+            register_tool(tool)
+            registered.append(tool.name)
+            _tool_categories[tool.name] = category
+            logger.debug(f"Registered: {tool_cls.__name__}")
+
     except ImportError as e:
         logger.error(f"Failed to import RAG tools: {e}")
     except Exception as e:
@@ -544,6 +538,15 @@ def register_image_tools() -> List[str]:
         logger.warning(f"Failed to register image tools: {e}")
 
     try:
+        from backend.tools.image_tools import GenerationStatusTool
+        register_tool(GenerationStatusTool())
+        registered.append("get_generation_status")
+        _tool_categories["get_generation_status"] = "image"
+        logger.debug("Registered: GenerationStatusTool")
+    except Exception as e:
+        logger.warning(f"Failed to register generation status tool: {e}")
+
+    try:
         from backend.tools.image_tools import AnimationGeneratorTool
         register_tool(AnimationGeneratorTool())
         registered.append("generate_animation")
@@ -562,6 +565,24 @@ def register_image_tools() -> List[str]:
         logger.warning(f"Failed to register video tool: {e}")
 
     try:
+        from backend.tools.video_pipeline_tools import MusicVideoTool
+        register_tool(MusicVideoTool())
+        registered.append("generate_music_video")
+        _tool_categories["generate_music_video"] = "image"
+        logger.debug("Registered: MusicVideoTool")
+    except Exception as e:
+        logger.warning(f"Failed to register music-video tool: {e}")
+
+    try:
+        from backend.tools.video_pipeline_tools import FilmCrewTool
+        register_tool(FilmCrewTool())
+        registered.append("start_film_crew")
+        _tool_categories["start_film_crew"] = "image"
+        logger.debug("Registered: FilmCrewTool")
+    except Exception as e:
+        logger.warning(f"Failed to register film-crew tool: {e}")
+
+    try:
         from backend.tools.image_tools import EditImageTool
         register_tool(EditImageTool())
         registered.append("edit_image")
@@ -569,6 +590,25 @@ def register_image_tools() -> List[str]:
         logger.debug("Registered: EditImageTool")
     except Exception as e:
         logger.warning(f"Failed to register edit_image tool: {e}")
+
+    # generate_identity is consent-gated in the tool itself (a recorded consent
+    # for the reference image, asked for on a chat card); its likeness was
+    # verified on 2026-09-19 once the PuLID node patch landed.
+    _photo_tools = [
+        ("RemoveBackgroundTool", "remove_background"),
+        ("InpaintImageTool", "inpaint_image"),
+        ("OutpaintImageTool", "outpaint_image"),
+        ("GenerateIdentityTool", "generate_identity"),
+    ]
+    for _cls_name, _tool_name in _photo_tools:
+        try:
+            from backend.tools import image_tools as _image_tools
+            register_tool(getattr(_image_tools, _cls_name)())
+            registered.append(_tool_name)
+            _tool_categories[_tool_name] = "image"
+            logger.debug("Registered: %s", _cls_name)
+        except Exception as e:
+            logger.warning("Failed to register %s: %s", _tool_name, e)
 
     return registered
 
@@ -643,6 +683,48 @@ def register_outreach_tools() -> List[str]:
     except Exception as e:
         logger.error(f"Failed to register outreach tools: {e}")
 
+    return registered
+
+
+def register_connection_tools() -> List[str]:
+    """Register the agent handle on the Connections publish queue."""
+    global _tool_categories
+    registered = []
+    category = "connections"
+
+    try:
+        from backend.tools.connection_tools import RequestPublishTool
+
+        tool = RequestPublishTool()
+        register_tool(tool)
+        registered.append(tool.name)
+        _tool_categories[tool.name] = category
+        logger.debug("Registered: RequestPublishTool")
+    except ImportError as e:
+        logger.error(f"Failed to import connection tools: {e}")
+    except Exception as e:
+        logger.error(f"Failed to register connection tools: {e}")
+
+    return registered
+
+
+def register_workstation_tools() -> List[str]:
+    """Register chat tools that wrap mapper / GPU / logs / swarm / self-improvement."""
+    global _tool_categories
+    registered = []
+    category = "workstation"
+    try:
+        from backend.tools.workstation_tools import WORKSTATION_TOOLS
+
+        for tool in WORKSTATION_TOOLS:
+            register_tool(tool)
+            registered.append(tool.name)
+            _tool_categories[tool.name] = category
+            logger.debug(f"Registered: {tool.__class__.__name__}")
+    except ImportError as e:
+        logger.error(f"Failed to import workstation tools: {e}")
+    except Exception as e:
+        logger.error(f"Failed to register workstation tools: {e}")
     return registered
 
 
@@ -733,6 +815,8 @@ def initialize_all_tools() -> ToolRegistry:
     _registered_tools.extend(register_test_execution_tools())
     _registered_tools.extend(register_agent_control_tools())
     _registered_tools.extend(register_outreach_tools())
+    _registered_tools.extend(register_connection_tools())
+    _registered_tools.extend(register_workstation_tools())
 
     # Get the registry for status reporting
     registry = get_tool_registry()

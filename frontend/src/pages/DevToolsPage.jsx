@@ -47,6 +47,8 @@ import {
 import { getProgressJobs, cleanupStuckJobs } from "../api/progressService";
 import { triggerReboot } from "../api/settingsService";
 import AlertSnackbar from "../components/common/AlertSnackbar";
+import DiagnosticsPanel from "../components/system/DiagnosticsPanel";
+import RAGDebugSection from "../components/settings/RAGDebugSection";
 import SystemMetricsBar from "../components/layout/SystemMetricsBar";
 import { activateResourceManager } from "../utils/resource_manager";
 import { io } from "socket.io-client";
@@ -144,6 +146,10 @@ const DevToolsPage = () => {
 
   const handleCloseSnackbar = () =>
     setSnackbar((prev) => ({ ...prev, open: false }));
+
+  const showMessage = useCallback((message, severity = "info") => {
+    setSnackbar({ open: true, message, severity });
+  }, []);
 
   const handleRetry = () => {
     setHealthError(null);
@@ -609,22 +615,22 @@ const DevToolsPage = () => {
               {dbHealth && !dbError ? (
                 <>
                   <Box display="flex" alignItems="center" mb={1}>
-                    {dbHealth.up_to_date ? (
+                    {dbHealth.status === "ok" ? (
                       <CheckCircle color="success" sx={{ mr: 1 }} />
                     ) : (
                       <Warning color="warning" sx={{ mr: 1 }} />
                     )}
                     <Chip
-                      label={dbHealth.up_to_date ? "Up to date" : "Needs update"}
-                      color={dbHealth.up_to_date ? "success" : "warning"}
+                      label={dbHealth.status === "ok" ? "Up to date" : "Needs update"}
+                      color={dbHealth.status === "ok" ? "success" : "warning"}
                       size="small"
                     />
                   </Box>
-                  <Typography variant="body2">Current: {dbHealth.current}</Typography>
+                  <Typography variant="body2">Current: {dbHealth.db_revision || "none"}</Typography>
                   <Typography variant="body2">
-                    Heads: {dbHealth.heads && dbHealth.heads.join(", ")}
+                    Heads: {(dbHealth.heads || [dbHealth.head]).filter(Boolean).join(", ")}
                   </Typography>
-                  {dbHealth.multiple_heads && (
+                  {dbHealth.status === "multiple_heads" && (
                     <Alert severity="error" sx={{ mt: 1 }}>
                       Multiple heads detected
                     </Alert>
@@ -1265,6 +1271,26 @@ const DevToolsPage = () => {
                   Run a self-test to see detailed system diagnostics
                 </Typography>
               )}
+            </CardContent>
+          </Card>
+        </Grid>
+        <Grid item xs={12}>
+          <Card>
+            <CardContent>
+              <Typography variant="h6" gutterBottom>
+                Diagnostics
+              </Typography>
+              <DiagnosticsPanel showMessage={showMessage} />
+            </CardContent>
+          </Card>
+        </Grid>
+        <Grid item xs={12}>
+          <Card>
+            <CardContent>
+              <Typography variant="h6" gutterBottom>
+                Retrieval debug
+              </Typography>
+              <RAGDebugSection />
             </CardContent>
           </Card>
         </Grid>

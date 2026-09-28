@@ -15,6 +15,15 @@ from typing import Optional
 if __name__ == "__main__" and "backend.app" not in sys.modules:
     sys.modules["backend.app"] = sys.modules["__main__"]
 
+# The MCP server process (backend/mcp) stays Flask-free. Importing this module
+# builds the web app, starts sidecars and threads, and logs to stdout, which is
+# that process's JSON-RPC pipe. Tools there call the backend over HTTP instead.
+if os.environ.get("GUAARDVARK_MCP_PROCESS") == "1" and __name__ != "__main__":
+    raise ImportError(
+        "backend.app cannot be imported inside the MCP server process; "
+        "call the backend over HTTP (backend/utils/backend_http.py)."
+    )
+
 # Under memory pressure the kernel must kill THIS process, never the desktop
 # (2026-08-04 client box lockups). Early, before any heavy allocation.
 try:
@@ -62,19 +71,7 @@ from logging.handlers import TimedRotatingFileHandler
 #     noise so voice processing doesn't emit 4 warnings per first-use.
 warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"pydub\..*")
 
-#  2. JAX "TPU not found" + "CUDA-enabled jaxlib not installed" warnings.
-#     JAX gets pulled transitively (llama-index retrievers → some tokenizer)
-#     and logs these on first chat. We don't use JAX; suppress.
-class _JaxBackendNoiseFilter(logging.Filter):
-    def filter(self, record):
-        msg = record.getMessage()
-        return not (
-            "Unable to initialize backend 'tpu'" in msg
-            or "CUDA-enabled jaxlib is not installed" in msg
-        )
-logging.getLogger("jax._src.xla_bridge").addFilter(_JaxBackendNoiseFilter())
-
-#  3. Werkzeug "write() before start_response" AssertionError — dev-server-
+#  2. Werkzeug "write() before start_response" AssertionError — dev-server-
 #     only artifact (gunicorn doesn't have this check). Happens when a WSGI
 #     handler finalizes without calling start_response — usually streaming
 #     generators that error before yield. Fires as ERROR via the werkzeug
@@ -135,6 +132,7 @@ except Exception as _e:
     logging.getLogger(__name__).warning(f"Plugin-runner sidecar failed to start: {_e}")
     # Non-fatal — plugin_manager will fall back to direct subprocess.run
 
+from backend.utils.clock import utcnow
 from backend.utils.chat_utils import (
     DEFAULT_FALLBACK_SYSTEM_PROMPT,
     GLOBAL_DEFAULT_SYSTEM_PROMPT_RULE_NAME,
@@ -415,6 +413,25 @@ except ImportError as e:
     )
 
 
+def dev_allowed_origins(frontend_url: str) -> list[str]:
+    """Browser origins the dev backend accepts, including Socket.IO handshakes.
+
+    A sibling install moves its dev server and backend off the default ports so
+    the two can run at once, so both are read from the environment: a hardcoded
+    list refuses every websocket from a relocated frontend.
+    """
+    flask_port = os.getenv("FLASK_PORT", os.getenv("PORT", "5000"))
+    dev_ports = sorted({os.getenv("VITE_PORT", "5173"), "3000", "5173", "5175"})
+    return [
+        f"http://{host}:{port}"
+        for port in dev_ports
+        for host in ("localhost", "127.0.0.1")
+    ] + [frontend_url] + [
+        f"http://localhost:{flask_port}",
+        f"http://127.0.0.1:{flask_port}",
+    ]
+
+
 # Re-entry guard. create_app() must run exactly once per Python process.
 # A second call would re-register all 80 blueprints, re-init BrainState, re-discover
 # plugins, and spawn duplicate background threads — corrupting all the singletons
@@ -520,20 +537,7 @@ def _initialize_app_components(app):
         supports_credentials = True
         app.logger.info(f"Production CORS: Allowing only {FRONTEND_URL}")
     else:
-        _flask_port = os.getenv("FLASK_PORT", os.getenv("PORT", "5000"))
-        _backend_origins = [
-            f"http://localhost:{_flask_port}",
-            f"http://127.0.0.1:{_flask_port}",
-        ]
-        allowed_origins = [
-            "http://localhost:3000",
-            "http://localhost:5173",
-            "http://localhost:5175",
-            "http://127.0.0.1:3000",
-            "http://127.0.0.1:5173",
-            "http://127.0.0.1:5175",
-            FRONTEND_URL,
-        ] + _backend_origins
+        allowed_origins = dev_allowed_origins(FRONTEND_URL)
         supports_credentials = True
         app.logger.info(f"Development CORS: Allowing {len(allowed_origins)} origins")
 
@@ -619,6 +623,11 @@ def _initialize_app_components(app):
             VIDEO_RENDER_STALE_HIGH = 3600  # 60 min at >=95% (long encode still OK)
             VIDEO_RENDER_STALE_MID = 7200   # 120 min mid-render (maxed Wan denoising)
 
+            # A single missed 2 s probe is normal while ComfyUI's HTTP thread
+            # starves behind a pegged GPU; only sustained silence counts as down.
+            COMFYUI_DOWN_GRACE = 30  # seconds of consecutive failed probes
+            comfy_fail_since = {"t": None}
+
             def _comfyui_is_down() -> bool:
                 try:
                     from backend.config import config as _cfg
@@ -627,9 +636,15 @@ def _initialize_app_components(app):
                         "GUAARDVARK_COMFYUI_URL", "http://127.0.0.1:8188"
                     )
                     resp = _requests.get(url, timeout=2)
-                    return resp.status_code != 200
+                    failed = resp.status_code != 200
                 except Exception:
-                    return True
+                    failed = True
+                if not failed:
+                    comfy_fail_since["t"] = None
+                    return False
+                if comfy_fail_since["t"] is None:
+                    comfy_fail_since["t"] = time.time()
+                return (time.time() - comfy_fail_since["t"]) >= COMFYUI_DOWN_GRACE
 
             def _job_age_seconds(metadata: dict, file_mtime: float) -> float:
                 last_raw = (
@@ -650,15 +665,17 @@ def _initialize_app_components(app):
             def _stale_threshold_seconds(metadata: dict, redis_healthy: bool, comfyui_down: bool) -> float:
                 if metadata.get("status") in TERMINAL_STATUSES:
                     return float("inf")
-                if not redis_healthy:
-                    return float(REDIS_LOSS_STALE)
                 if metadata.get("process_type") == "video_render":
+                    # Renders report through ComfyUI polling, not the Redis
+                    # relay, so a relay outage says nothing about their health.
                     if comfyui_down and metadata.get("status") == "processing":
                         return 0.0
                     progress = int(metadata.get("progress") or 0)
                     if progress >= 95:
                         return float(VIDEO_RENDER_STALE_HIGH)
                     return float(VIDEO_RENDER_STALE_MID)
+                if not redis_healthy:
+                    return float(REDIS_LOSS_STALE)
                 return float(STALE_THRESHOLD)
 
             def _stale_error_message(metadata: dict, comfyui_down: bool) -> str:
@@ -679,6 +696,16 @@ def _initialize_app_components(app):
                         get_batch_video_generator().cancel_batch(str(batch_id))
                     except Exception:
                         pass
+                # The batch worker owns the GPU gate and releases it when its
+                # session exits; taking it away while that thread is alive hands
+                # the card to a second job mid-render. Only a dead worker leaves
+                # the gate orphaned.
+                worker_alive = any(
+                    t.name == "batch-video-worker" and t.is_alive()
+                    for t in threading.enumerate()
+                )
+                if worker_alive:
+                    return
                 try:
                     from backend.services.job_operation_gate import get_gate
                     from backend.services.job_types import JobKind
@@ -703,7 +730,7 @@ def _initialize_app_components(app):
                 metadata["status"] = "error"
                 metadata["message"] = _stale_error_message(metadata, comfyui_down)
                 metadata["is_complete"] = True
-                metadata["completion_time_utc"] = datetime.utcnow().isoformat()
+                metadata["completion_time_utc"] = utcnow().isoformat()
                 with open(metadata_file, "w") as f:
                     json.dump(metadata, f, indent=4)
                 if metadata.get("process_type") == "video_render":
@@ -859,9 +886,41 @@ def _initialize_app_components(app):
                         time.sleep(reconnect_delay)
                         reconnect_delay = min(30, reconnect_delay * 2)  # backoff
 
+            def relay_redis_preview():
+                """Independent of the progress relay so a bad JPEG cannot stall percents."""
+                from backend.utils.preview_emitter import REDIS_CHANNEL, SOCKET_EVENT
+                redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+                reconnect_delay = 5
+                while True:
+                    try:
+                        r = redis.Redis.from_url(redis_url)
+                        r.ping()
+                        pubsub = r.pubsub()
+                        pubsub.subscribe(REDIS_CHANNEL)
+                        app.logger.info("Redis preview relay subscribed to %s", REDIS_CHANNEL)
+                        reconnect_delay = 5
+                        for msg in pubsub.listen():
+                            if msg['type'] != 'message':
+                                continue
+                            try:
+                                event_data = json.loads(msg['data'])
+                            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                                app.logger.warning(f"Bad preview message from Redis: {e}")
+                                continue
+                            process_id = event_data.get('job_id', '')
+                            if process_id:
+                                socketio.emit(SOCKET_EVENT, event_data, to=process_id, namespace='/')
+                            socketio.emit(SOCKET_EVENT, event_data, to='global_progress', namespace='/')
+                    except Exception as e:
+                        app.logger.warning(f"Redis preview relay lost (will reconnect): {e}")
+                        time.sleep(reconnect_delay)
+                        reconnect_delay = min(30, reconnect_delay * 2)
+
             relay_thread = threading.Thread(target=relay_redis_progress, daemon=True)
             relay_thread.start()
-            app.logger.info("Started Redis progress relay thread")
+            preview_relay_thread = threading.Thread(target=relay_redis_preview, daemon=True)
+            preview_relay_thread.start()
+            app.logger.info("Started Redis progress and preview relay threads")
         else:
             app.logger.info("Redis progress relay thread already running, skipping")
 
@@ -1050,6 +1109,15 @@ def _initialize_app_components(app):
 
     db.init_app(app)
 
+    # Extensions (extensions/<id>/): models must exist before create_all(),
+    # so this is the first of their hook points. See backend/extensions.
+    from backend import extensions as _ext
+    _extensions = _ext.discover()
+    for _ext_id, _err in _ext.import_models(_extensions).items():
+        _ext.record(_ext_id, "models", _err is None, _err)
+
+    for _ext_id, _err in _ext.register_models(_extensions).items():
+        _ext.record(_ext_id, "media_models", _err is None, _err)
     try:
         from backend.tools import initialize_all_tools, get_registered_tools
         tool_registry = initialize_all_tools()
@@ -1102,7 +1170,14 @@ def _initialize_app_components(app):
         app.plugin_manager = None
 
     from backend.utils.blueprint_discovery import auto_register_blueprints
-    auto_register_blueprints(app)
+    auto_register_blueprints(app, extension_directories=_ext.blueprint_directories(_extensions))
+    for _e in _extensions:
+        _missing = _ext.missing_url_prefixes(app, _e)
+        _ext.record(_e.id, "blueprints", not _missing, _missing or None)
+        if _missing:
+            # A blueprint import error becomes a warning in discovery; without
+            # this, a vertical's every route 404s behind a clean startup.
+            app.logger.error("extension %s: no routes mounted under %s — check its api/ imports", _e.id, ", ".join(_missing))
 
     # Resume any in-flight video projects (productions + music videos, + future kinds)
     # after a crash. DB-driven — no in-memory state to lose. One registry-driven pass,
@@ -1156,7 +1231,43 @@ def _initialize_app_components(app):
             pass
     atexit.register(_unload_heavy_generators)
 
+    # MCP: keep first-class mcp__<server>__<tool> proxies in sync with server
+    # connections. The service stops its MCP child processes via atexit.
+    # Tools read the project-folder limit from threads without an app
+    # context; load it once here.
+    try:
+        with app.app_context():
+            from backend.utils.settings_utils import get_confine_tool_paths
+            get_confine_tool_paths()
+    except Exception as e:
+        app.logger.warning(f"Could not load the tool path limit setting: {e}")
+
+    try:
+        from backend.tools.mcp_tools import install_proxy_sync
+        install_proxy_sync()
+    except Exception as e:
+        app.logger.warning(f"MCP proxy tool sync unavailable: {e}")
+
     return app
+
+
+def start_mcp_autoconnect(app):
+    """Connect MCP servers marked autoConnect, off the startup path."""
+    from backend import config as _cfg
+
+    if not (_cfg.MCP_ENABLED and _cfg.MCP_AUTOCONNECT):
+        return
+
+    def _run():
+        try:
+            from backend.services.mcp_client_service import get_mcp_service
+            result = get_mcp_service().autoconnect()
+            if result.get("results"):
+                app.logger.info(f"MCP autoconnect: {result['results']}")
+        except Exception as e:
+            app.logger.warning(f"MCP autoconnect failed: {e}")
+
+    threading.Thread(target=_run, name="mcp-autoconnect", daemon=True).start()
 
 app = create_app()
 
@@ -1297,6 +1408,55 @@ try:
                     except Exception:
                         pass
 
+            # Feedback rows learned to name a reply and carry what they taught
+            # (2026-09-22). Additive, nullable; legacy rows keep working.
+            for _col, _ddl in (
+                ("message_id", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS message_id INTEGER"),
+                ("request_id", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS request_id VARCHAR(64)"),
+                ("kind", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS kind VARCHAR(120) DEFAULT 'response'"),
+                ("verdict", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS verdict VARCHAR(8)"),
+                ("why_text", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS why_text TEXT"),
+                ("why_tags", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS why_tags JSON"),
+                ("provenance", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS provenance JSON"),
+                ("applied", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS applied JSON"),
+                ("updated_at", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP"),
+                ("retracted_at", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS retracted_at TIMESTAMP"),
+            ):
+                try:
+                    from sqlalchemy import text as _sa_text
+                    existing = db.session.execute(_sa_text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'tool_feedback' AND column_name = :c"
+                    ), {"c": _col}).fetchone()
+                    if existing is None:
+                        app.logger.warning(f"Adding missing tool_feedback.{_col} column (legacy DB)")
+                        db.session.execute(_sa_text(_ddl))
+                        db.session.commit()
+                except Exception as col_err:
+                    app.logger.warning(f"Failed to ensure tool_feedback.{_col} column: {col_err}")
+                    try:
+                        db.session.rollback()
+                    except Exception:
+                        pass
+            for _stmt in (
+                "UPDATE tool_feedback SET verdict = CASE WHEN positive THEN 'up' ELSE 'down' END WHERE verdict IS NULL",
+                "UPDATE tool_feedback SET kind = 'response' WHERE kind IS NULL",
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_tool_feedback_message_kind "
+                "ON tool_feedback (message_id, kind) WHERE message_id IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS ix_tool_feedback_request_id ON tool_feedback (request_id)",
+                "CREATE INDEX IF NOT EXISTS ix_tool_feedback_message_id ON tool_feedback (message_id)",
+            ):
+                try:
+                    from sqlalchemy import text as _sa_text
+                    db.session.execute(_sa_text(_stmt))
+                    db.session.commit()
+                except Exception as idx_err:
+                    app.logger.warning(f"tool_feedback reconcile skipped: {idx_err}")
+                    try:
+                        db.session.rollback()
+                    except Exception:
+                        pass
+
             # Agent memory scope/curation fields added after the base schema.
             # Existing Postgres databases need additive ALTERs because
             # db.create_all() does not change existing tables.
@@ -1328,6 +1488,18 @@ try:
                     except Exception:
                         pass
 
+            # Extension schema additions (create_all never alters), then seeds.
+            # This block runs at module level after create_app() has returned,
+            # so the loader is bound again here; discovery is a directory scan
+            # and the load report it records into is module-level.
+            from backend import extensions as _ext
+            _extensions = _ext.discover()
+            try:
+                for _ext_id, _cols in _ext.run_migrations(_extensions, db, app.logger).items():
+                    _ext.record(_ext_id, "migrations", True, _cols)
+            except Exception as ext_err:
+                app.logger.error(f"Extension migrations failed: {ext_err}")
+
             # Create default OS-style folders (Images/, Videos/, Code/) so
             # generated outputs land somewhere DocumentsPage can see them
             try:
@@ -1336,6 +1508,15 @@ try:
                 app.logger.info("Default folders verified (Images, Videos, Code)")
             except Exception as folder_err:
                 app.logger.warning(f"Default folder setup skipped: {folder_err}")
+
+            try:
+                for _ext_id, _outcome in _ext.run_seeds(_extensions, app).items():
+                    _ext.record(_ext_id, "seed", not _outcome.startswith("error"), _outcome)
+            except Exception as ext_err:
+                app.logger.error(f"Extension seeds failed: {ext_err}")
+            if _extensions:
+                _summary = ", ".join(f"{e.id} v{e.version}" + ("" if _ext.load_report().get(e.id, {}).get("ok", True) else " (ERRORS)") for e in _extensions)
+                app.logger.info(f"Extensions loaded: {_summary}")
 
             # Stamp Alembic to head (so health checks pass)
             if not os.environ.get("GUAARDVARK_SKIP_MIGRATIONS") and not migrations_already_verified:
@@ -2162,6 +2343,54 @@ def handle_internal_server_error(e):
     )
 
 
+@app.cli.command("load-rules")
+@click.argument("bundle_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--enable", is_flag=True, help="Also switch the global rules toggle on.")
+def load_rules_cli(bundle_file, enable):
+    """Apply a rule bundle (persona + rules), upserting by name.
+
+    Bundles live in backend/rule_bundles/. The running server bakes the persona
+    into its prompts at startup; POST /api/brain/refresh picks the new one up
+    without a restart.
+    """
+    from backend.models import Setting
+    from backend.seed_data import load_rule_bundle
+
+    with app.app_context():
+        counts = load_rule_bundle(bundle_file)
+        if enable:
+            row = db.session.get(Setting, "rules_enabled")
+            if row is None:
+                db.session.add(Setting(key="rules_enabled", value="true"))
+            else:
+                row.value = "true"
+            db.session.commit()
+    click.echo(
+        f"{bundle_file}: inserted {counts['inserted']}, updated {counts['updated']}, "
+        f"deactivated {counts['deactivated']}"
+        + ("; rules_enabled=true" if enable else "")
+    )
+    click.echo("If the server is running: curl -X POST <host>/api/brain/refresh")
+
+
+@app.cli.command("load-lessons")
+@click.argument("bundle_file", type=click.Path(exists=True, dir_okay=False))
+def load_lessons_cli(bundle_file):
+    """Apply a lesson bundle, upserting procedures by title.
+
+    Bundles live in backend/lesson_bundles/. Lessons are stored as agent_memories
+    and surface in chat via get_memories_for_context.
+    """
+    from backend.seed_data import load_lesson_bundle
+
+    with app.app_context():
+        counts = load_lesson_bundle(bundle_file)
+    click.echo(
+        f"{bundle_file}: inserted {counts['inserted']}, updated {counts['updated']}, "
+        f"invalid {counts['invalid']}"
+    )
+
+
 @app.cli.command("seed-db")
 @click.option("--force", is_flag=True, help="Force seeding even if models exist.")
 def seed_database_cli(force):
@@ -2471,6 +2700,10 @@ if __name__ == "__main__":
         f"Starting Flask+SocketIO server on {run_host}:{run_port} "
         f"(LLM timeout: {app.config.get('LLM_REQUEST_TIMEOUT', LLM_REQUEST_TIMEOUT)}s)"
     )
+    # With the debug reloader, only the serving child (WERKZEUG_RUN_MAIN=true)
+    # should spawn MCP server processes, not the file-watching parent.
+    if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        start_mcp_autoconnect(app)
     socketio.run(app, host=run_host, port=run_port, debug=app.debug,
                  allow_unsafe_werkzeug=True)
 else:

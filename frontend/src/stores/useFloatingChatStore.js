@@ -1,6 +1,10 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 
+// Enough for a working day of floating-chat turns; older ones live in the
+// session history on the server.
+const MAX_PERSISTED_MESSAGES = 200;
+
 export const useFloatingChatStore = create(
   persist(
     // eslint-disable-next-line no-unused-vars
@@ -9,6 +13,15 @@ export const useFloatingChatStore = create(
       isOpen: false,
       setIsOpen: (open) => set({ isOpen: open }),
       toggleOpen: () => set((state) => ({ isOpen: !state.isOpen })),
+
+      // The floating button can be dismissed. The choice outlives a reload only
+      // while the workspace bar shows its own chat button, so a chrome without
+      // one gets the button back on the next load.
+      fabHidden: false,
+      fabHiddenThisSession: false,
+      hideFab: () => set({ fabHidden: true, fabHiddenThisSession: true }),
+      barChatEntry: false,
+      setBarChatEntry: (present) => set({ barChatEntry: Boolean(present) }),
 
       // Window geometry (persisted)
       position: { x: -1, y: -1 }, // -1 signals "use default" on first render
@@ -19,7 +32,8 @@ export const useFloatingChatStore = create(
       setCollapsed: (collapsed) => set({ collapsed }),
       toggleCollapsed: () => set((s) => ({ collapsed: !s.collapsed })),
 
-      // Chat state (NOT persisted)
+      // Chat state. The thread and its session id persist so a page refresh
+      // brings the conversation back; "+" starts a new one.
       messages: [],
       addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
       updateMessage: (id, updates) =>
@@ -41,9 +55,13 @@ export const useFloatingChatStore = create(
       sessionId: `floating_${Date.now()}`,
       setSessionId: (id) => set({ sessionId: id }),
 
-      // Page context (updated reactively by FloatingChatProvider)
+      // Page context (updated reactively by FloatingChatProvider). A page that
+      // knows what its entity is called sets entityLabel after it loads; a route
+      // change clears it so a stale name never sits over a new id.
       pageContext: null,
-      setPageContext: (ctx) => set({ pageContext: ctx }),
+      setPageContext: (ctx) => set({ pageContext: ctx, entityLabel: null }),
+      entityLabel: null,
+      setEntityLabel: (label) => set({ entityLabel: label || null }),
     }),
     {
       name: "guaardvark-floating-chat",
@@ -52,6 +70,10 @@ export const useFloatingChatStore = create(
         position: state.position,
         size: state.size,
         collapsed: state.collapsed,
+        isOpen: state.isOpen,
+        fabHidden: state.fabHidden,
+        sessionId: state.sessionId,
+        messages: state.messages.slice(-MAX_PERSISTED_MESSAGES),
       }),
       merge: (persistedState, currentState) => ({
         ...currentState,

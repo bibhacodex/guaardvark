@@ -19,6 +19,8 @@ from typing import Optional
 
 import requests
 
+from backend.utils.ollama_resource_manager import think_payload
+
 logger = logging.getLogger(__name__)
 
 
@@ -115,6 +117,7 @@ def grade_draft_externally(draft_text: str, thread_context: str) -> dict:
                 ],
                 "options": {"temperature": 0.1, "num_ctx": 4096},
                 "format": "json",
+                **think_payload(model),
             },
             timeout=60,
         )
@@ -194,6 +197,7 @@ def score_thread_relevance(
                 ],
                 "options": {"temperature": 0.1, "num_ctx": 4096},
                 "format": "json",
+                **think_payload(model),
             },
             timeout=45,
         )

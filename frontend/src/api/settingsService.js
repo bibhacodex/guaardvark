@@ -28,6 +28,71 @@ export const clearPycache = async () => {
   }
 };
 
+export const getProfile = async () => {
+  const response = await fetch(`${BASE_URL}/settings/profile`);
+  return await handleResponse(response);
+};
+
+export const setProfile = async (name) => {
+  const response = await fetch(`${BASE_URL}/settings/profile`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  const data = await handleResponse(response);
+  if (typeof data === "object" && data !== null && data.error) throw new Error(data.error);
+  return data;
+};
+
+/**
+ * How the start/stop scripts treat Ollama, as recorded in .env.
+ * @returns {Promise<{keep_running: boolean, external: boolean, env_writable: boolean}>}
+ */
+export const getOllamaLifecycle = async () => {
+  const response = await fetch(`${BASE_URL}/settings/ollama_lifecycle`);
+  return await handleResponse(response);
+};
+
+/**
+ * Persist the Ollama policy. Takes effect on the next stop/start; no restart needed.
+ * @param {{keep_running?: boolean, external?: boolean}} body
+ */
+export const setOllamaLifecycle = async (body) => {
+  const response = await fetch(`${BASE_URL}/settings/ollama_lifecycle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await handleResponse(response);
+  if (typeof data === "object" && data !== null && data.error) throw new Error(data.error);
+  return data;
+};
+
+export const getGenerationHistoryCounts = async () => {
+  const endpoint = `${BASE_URL}/meta/generation-history`;
+  try {
+    const response = await fetch(endpoint);
+    return await handleResponse(response);
+  } catch (err) {
+    console.error("settingsService: Error fetching generation history counts:", err.message);
+    return null;
+  }
+};
+
+export const deleteGenerationHistory = async () => {
+  const endpoint = `${BASE_URL}/meta/generation-history`;
+  try {
+    const response = await fetch(endpoint, { method: "DELETE" });
+    const data = await handleResponse(response);
+    if (typeof data === "object" && data !== null && data.error)
+      throw new Error(data.error);
+    return data;
+  } catch (err) {
+    console.error("settingsService: Error deleting generation history:", err.message);
+    throw err;
+  }
+};
+
 export const getChatHistoryCounts = async () => {
   const endpoint = `${BASE_URL}/enhanced-chat/history/all`;
   try {
@@ -189,6 +254,26 @@ export const resumePendingIndexing = async () => {
     return data;
   } catch (err) {
     console.error("settingsService: Error resuming pending indexing:", err.message);
+    throw err;
+  }
+};
+
+export const buildCorpusSummaries = async (options = {}) => {
+  // RAPTOR: minutes of sustained GPU work, so the backend queues it and returns a
+  // task id rather than holding the request open.
+  const endpoint = `${BASE_URL}/index/build-corpus-summaries`;
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(options),
+    });
+    const data = await handleResponse(response);
+    if (typeof data === "object" && data !== null && data.error)
+      throw new Error(data.error);
+    return data;
+  } catch (err) {
+    console.error("settingsService: Error queuing corpus summary build:", err.message);
     throw err;
   }
 };
@@ -550,6 +635,30 @@ export const triggerReboot = async () => {
   }
 };
 
+export const getConfineToolPaths = async () => {
+  try {
+    const response = await fetch(`${BASE_URL}/settings/confine_tool_paths`);
+    return await handleResponse(response);
+  } catch (err) {
+    console.error("settingsService: Error getting tool path limit:", err.message);
+    return { error: err.message };
+  }
+};
+
+export const setConfineToolPaths = async (enabled) => {
+  try {
+    const response = await fetch(`${BASE_URL}/settings/confine_tool_paths`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confine_tool_paths: !!enabled }),
+    });
+    return await handleResponse(response);
+  } catch (err) {
+    console.error("settingsService: Error setting tool path limit:", err.message);
+    return { error: err.message };
+  }
+};
+
 export const getLlmDebug = async () => {
   try {
     const response = await fetch(`${BASE_URL}/settings/llm_debug`);
@@ -573,33 +682,6 @@ export const setLlmDebug = async (enabled) => {
     return await handleResponse(response);
   } catch (err) {
     console.error("settingsService: Error setting LLM debug:", err.message);
-    return { error: err.message };
-  }
-};
-
-export const getRagDebug = async () => {
-  try {
-    const response = await fetch(`${BASE_URL}/settings/rag_debug`);
-    return await handleResponse(response);
-  } catch (err) {
-    console.error(
-      "settingsService: Error getting RAG debug setting:",
-      err.message,
-    );
-    return { error: err.message };
-  }
-};
-
-export const setRagDebug = async (enabled) => {
-  try {
-    const response = await fetch(`${BASE_URL}/settings/rag_debug`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rag_debug_enabled: !!enabled }),
-    });
-    return await handleResponse(response);
-  } catch (err) {
-    console.error("settingsService: Error setting RAG debug:", err.message);
     return { error: err.message };
   }
 };

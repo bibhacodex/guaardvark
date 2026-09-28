@@ -31,6 +31,14 @@ def client(app):
 def _no_dispatch(monkeypatch):
     # Never actually enqueue Celery work in API tests.
     monkeypatch.setattr(MusicVideoService, "dispatch_agent", lambda self, mv_id, agent: None)
+    monkeypatch.setattr(
+        "backend.services.video_model_registry.resolve_active_video_model",
+        lambda role, explicit=None, surface=None: (explicit or "wan22-5b", None),
+    )
+    monkeypatch.setattr(
+        "backend.api.music_video_api.get_video_generator",
+        lambda: type("VG", (), {"service_available": True})(),
+    )
 
 
 def _song_doc(tmp_path):
@@ -52,6 +60,36 @@ def test_create_rejects_missing_song_document(client):
         "name": "x", "style_prompt": "deep blue", "song_document_id": 9999,
     })
     assert resp.status_code == 400
+
+
+def test_create_rejects_unknown_i2v_model(client, app, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "backend.services.video_model_registry.resolve_active_video_model",
+        lambda *a, **k: (None, "Unknown video model 'nope'"),
+    )
+    with app.app_context():
+        doc = _song_doc(tmp_path)
+        resp = client.post("/api/music-video", json={
+            "name": "x",
+            "style_prompt": "deep blue",
+            "song_document_id": doc.id,
+            "settings": {"i2v_model": "nope"},
+        })
+    assert resp.status_code == 400
+    assert "Unknown" in (resp.get_json() or {}).get("error", "")
+
+
+def test_mv_dict_defaults_i2v_to_registry_default(app, tmp_path):
+    from backend.api.music_video_api import _mv_dict
+    from backend.services.video_model_registry import DEFAULT_I2V_MODEL
+    with app.app_context():
+        doc = _song_doc(tmp_path)
+        svc = MusicVideoService(db.session)
+        mv = svc.create(
+            name="x", song_document_id=doc.id, song_path=str(tmp_path / "song.wav"),
+            style_prompt="x", project_id=None, settings={},
+        )
+        assert _mv_dict(mv)["i2v_model"] == DEFAULT_I2V_MODEL
 
 
 def test_create_advances_to_analyzing(client, app, tmp_path):

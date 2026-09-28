@@ -52,6 +52,25 @@ if [ ! -f "$VENV_PYTHON" ]; then
     exit 1
 fi
 
+# Launch settings (GUAARDVARK_COMFYUI_*) come from the checkout's .env at every
+# start, on top of the inherited environment, so editing .env and restarting
+# the plugin is enough for a reserve or attention change. The backend's own
+# environment is frozen at backend start and used to win here. Parsed by
+# dotenv_launch_overrides in backend/services/comfyui_launch_flags.py (loaded
+# by path: no backend package import).
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    _dotenv_exports=$("$VENV_PYTHON" - "$PROJECT_ROOT" <<'DOTENV'
+import importlib.util, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location(
+    "comfyui_launch_flags", root / "backend" / "services" / "comfyui_launch_flags.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+print(mod.shell_exports(mod.dotenv_launch_overrides(root / ".env")))
+DOTENV
+    ) && eval "$_dotenv_exports"
+fi
+
 # Install ComfyUI + custom-node deps into backend/venv (shared — no plugin venv)
 # shellcheck source=install_deps.sh
 source "$SCRIPT_DIR/install_deps.sh"
@@ -171,13 +190,104 @@ echo "Log: $LOG_FILE"
 #   --cache-none            no execution cache: caps the RAM-pressure cache AND
 #                           re-runs LoraLoader each prompt, which the patched
 #                           unpatch_model() relies on to rebuild patches
-#   --reserve-vram 1.0      the desktop compositor holds 600-800MB VRAM; without
-#                           headroom a maxed 16GB card starves it and Wayland dies
+#   --reserve-vram N        the desktop compositor holds 600-800MB VRAM; without
+#                           headroom a maxed 16GB card starves it and Wayland dies.
+#                           Default 1.0 GB; GUAARDVARK_COMFYUI_RESERVE_VRAM raises it
+#                           when a partially loaded model needs more room for its
+#                           activations than ComfyUI's estimate leaves (MiniMax H3's
+#                           int8 MLP ran out at 0.9 GB of headroom on a 16 GB card).
+#   --disable-pinned-memory ComfyUI otherwise page-locks up to ~90% of system RAM
+#                           for offload buffers; pinned pages cannot be swapped or
+#                           reclaimed, so the desktop starves before the OOM killer
+#                           acts. GUAARDVARK_COMFYUI_PINNED_MEMORY=1 re-enables it.
+#   --listen 127.0.0.1      ComfyUI has no auth; every consumer is on this host.
+#                           GUAARDVARK_COMFYUI_LISTEN overrides for deliberate LAN use.
+#   --preview-method/size   ComfyUI defaults to none, so API runs emit no sampler
+#                           thumbnails. auto → Latent2RGB. Keep in lockstep with
+#                           backend/services/comfyui_launch_flags.py.
+#                           GUAARDVARK_COMFYUI_PREVIEW_METHOD=none turns them off.
+#   --disable-api-nodes     no cloud API nodes, and the ComfyUI frontend stops
+#                           talking to the internet.
+#   --use-ck-attention /    attention backend, GUAARDVARK_COMFYUI_ATTENTION=
+#   --use-sage-attention    auto|ck|sage|pytorch (default pytorch). ck is
+#                           comfy_kitchen's int8 kernel already in the venv; sage
+#                           needs the sageattention package installed by hand.
+#                           Process-wide, every family. Keep in lockstep with
+#                           backend/services/comfyui_launch_flags.py.
+#
+# Nothing leaves the machine during generation. Custom nodes will download
+# weights from Hugging Face on their own when a file is missing (the CogVideoX
+# wrapper pulled 11GB mid-render, 2026-08-28), so the Hub client runs offline
+# in this process: a missing file is a loud error naming Manage Video Models,
+# never a silent download. Installs happen in the backend behind the Install
+# button. Keep in lockstep with LOCAL_ONLY_ENV in comfyui_launch_flags.py.
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_HUB_DISABLE_TELEMETRY=1
+export DO_NOT_TRACK=1
 cd "$COMFYUI_DIR"
 # Under memory pressure the kernel must kill ComfyUI, never the desktop
 # (2026-08-04 client box lockups). Children inherit; unprivileged raises allowed.
 echo "${GUAARDVARK_OOM_SCORE_ADJ:-500}" > /proc/self/oom_score_adj 2>/dev/null || true
-"$VENV_PYTHON" main.py --listen --port "$PORT" --disable-smart-memory --cache-none --reserve-vram 1.0 >> "$LOG_FILE" 2>&1 &
+PIN_FLAG="--disable-pinned-memory"
+[ "${GUAARDVARK_COMFYUI_PINNED_MEMORY:-0}" = "1" ] && PIN_FLAG=""
+PREVIEW_METHOD="${GUAARDVARK_COMFYUI_PREVIEW_METHOD:-auto}"
+case "$PREVIEW_METHOD" in
+    none|auto|latent2rgb|taesd) ;;
+    *) PREVIEW_METHOD=auto ;;
+esac
+PREVIEW_SIZE="${GUAARDVARK_COMFYUI_PREVIEW_SIZE:-256}"
+PREVIEW_FLAGS="--preview-method ${PREVIEW_METHOD}"
+if [ "$PREVIEW_METHOD" != "none" ]; then
+    PREVIEW_FLAGS="$PREVIEW_FLAGS --preview-size ${PREVIEW_SIZE}"
+fi
+# Attention backend: only a backend whose package imports is passed, so a
+# typo or a missing wheel never stops ComfyUI from starting.
+ATTENTION="${GUAARDVARK_COMFYUI_ATTENTION:-pytorch}"
+case "$ATTENTION" in
+    auto|ck|sage|pytorch) ;;
+    *) ATTENTION=pytorch ;;
+esac
+CK_OK=0; SAGE_OK=0
+"$VENV_PYTHON" -c 'import comfy_kitchen as ck, sys; sys.exit(0 if ck.int8_attention_is_available() else 1)' >/dev/null 2>&1 && CK_OK=1
+"$VENV_PYTHON" -c 'import sageattention' >/dev/null 2>&1 && SAGE_OK=1
+if [ "$ATTENTION" = "auto" ]; then
+    if [ "$CK_OK" = "1" ]; then ATTENTION=ck; elif [ "$SAGE_OK" = "1" ]; then ATTENTION=sage; else ATTENTION=pytorch; fi
+fi
+ATTN_FLAG=""
+case "$ATTENTION" in
+    ck)   [ "$CK_OK" = "1" ] && ATTN_FLAG="--use-ck-attention" ;;
+    sage) [ "$SAGE_OK" = "1" ] && ATTN_FLAG="--use-sage-attention" ;;
+esac
+echo "Attention: ${ATTN_FLAG:-pytorch (default)}"
+# Reserve precedence (keep in lockstep with reserve_vram_cli_args in
+# backend/services/comfyui_launch_flags.py): an explicit
+# GUAARDVARK_COMFYUI_RESERVE_VRAM wins; otherwise the value the video generator
+# requested for the model about to run (pids/comfyui.reserve-vram, from the
+# registry's comfyui_reserve_vram_gb); otherwise 1.0.
+RESERVE_REQUEST_FILE="$PROJECT_ROOT/pids/comfyui.reserve-vram"
+RESERVE_SOURCE="default"
+if [ -n "${GUAARDVARK_COMFYUI_RESERVE_VRAM:-}" ]; then
+    RESERVE_SOURCE="GUAARDVARK_COMFYUI_RESERVE_VRAM"
+elif [ -f "$RESERVE_REQUEST_FILE" ]; then
+    GUAARDVARK_COMFYUI_RESERVE_VRAM=$(head -n 1 "$RESERVE_REQUEST_FILE" 2>/dev/null | tr -d '[:space:]')
+    RESERVE_SOURCE="requested by the model (pids/comfyui.reserve-vram)"
+fi
+RESERVE_VRAM="${GUAARDVARK_COMFYUI_RESERVE_VRAM:-1.0}"
+case "$RESERVE_VRAM" in
+    ''|*[!0-9.]*) RESERVE_VRAM=1.0; RESERVE_SOURCE="default (value was not a number)" ;;
+esac
+echo "Reserve VRAM: ${RESERVE_VRAM} GB (${RESERVE_SOURCE})"
+# Cast Library LoRAs live in STORAGE_DIR/training/loras; guaardvark_model_paths.yaml
+# adds that folder to ComfyUI's LoRA search. STORAGE_DIR resolves as in backend/config.py.
+STORAGE_DIR="${GUAARDVARK_STORAGE_DIR:-data}"
+case "$STORAGE_DIR" in
+    /*) ;;
+    *) STORAGE_DIR="${GUAARDVARK_ROOT:-$PROJECT_ROOT}/$STORAGE_DIR" ;;
+esac
+export GUAARDVARK_TRAINING_DIR="$STORAGE_DIR/training"
+echo "Cast LoRAs: $GUAARDVARK_TRAINING_DIR/loras"
+"$VENV_PYTHON" main.py --listen "${GUAARDVARK_COMFYUI_LISTEN:-127.0.0.1}" --port "$PORT" --disable-smart-memory --cache-none --reserve-vram "$RESERVE_VRAM" --disable-api-nodes --extra-model-paths-config "$PLUGIN_ROOT/guaardvark_model_paths.yaml" $PIN_FLAG $PREVIEW_FLAGS $ATTN_FLAG >> "$LOG_FILE" 2>&1 &
 
 # Save PID
 PID_DIR="$PROJECT_ROOT/pids"

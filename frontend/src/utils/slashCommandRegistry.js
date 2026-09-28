@@ -6,10 +6,64 @@
  */
 
 const BUILT_IN_COMMANDS = [
-  {
+    {
     name: "/imagine",
     description: "Generate an image from a text prompt",
     usage: "/imagine <prompt>",
+    category: "generation",
+    args: "required",
+    handler: "builtin",
+    ruleId: null,
+  },
+  {
+    name: "/removebg",
+    description: "Remove the background from the attached photo (transparent PNG)",
+    usage: "/removebg",
+    category: "generation",
+    args: "none",
+    handler: "builtin",
+    ruleId: null,
+  },
+  {
+    name: "/inpaint",
+    description: "Change or remove something in the attached photo",
+    usage: "/inpaint <instruction>",
+    category: "generation",
+    args: "required",
+    handler: "builtin",
+    ruleId: null,
+  },
+  {
+    name: "/outpaint",
+    description: "Extend the attached photo and fill the new canvas",
+    usage: "/outpaint [left|right|top|bottom|all] [instruction]",
+    category: "generation",
+    args: "optional",
+    handler: "builtin",
+    ruleId: null,
+  },
+  {
+    name: "/video",
+    description: "Queue a video clip from a text prompt",
+    usage: "/video <prompt>",
+    category: "generation",
+    args: "required",
+    handler: "builtin",
+    ruleId: null,
+  },
+  {
+    name: "/music-video",
+    description: "Start a music-video plan from a song (approve in Studio before clips render)",
+    usage: "/music-video <song-path-or-id> <style>",
+    category: "generation",
+    args: "required",
+    handler: "builtin",
+    ruleId: null,
+  },
+  {
+    name: "/film-crew",
+    description: "Start a Film Crew production from a screenplay (renders wait in Studio)",
+    usage: "/film-crew <screenplay>",
     category: "generation",
     args: "required",
     handler: "builtin",
@@ -39,6 +93,42 @@ const BUILT_IN_COMMANDS = [
     usage: "/websearch <query>",
     category: "utility",
     args: "required",
+    handler: "builtin",
+    ruleId: null,
+  },
+  {
+    name: "/gpu",
+    description: "Inspect live GPU lock, VRAM slots, and running plugins",
+    usage: "/gpu",
+    category: "utility",
+    args: "none",
+    handler: "builtin",
+    ruleId: null,
+  },
+  {
+    name: "/logs",
+    description: "Tail a Guaardvark log (optional filename and grep)",
+    usage: "/logs [backend.log] [query]",
+    category: "utility",
+    args: "optional",
+    handler: "builtin",
+    ruleId: null,
+  },
+  {
+    name: "/sysmap",
+    description: "Run the System Mapper (same snapshot as /system-map)",
+    usage: "/sysmap [refresh]",
+    category: "utility",
+    args: "optional",
+    handler: "builtin",
+    ruleId: null,
+  },
+  {
+    name: "/swarm",
+    description: "Swarm orchestrator status (plugin must be running)",
+    usage: "/swarm [swarm-id]",
+    category: "utility",
+    args: "optional",
     handler: "builtin",
     ruleId: null,
   },
@@ -148,6 +238,23 @@ let _dbCommandsCacheTime = 0;
 const DB_COMMANDS_TTL = 60000; // 60 seconds
 
 /**
+ * COMMAND_RULE list from GET /api/rules. The live handler returns a bare array
+ * (`jsonify(items)`). Older envelopes used `{rules}` or `{data: {rules}}`.
+ */
+export function extractCommandRules(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.data?.rules)) return payload.data.rules;
+  if (Array.isArray(payload?.rules)) return payload.rules;
+  return [];
+}
+
+/** Drop the 60s COMMAND_RULE cache (tests). */
+export function resetDbCommandsCache() {
+  _dbCommandsCache = null;
+  _dbCommandsCacheTime = 0;
+}
+
+/**
  * Fetch COMMAND_RULE entries from the backend.
  * Cached for 60 seconds to avoid redundant fetches on re-mount.
  */
@@ -161,7 +268,7 @@ async function fetchDbCommands() {
     const res = await fetch("/api/rules?type=COMMAND_RULE&is_active=true");
     if (!res.ok) return _dbCommandsCache || [];
     const data = await res.json();
-    const rules = data.data?.rules || data.rules || [];
+    const rules = extractCommandRules(data);
     _dbCommandsCache = rules
       .filter((r) => r.command_label)
       .map((r) => ({
@@ -236,4 +343,11 @@ export function parseCommand(input) {
   };
 }
 
-export default { getAllCommands, getBuiltInCommands, filterCommands, parseCommand };
+export default {
+  getAllCommands,
+  getBuiltInCommands,
+  filterCommands,
+  parseCommand,
+  extractCommandRules,
+  resetDbCommandsCache,
+};

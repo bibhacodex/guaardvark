@@ -49,6 +49,35 @@ class TestSlashCommandResolver:
         assert tool == "generate_image"
         assert params["prompt"] == "sunset"
 
+    def test_video_resolves_to_generate_video(self):
+        from backend.services.slash_command_executor import resolve_slash_direct_tool
+
+        tool, params = resolve_slash_direct_tool({
+            "slash_command": "video",
+            "slash_args": "a cat playing piano",
+        })
+        assert tool == "generate_video"
+        assert params["prompt"] == "a cat playing piano"
+        assert tool != "generate_animation"
+
+    def test_identity_slash_does_not_grant_consent(self):
+        """Consent is a stored record obtained through the chat card, not a flag."""
+        from backend.services.slash_command_executor import resolve_slash_direct_tool
+
+        tool, params = resolve_slash_direct_tool({
+            "slash_command": "identity",
+            "slash_args": "a 1940s detective in the rain",
+        })
+        assert tool == "generate_identity"
+        assert params["prompt"] == "a 1940s detective in the rain"
+        assert "consented" not in params
+
+    def test_removebg_slash(self):
+        from backend.services.slash_command_executor import resolve_slash_direct_tool
+
+        tool, params = resolve_slash_direct_tool({"slash_command": "removebg"})
+        assert tool == "remove_background"
+
 
 class TestDirectToolIntercept:
     def test_try_direct_tool_calls_registry_without_llm(self):
@@ -222,6 +251,29 @@ class TestSlashCommandMap:
 
         assert SLASH_COMMAND_TOOL_MAP["imagine"] == "generate_image"
         assert SLASH_COMMAND_TOOL_MAP["websearch"] == "web_search"
+        assert SLASH_COMMAND_TOOL_MAP["music-video"] == "generate_music_video"
+        assert SLASH_COMMAND_TOOL_MAP["film-crew"] == "start_film_crew"
+
+    def test_music_video_slash_resolves_params(self):
+        from backend.services.slash_command_executor import resolve_slash_direct_tool
+
+        tool, params = resolve_slash_direct_tool({
+            "slash_command": "music-video",
+            "slash_args": "song.mp3 neon noir rain",
+        })
+        assert tool == "generate_music_video"
+        assert params["song"] == "song.mp3"
+        assert "neon noir" in params["style_prompt"]
+
+    def test_film_crew_slash_resolves_params(self):
+        from backend.services.slash_command_executor import resolve_slash_direct_tool
+
+        tool, params = resolve_slash_direct_tool({
+            "slash_command": "film-crew",
+            "slash_args": "INT. ROOM. Hi.",
+        })
+        assert tool == "start_film_crew"
+        assert "INT. ROOM" in params["script_text"]
 
     def test_generate_image_registry_category(self):
         from backend.tools.tool_registry_init import get_tool_categories, initialize_all_tools
@@ -229,3 +281,5 @@ class TestSlashCommandMap:
         initialize_all_tools()
         cats = get_tool_categories()
         assert cats.get("generate_image") == "image"
+        assert cats.get("generate_music_video") == "image"
+        assert cats.get("start_film_crew") == "image"

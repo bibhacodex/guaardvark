@@ -4,56 +4,18 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Typography,
   Box,
-  Stack,
   Select,
   MenuItem,
-  Button,
   FormControl,
   InputLabel,
-  CircularProgress,
-  Paper,
   Tooltip,
-  Switch,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogContentText,
-  DialogActions,
   TextField,
   Avatar,
-  Slider,
 } from "@mui/material";
-import MuiAlert from "@mui/material/Alert";
 
 // MUI Icons
-import CheckCircleOutlineIcon from "@mui/icons-material/CheckCircleOutline";
-import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
-import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
-import SyncProblemIcon from "@mui/icons-material/SyncProblem";
-import StorageIcon from "@mui/icons-material/Storage";
-import DnsIcon from "@mui/icons-material/Dns";
-import SpeedIcon from "@mui/icons-material/Speed";
-import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
-import FileDownloadIcon from "@mui/icons-material/FileDownload";
 import AccountBoxIcon from "@mui/icons-material/AccountBox";
-import WarningIcon from "@mui/icons-material/Warning";
-import SecurityIcon from "@mui/icons-material/Security";
-import FolderIcon from "@mui/icons-material/Folder";
-import ChatIcon from "@mui/icons-material/Chat";
-import ApiIcon from "@mui/icons-material/Api";
-import SystemIcon from "@mui/icons-material/Computer";
-import TrendingUpIcon from "@mui/icons-material/TrendingUp";
-import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
-import {
-  Accordion,
-  AccordionSummary,
-  AccordionDetails,
-  Chip,
-  LinearProgress,
-  Divider,
-  Collapse,
-} from "@mui/material";
-import { alpha } from "@mui/material/styles";
+import { LinearProgress } from "@mui/material";
 
 import { io } from "socket.io-client";
 import CreateBackupModal from "../components/modals/CreateBackupModal";
@@ -62,23 +24,20 @@ import ManageBackupsModal from "../components/modals/ManageBackupsModal";
 import PurgeIndexModal from "../components/modals/PurgeIndexModal";
 import ThemeSelectorModal from "../components/modals/ThemeSelectorModal";
 import UncleClaudeSection from "../components/settings/UncleClaudeSection";
-import MemoryManagementSection from "../components/settings/MemoryManagementSection";
 import AgentDisplaySection from "../components/settings/AgentDisplaySection";
 import KillSwitchModal from "../components/modals/KillSwitchModal";
 import RebootProgressModal from "../components/modals/RebootProgressModal";
-import RAGDebugSection from "../components/settings/RAGDebugSection";
 import ImageModelsModal from "../components/modals/ImageModelsModal";
 import InfographicModelsModal from "../components/modals/InfographicModelsModal";
 import VideoModelsModal from "../components/modals/VideoModelsModal";
 import VoiceModelsModal from "../components/modals/VoiceModelsModal";
-import AgentsSettingsModal from "../components/modals/AgentsSettingsModal";
+import AudioFoundryModelsModal from "../components/modals/AudioFoundryModelsModal";
 import InterconnectorSettingsModal from "../components/modals/InterconnectorSettingsModal";
 import VoiceSettingsModal from "../components/modals/VoiceSettingsModal";
-import SettingsRow from "../components/settings/SettingsRow";
-import SettingsCardWrapper from "../components/settings/SettingsCardWrapper";
+import ExportChatsButton from "../components/settings/ExportChatsButton";
+import ProfileSection from "../components/settings/ProfileSection";
 import { SOCKET_URL } from "../api/apiClient";
 import { SUPPORT_LINKS } from "../config/constants";
-import SchoolIcon from "@mui/icons-material/School";
 import CoffeeIcon from "@mui/icons-material/Coffee";
 import StarIcon from "@mui/icons-material/Star";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
@@ -86,8 +45,6 @@ import { useNavigate } from "react-router-dom";
 import {
   getBranding,
   updateBranding,
-  getRagDebug,
-  setRagDebug as setRagDebugAPI,
   getRagFeatures,
   updateRagFeatures,
   clearBehaviorLog,
@@ -97,12 +54,33 @@ import {
 import { useAppStore } from "../stores/useAppStore";
 import { useStatus } from "../contexts/StatusContext";
 import PageLayout from "../components/layout/PageLayout";
+import {
+  SettingChip,
+  ChoiceChips,
+  StatusPill,
+  ActionButton,
+  SettingsPanel,
+  Cluster,
+  Line,
+  Sep,
+  Hint,
+  ConfirmActionDialog,
+  DashboardStrip,
+  DashboardTile,
+} from "../components/settings/ui";
+import IndexProfileChips from "../components/settings/IndexProfileChips";
+import RebuildIndexDialog from "../components/settings/RebuildIndexDialog";
+import IndexProfileEditDialog from "../components/settings/IndexProfileEditDialog";
+import RefreshIcon from "@mui/icons-material/Refresh";
+import { useTheme, useMediaQuery } from "@mui/material";
 import { useSnackbar } from "../components/common/SnackbarProvider";
 import * as interconnectorApi from "../api/interconnectorService";
 import { useVoice } from "../contexts/VoiceContext";
 import * as apiService from "../api";
 import voiceService from "../api/voiceService";
 import { ragAutoresearchService } from "../api/ragAutoresearchService";
+import { getMcpStatus } from "../api/mcpService";
+import { NAV_CHROME } from "../config/navCatalog";
 
 const debugLog = (...args) => {
   if (import.meta.env.DEV) {
@@ -112,6 +90,16 @@ const debugLog = (...args) => {
 
 // localStorage keys for persisting settings
 const WEB_SEARCH_ENABLED_KEY = "guaardvark_webSearchEnabled";
+
+// model_api and system_api call success_response(message, data) with the
+// arguments reversed, so their payload arrives under "message". The service
+// layer compensates route by route; the raw fetches on this page do it here.
+const payloadOf = (d) => {
+  if (d && typeof d.data === "object" && d.data !== null) return d.data;
+  if (d && typeof d.message === "object" && d.message !== null)
+    return d.message;
+  return d?.data ?? d;
+};
 const ADV_DEBUG_ENABLED_KEY = "guaardvark_advDebugEnabled";
 const BEHAVIOR_LEARNING_ENABLED_KEY = "guaardvark_behaviorLearningEnabled";
 const LLM_DEBUG_ENABLED_KEY = "guaardvark_llmDebugEnabled";
@@ -137,9 +125,13 @@ const SettingsPage = () => {
   // Reset selectedModel if it's not in available options
   useEffect(() => {
     if (selectedModel && availableModels.length > 0) {
-      const isModelAvailable = availableModels.some(model => model.name === selectedModel);
+      const isModelAvailable = availableModels.some(
+        (model) => model.name === selectedModel,
+      );
       if (!isModelAvailable) {
-        console.warn(`Model "${selectedModel}" is not available, resetting selection`);
+        console.warn(
+          `Model "${selectedModel}" is not available, resetting selection`,
+        );
         setSelectedModel("");
       }
     }
@@ -148,12 +140,15 @@ const SettingsPage = () => {
   const [isTestingLLM, setIsTestingLLM] = useState(false); // Local state for Test LLM button
   const { showMessage, closeSnackbar } = useSnackbar();
   const navigate = useNavigate();
-  const [ragDebug, setRagDebug] = useState(false);
   const [enhancedContext, setEnhancedContext] = useState(false);
   const [advancedRag, setAdvancedRag] = useState(false);
   const [advancedDebug, setAdvancedDebug] = useState(getInitialAdvancedDebug);
   const [llmDebug, setLlmDebugState] = useState(getInitialLlmDebug);
   const [verbatimPrompts, setVerbatimPromptsState] = useState(false);
+  const [verbatimSaving, setVerbatimSaving] = useState(false);
+  // VERBATIM_PROMPTS in the server environment overrides the toggle; when set
+  // the chip shows on and cannot be changed here.
+  const [verbatimForcedByEnv, setVerbatimForcedByEnv] = useState(false);
   // Media stack (stills / cast LoRA train / max quality) — Ollama-picker style
   const [mediaModels, setMediaModelsState] = useState({
     stills_model: "zimage-turbo",
@@ -161,6 +156,12 @@ const SettingsPage = () => {
     max_quality_model: "flux-dev",
     train_profiles: [],
     stills_profiles: [],
+  });
+  const lastSavedLoraRef = useRef({});
+  const [loraSaveState, setLoraSaveState] = useState({
+    zimage: "saved",
+    sdxl: "saved",
+    flux: "saved",
   });
   const [behaviorLearningEnabled, setBehaviorLearningEnabled] = useState(
     getInitialBehaviorLearning,
@@ -217,13 +218,6 @@ const SettingsPage = () => {
     }
   }
   const [webSearchEnabled, setWebSearchEnabled] = useState(getInitialWebSearch);
-  const [isTesting, setIsTesting] = useState(false);
-  const [testResults, setTestResults] = useState(null);
-  const [isRunningTests, setIsRunningTests] = useState(false);
-  const [testMode, setTestMode] = useState("basic");
-  const [expandedCategories, setExpandedCategories] = useState({});
-  const [testSuiteResults, setTestSuiteResults] = useState(null);
-  const [testSuiteOutputOpen, setTestSuiteOutputOpen] = useState(false);
   // activeTab removed — all cards shown on single page
   const [musicDirectory, setMusicDirectory] = useState("");
 
@@ -253,48 +247,62 @@ const SettingsPage = () => {
 
   const [themeModalOpen, setThemeModalOpen] = useState(false);
   const [voiceSettingsModalOpen, setVoiceSettingsModalOpen] = useState(false);
-  const [agentsModalOpen, setAgentsModalOpen] = useState(false);
   const [interconnectorModalOpen, setInterconnectorModalOpen] = useState(false);
   const [interconnectorEnabled, setInterconnectorEnabled] = useState(false);
-  const [interconnectorPendingCount, setInterconnectorPendingCount] = useState(0);
+  const [interconnectorPendingCount, setInterconnectorPendingCount] =
+    useState(0);
   const [interconnectorIsClient, setInterconnectorIsClient] = useState(false);
-  const [interconnectorUpdateStatus, setInterconnectorUpdateStatus] = useState(null);
+  const [interconnectorUpdateStatus, setInterconnectorUpdateStatus] =
+    useState(null);
   const [interconnectorApplying, setInterconnectorApplying] = useState(false);
 
   // Inline apply: lets the top banner's UPDATE button push the updates straight
   // through without making the user open the modal. Mirrors the same call the
   // ClientUpdatePanel makes (interconnectorApi.applyUpdates([])) plus a confirm.
-  const handleApplyInterconnectorUpdates = useCallback(async (e) => {
-    if (e?.stopPropagation) e.stopPropagation();
-    if (interconnectorApplying) return;
-    if (!window.confirm("Apply all interconnector updates? Existing files will be backed up automatically.")) {
-      return;
-    }
-    setInterconnectorApplying(true);
-    try {
-      const response = await interconnectorApi.applyUpdates([]);
-      if (response?.error) {
-        showMessage?.(`Update failed: ${response.error}`, "error");
-      } else {
-        const data = response?.data || response || {};
-        showMessage?.(
-          `Updated ${data.applied || 0} files (${data.created || 0} new, ${data.updated || 0} modified)`,
-          "success"
-        );
-        // Clear the banner; a follow-up checkForUpdates will repopulate if more remain.
-        setInterconnectorUpdateStatus((prev) => prev ? { ...prev, available: false, count: 0 } : prev);
-        setTimeout(() => {
-          interconnectorApi.checkForUpdates?.().then((res) => {
-            if (res && !res.error) setInterconnectorUpdateStatus(res.data || res);
-          }).catch(() => {});
-        }, 1000);
+  const handleApplyInterconnectorUpdates = useCallback(
+    async (e) => {
+      if (e?.stopPropagation) e.stopPropagation();
+      if (interconnectorApplying) return;
+      if (
+        !window.confirm(
+          "Apply all interconnector updates? Existing files will be backed up automatically.",
+        )
+      ) {
+        return;
       }
-    } catch (err) {
-      showMessage?.(`Update failed: ${err.message}`, "error");
-    } finally {
-      setInterconnectorApplying(false);
-    }
-  }, [interconnectorApplying]);
+      setInterconnectorApplying(true);
+      try {
+        const response = await interconnectorApi.applyUpdates([]);
+        if (response?.error) {
+          showMessage?.(`Update failed: ${response.error}`, "error");
+        } else {
+          const data = response?.data || response || {};
+          showMessage?.(
+            `Updated ${data.applied || 0} files (${data.created || 0} new, ${data.updated || 0} modified)`,
+            "success",
+          );
+          // Clear the banner; a follow-up checkForUpdates will repopulate if more remain.
+          setInterconnectorUpdateStatus((prev) =>
+            prev ? { ...prev, available: false, count: 0 } : prev,
+          );
+          setTimeout(() => {
+            interconnectorApi
+              .checkForUpdates?.()
+              .then((res) => {
+                if (res && !res.error)
+                  setInterconnectorUpdateStatus(res.data || res);
+              })
+              .catch(() => {});
+          }, 1000);
+        }
+      } catch (err) {
+        showMessage?.(`Update failed: ${err.message}`, "error");
+      } finally {
+        setInterconnectorApplying(false);
+      }
+    },
+    [interconnectorApplying],
+  );
   const [voiceChatEnabled, setVoiceChatEnabled] = useState(() => {
     try {
       return localStorage.getItem(VOICE_CHAT_ENABLED_KEY) !== "false";
@@ -304,14 +312,26 @@ const SettingsPage = () => {
   });
   const [killSwitchOpen, setKillSwitchOpen] = useState(false);
   const [rebootDialogOpen, setRebootDialogOpen] = useState(false);
+  const [deleteHistoryDialogOpen, setDeleteHistoryDialogOpen] = useState(false);
+  const [deleteHistoryCounts, setDeleteHistoryCounts] = useState(null);
+  const [deleteHistoryInProgress, setDeleteHistoryInProgress] = useState(false);
   const [rebootInProgress, setRebootInProgress] = useState(false);
   const [rebootProgressModalOpen, setRebootProgressModalOpen] = useState(false);
   const [imageModelsModalOpen, setImageModelsModalOpen] = useState(false);
-  const [infographicModelsModalOpen, setInfographicModelsModalOpen] = useState(false);
+  const [infographicModelsModalOpen, setInfographicModelsModalOpen] =
+    useState(false);
   const [videoModelsModalOpen, setVideoModelsModalOpen] = useState(false);
   const [voiceModelsModalOpen, setVoiceModelsModalOpen] = useState(false);
-  const setTrainerOpen = useAppStore((state) => state.setTrainerOpen);
+  const [audioModelsModalOpen, setAudioModelsModalOpen] = useState(false);
   const [imageGenStatus, setImageGenStatus] = useState(null);
+  // /api/batch-image/status reports service_available (the batch image service
+  // loaded) and image_generator_available (its image pipeline loaded); usable
+  // means both. Batch images run on the backend's own pipeline, not ComfyUI.
+  const imageGenAvailable = Boolean(
+    imageGenStatus?.service_available && imageGenStatus?.image_generator_available,
+  );
+  const imageGenUnavailableHint =
+    imageGenStatus?.error || "the image service did not load; see the backend log";
 
   // Resource monitor and embedding model state
   const [gpuResources, setGpuResources] = useState(null);
@@ -320,6 +340,27 @@ const SettingsPage = () => {
   const [isSwitchingEmbedding, setIsSwitchingEmbedding] = useState(false);
   const [embedDimFilter, setEmbedDimFilter] = useState(null); // null = all, or a number like 1024
   const [chatSizeFilter, setChatSizeFilter] = useState(null); // null = all, or "small"/"medium"/"large"
+
+  // ── v3 layout and danger-zone state ──
+  const theme = useTheme();
+  const isXl = useMediaQuery(theme.breakpoints.up("xl"));
+  const isMd = useMediaQuery(theme.breakpoints.up("md"));
+  const [indexProfiles, setIndexProfiles] = useState([]);
+  const [profilesReloadKey, setProfilesReloadKey] = useState(0);
+  const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
+  const [clearChatOpen, setClearChatOpen] = useState(false);
+  const [clearChatBusy, setClearChatBusy] = useState(false);
+  const [chatHistoryCounts, setChatHistoryCounts] = useState(null);
+  const [clearMemoriesOpen, setClearMemoriesOpen] = useState(false);
+  const [clearMemoriesBusy, setClearMemoriesBusy] = useState(false);
+  const [memoryCount, setMemoryCount] = useState(null);
+  const [mcpStatus, setMcpStatus] = useState(null);
+  const [confineToolPaths, setConfineToolPaths] = useState(false);
+  const [musicDirectorySaved, setMusicDirectorySaved] = useState("");
+  // "rules" clears rules the chat learned; "log" empties the behaviour log file.
+  const [learningClear, setLearningClear] = useState(null);
+  const [learningBusy, setLearningBusy] = useState(false);
+  const [editProfile, setEditProfile] = useState(null);
 
   // RAG Autoresearch settings state
   const [autoresearchSettings, setAutoresearchSettings] = useState({});
@@ -334,7 +375,11 @@ const SettingsPage = () => {
 
   // Keep local branding state in sync with the latest persisted values
   useEffect(() => {
-    if (!brandingFile && persistedSystemLogo && systemLogo !== persistedSystemLogo) {
+    if (
+      !brandingFile &&
+      persistedSystemLogo &&
+      systemLogo !== persistedSystemLogo
+    ) {
       setSystemLogo(persistedSystemLogo);
     }
   }, [brandingFile, persistedSystemLogo, systemLogo]);
@@ -357,28 +402,30 @@ const SettingsPage = () => {
       }
 
       const saved = localStorage.getItem(VOICE_SETTINGS_KEY);
-      return saved ? JSON.parse(saved) : {
-        voice: 'libritts',
-        recordingQuality: 'medium',
-        recordingVolume: 1.0,
-        autoGainControl: true,
-        noiseSuppression: true,
-        echoCancellation: true,
-        playbackVolume: 1.0,
-        playbackSpeed: 1.0,
-        maxRecordingDuration: 60,
-        ttsEnabled: true,
-        micEnabled: true,
-        // Continuous listening mode settings
-        silenceThreshold: 0.05,
-        silenceTimeout: 2000,
-        maxSegmentDuration: 30000
-      };
+      return saved
+        ? JSON.parse(saved)
+        : {
+            voice: "libritts",
+            recordingQuality: "medium",
+            recordingVolume: 1.0,
+            autoGainControl: true,
+            noiseSuppression: true,
+            echoCancellation: true,
+            playbackVolume: 1.0,
+            playbackSpeed: 1.0,
+            maxRecordingDuration: 60,
+            ttsEnabled: true,
+            micEnabled: true,
+            // Continuous listening mode settings
+            silenceThreshold: 0.05,
+            silenceTimeout: 2000,
+            maxSegmentDuration: 30000,
+          };
     } catch (error) {
-      console.warn('Failed to load voice settings from localStorage:', error);
+      console.warn("Failed to load voice settings from localStorage:", error);
       return {
-        voice: 'libritts',
-        recordingQuality: 'medium',
+        voice: "libritts",
+        recordingQuality: "medium",
         recordingVolume: 1.0,
         autoGainControl: true,
         noiseSuppression: true,
@@ -391,7 +438,7 @@ const SettingsPage = () => {
         // Continuous listening mode settings
         silenceThreshold: 0.05,
         silenceTimeout: 2000,
-        maxSegmentDuration: 30000
+        maxSegmentDuration: 30000,
       };
     }
   });
@@ -403,11 +450,12 @@ const SettingsPage = () => {
   const [isVoiceTestPlaying, setIsVoiceTestPlaying] = useState(false);
   const [isInstallingVoice, setIsInstallingVoice] = useState(false);
   const [isInstallingWhisper, setIsInstallingWhisper] = useState(false);
+  const [whisperManualInstall, setWhisperManualInstall] = useState(null);
   const [voiceModelsStatus, setVoiceModelsStatus] = useState(null);
 
   // Get VoiceContext to sync voice changes
   const voiceContext = useVoice();
-  const setSelectedVoice = voiceContext?.setSelectedVoice || (() => { });
+  const setSelectedVoice = voiceContext?.setSelectedVoice || (() => {});
 
   // Load voice configuration
   useEffect(() => {
@@ -416,7 +464,10 @@ const SettingsPage = () => {
 
   // Load autoresearch settings
   useEffect(() => {
-    ragAutoresearchService.getSettings().then(data => setAutoresearchSettings(data)).catch(() => {});
+    ragAutoresearchService
+      .getSettings()
+      .then((data) => setAutoresearchSettings(data))
+      .catch(() => {});
   }, []);
 
   const loadVoiceConfiguration = async () => {
@@ -427,7 +478,7 @@ const SettingsPage = () => {
       const [status, voices, modelsStatus] = await Promise.all([
         voiceService.getStatus(),
         voiceService.getVoices().catch(() => ({ voices: [] })),
-        voiceService.getVoiceModelsStatus().catch(() => null)
+        voiceService.getVoiceModelsStatus().catch(() => null),
       ]);
 
       setVoiceStatus(status);
@@ -437,29 +488,29 @@ const SettingsPage = () => {
       // Set default voice if not already set or if saved voice is not available
       if (voices.voices && voices.voices.length > 0) {
         const savedVoice = voiceSettings.voice;
-        const isVoiceAvailable = voices.voices.some(v => v.id === savedVoice);
+        const isVoiceAvailable = voices.voices.some((v) => v.id === savedVoice);
 
         if (!savedVoice || !isVoiceAvailable) {
           const defaultVoice = voices.default_voice || voices.voices[0].id;
-          setVoiceSettings(prev => ({
+          setVoiceSettings((prev) => ({
             ...prev,
-            voice: defaultVoice
+            voice: defaultVoice,
           }));
         }
       } else {
         // If no voices are available, reset to empty string to avoid MUI warnings
-        setVoiceSettings(prev => ({
+        setVoiceSettings((prev) => ({
           ...prev,
-          voice: ''
+          voice: "",
         }));
       }
     } catch (error) {
-      console.error('Failed to load voice configuration:', error);
-      setVoiceError('Failed to load voice configuration');
+      console.error("Failed to load voice configuration:", error);
+      setVoiceError("Failed to load voice configuration");
       // Reset voice to empty string on error to avoid MUI warnings
-      setVoiceSettings(prev => ({
+      setVoiceSettings((prev) => ({
         ...prev,
-        voice: ''
+        voice: "",
       }));
     } finally {
       setIsVoiceLoading(false);
@@ -470,16 +521,19 @@ const SettingsPage = () => {
     setIsVoiceTestPlaying(true);
     try {
       // Check if voice is available first
-      const voice = availableVoices.find(v => v.id === voiceId);
+      const voice = availableVoices.find((v) => v.id === voiceId);
       if (voice && voice.available === false) {
-        showMessage(`Voice model "${voice.name}" is not installed. Please install it first.`, "warning");
+        showMessage(
+          `Voice model "${voice.name}" is not installed. Please install it first.`,
+          "warning",
+        );
         setIsVoiceTestPlaying(false);
         return;
       }
 
       const response = await voiceService.textToSpeech(
         "Hello! This is a test of the text-to-speech feature.",
-        voiceId
+        voiceId,
       );
 
       if (response.audio_url) {
@@ -491,10 +545,16 @@ const SettingsPage = () => {
         setIsVoiceTestPlaying(false);
       }
     } catch (error) {
-      console.error('Voice test failed:', error);
+      console.error("Voice test failed:", error);
       const errorMessage = error.message || "Voice test failed";
-      if (errorMessage.includes("not found") || errorMessage.includes("not installed")) {
-        showMessage("Voice model is not installed. Please install voice models first.", "warning");
+      if (
+        errorMessage.includes("not found") ||
+        errorMessage.includes("not installed")
+      ) {
+        showMessage(
+          "Voice model is not installed. Please install voice models first.",
+          "warning",
+        );
       } else {
         showMessage(`Voice test failed: ${errorMessage}`, "error");
       }
@@ -503,38 +563,48 @@ const SettingsPage = () => {
   };
 
   const handleVoiceSettingChange = (setting, value) => {
-    setVoiceSettings(prev => ({
+    setVoiceSettings((prev) => ({
       ...prev,
-      [setting]: value
+      [setting]: value,
     }));
 
     // Update VoiceContext immediately — localStorage 'storage' events only fire
     // in OTHER tabs, so we must sync the context directly for same-tab updates.
-    if (setting === 'voice' && value) {
+    if (setting === "voice" && value) {
       setSelectedVoice(value);
-      const voiceName = availableVoices.find(v => v.id === value)?.name || value;
+      const voiceName =
+        availableVoices.find((v) => v.id === value)?.name || value;
       showMessage(`Voice changed to ${voiceName}`, "success");
-    } else if (setting === 'ttsEnabled') {
+    } else if (setting === "ttsEnabled") {
       if (voiceContext?.setTtsEnabled) {
         voiceContext.setTtsEnabled(value);
       }
-      showMessage(`Text-to-Speech ${value ? 'enabled' : 'disabled'}`, "success");
-    } else if (setting === 'micEnabled') {
-      showMessage(`Microphone ${value ? 'enabled' : 'disabled'}`, "success");
+      showMessage(
+        `Text-to-Speech ${value ? "enabled" : "disabled"}`,
+        "success",
+      );
+    } else if (setting === "micEnabled") {
+      showMessage(`Microphone ${value ? "enabled" : "disabled"}`, "success");
     }
   };
 
   const installDefaultVoiceModel = async () => {
     setIsInstallingVoice(true);
     try {
-      showMessage("Installing LibriTTS voice model... This may take a moment.", "info");
-      const result = await voiceService.installVoiceModel('libritts');
+      showMessage(
+        "Installing LibriTTS voice model... This may take a moment.",
+        "info",
+      );
+      const result = await voiceService.installVoiceModel("libritts");
 
       if (result.success) {
         if (result.already_installed) {
           showMessage("LibriTTS voice model is already installed.", "info");
         } else {
-          showMessage(`Successfully installed LibriTTS voice model (${result.model_size_mb} MB)`, "success");
+          showMessage(
+            `Successfully installed LibriTTS voice model (${result.model_size_mb} MB)`,
+            "success",
+          );
         }
         // Reload voice configuration to update the UI
         await loadVoiceConfiguration();
@@ -542,7 +612,7 @@ const SettingsPage = () => {
         showMessage(`Failed to install voice model: ${result.error}`, "error");
       }
     } catch (error) {
-      console.error('Failed to install voice model:', error);
+      console.error("Failed to install voice model:", error);
       showMessage(`Failed to install voice model: ${error.message}`, "error");
     } finally {
       setIsInstallingVoice(false);
@@ -551,42 +621,79 @@ const SettingsPage = () => {
 
   const installWhisperCpp = async () => {
     setIsInstallingWhisper(true);
+    setWhisperManualInstall(null);
     try {
-      showMessage("Installing Whisper.cpp... This will clone and build from source (may take 1-2 minutes).", "info");
+      showMessage(
+        voiceStatus?.install_method === "pkexec"
+          ? "Approve the password prompt on your desktop, then Whisper.cpp will build."
+          : "Installing Whisper.cpp... This will clone and build from source (may take 1-2 minutes).",
+        "info",
+      );
       const result = await voiceService.installWhisper();
 
       if (result.success) {
         if (result.already_installed) {
           showMessage("Whisper.cpp is already installed.", "info");
         } else {
-          showMessage("Whisper.cpp installed successfully! You can now use speech recognition.", "success");
+          showMessage(
+            "Whisper.cpp installed successfully! You can now use speech recognition.",
+            "success",
+          );
         }
         await loadVoiceConfiguration();
+      } else if (result.needs_manual_install && result.manual_command) {
+        setWhisperManualInstall({
+          command: result.manual_command,
+          reason: result.error,
+        });
       } else {
         showMessage(`Failed to install Whisper.cpp: ${result.error}`, "error");
       }
     } catch (error) {
-      console.error('Failed to install Whisper.cpp:', error);
-      showMessage(`Failed to install Whisper.cpp: ${error.message}`, "error");
+      console.error("Failed to install Whisper.cpp:", error);
+      const data = error.data || {};
+      if (data.needs_manual_install && data.manual_command) {
+        setWhisperManualInstall({
+          command: data.manual_command,
+          reason: data.error || error.message,
+        });
+      } else {
+        showMessage(`Failed to install Whisper.cpp: ${error.message}`, "error");
+      }
     } finally {
       setIsInstallingWhisper(false);
+    }
+  };
+
+  const copyWhisperCommand = async (command) => {
+    try {
+      await navigator.clipboard.writeText(command);
+      showMessage("Command copied to clipboard.", "success");
+    } catch (e) {
+      showMessage("Could not copy — select the command and copy it manually.", "warning");
     }
   };
 
   const installWhisperSpeechModel = async () => {
     setIsInstallingWhisper(true);
     try {
-      showMessage("Downloading default Whisper speech model (tiny.en)...", "info");
-      const result = await voiceService.installWhisperModel('tiny.en');
+      showMessage(
+        "Downloading default Whisper speech model (tiny.en)...",
+        "info",
+      );
+      const result = await voiceService.installWhisperModel("tiny.en");
 
       if (result.success) {
-        showMessage(`Whisper model ready (${result.model_size_mb} MB)`, "success");
+        showMessage(
+          `Whisper model ready (${result.model_size_mb} MB)`,
+          "success",
+        );
         await loadVoiceConfiguration();
       } else {
         showMessage(`Failed to download model: ${result.error}`, "error");
       }
     } catch (error) {
-      console.error('Failed to install whisper model:', error);
+      console.error("Failed to install whisper model:", error);
       showMessage(`Failed to download model: ${error.message}`, "error");
     } finally {
       setIsInstallingWhisper(false);
@@ -596,11 +703,18 @@ const SettingsPage = () => {
   const fetchBranding = useCallback(async () => {
     try {
       const response = await getBranding();
-      debugLog("Fetched branding response", { hasData: Boolean(response?.data) });
+      debugLog("Fetched branding response", {
+        hasData: Boolean(response?.data),
+      });
       if (response && response.data) {
         const data = response.data;
-        setBrandingName((prev) => data.system_name ?? prev ?? persistedSystemName ?? "");
-        setSystemLogo((prevLogo) => data.logo_path ?? prevLogo ?? persistedSystemLogo ?? null);
+        setBrandingName(
+          (prev) => data.system_name ?? prev ?? persistedSystemName ?? "",
+        );
+        setSystemLogo(
+          (prevLogo) =>
+            data.logo_path ?? prevLogo ?? persistedSystemLogo ?? null,
+        );
         debugLog("Updated branding state", {
           hasName: Boolean(data.system_name ?? persistedSystemName),
           hasLogo: Boolean(data.logo_path ?? persistedSystemLogo),
@@ -618,31 +732,44 @@ const SettingsPage = () => {
   }, [fetchBranding]);
 
   useEffect(() => {
-    getMusicDirectory().then((res) => {
-      if (res?.data?.music_directory !== undefined) {
-        setMusicDirectory(res.data.music_directory);
-      }
-    }).catch(() => {});
+    getMusicDirectory()
+      .then((res) => {
+        if (res?.data?.music_directory !== undefined) {
+          setMusicDirectory(res.data.music_directory);
+          setMusicDirectorySaved(res.data.music_directory);
+        }
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
-    interconnectorApi.getInterconnectorConfig().then((res) => {
-      const enabled = res?.data?.config?.is_enabled || res?.config?.is_enabled;
-      if (enabled) {
-        setInterconnectorEnabled(true);
-        const nodeMode = res?.data?.config?.node_mode || res?.config?.node_mode;
-        setInterconnectorIsClient(nodeMode === "client");
-        // Check for pending approvals
-        interconnectorApi.getPendingApprovals?.().then((approvals) => {
-          setInterconnectorPendingCount(Array.isArray(approvals) ? approvals.length : 0);
-        }).catch(() => {});
-      } else if (!res?.error) {
-        setInterconnectorEnabled(false);
-        setInterconnectorPendingCount(0);
-        setInterconnectorIsClient(false);
-        setInterconnectorUpdateStatus(null);
-      }
-    }).catch(() => {});
+    interconnectorApi
+      .getInterconnectorConfig()
+      .then((res) => {
+        const enabled =
+          res?.data?.config?.is_enabled || res?.config?.is_enabled;
+        if (enabled) {
+          setInterconnectorEnabled(true);
+          const nodeMode =
+            res?.data?.config?.node_mode || res?.config?.node_mode;
+          setInterconnectorIsClient(nodeMode === "client");
+          // Check for pending approvals
+          interconnectorApi
+            .getPendingApprovals?.()
+            .then((approvals) => {
+              setInterconnectorPendingCount(
+                Array.isArray(approvals) ? approvals.length : 0,
+              );
+            })
+            .catch(() => {});
+        } else if (!res?.error) {
+          setInterconnectorEnabled(false);
+          setInterconnectorPendingCount(0);
+          setInterconnectorIsClient(false);
+          setInterconnectorUpdateStatus(null);
+        }
+      })
+      .catch(() => {});
   }, [interconnectorModalOpen]);
 
   // One-shot check for code updates when in client mode
@@ -652,16 +779,19 @@ const SettingsPage = () => {
       return;
     }
     const timer = setTimeout(() => {
-      interconnectorApi.checkForUpdates().then((res) => {
-        const data = res?.data || res;
-        if (!data?.error) {
-          setInterconnectorUpdateStatus({
-            available: data.available || false,
-            count: data.count || 0,
-            summary: data.summary || { backend: 0, frontend: 0, other: 0 },
-          });
-        }
-      }).catch(() => {});
+      interconnectorApi
+        .checkForUpdates()
+        .then((res) => {
+          const data = res?.data || res;
+          if (!data?.error) {
+            setInterconnectorUpdateStatus({
+              available: data.available || false,
+              count: data.count || 0,
+              summary: data.summary || { backend: 0, frontend: 0, other: 0 },
+            });
+          }
+        })
+        .catch(() => {});
     }, 1500);
     return () => clearTimeout(timer);
   }, [interconnectorEnabled, interconnectorIsClient, interconnectorModalOpen]);
@@ -676,9 +806,15 @@ const SettingsPage = () => {
   }, [voiceChatEnabled]);
 
   const themeName = useAppStore((state) => state.themeName);
+  const navChrome = useAppStore((state) => state.navChrome);
+  const setNavChrome = useAppStore((state) => state.setNavChrome);
 
-  const { activeModel, isLoadingModel, modelError: _modelError, refreshActiveModel } =
-    useStatus();
+  const {
+    activeModel,
+    isLoadingModel,
+    modelError: _modelError,
+    refreshActiveModel,
+  } = useStatus();
 
   // Socket listener for async model switching events
   useEffect(() => {
@@ -705,8 +841,13 @@ const SettingsPage = () => {
         showMessage(data.message || `Loading ${data.model}...`, "info");
       } else if (data.status === "complete") {
         setModelSwitchStatus("complete");
-        setModelSwitchMessage(data.message || `Model switched to ${data.model}`);
-        showMessage(data.message || `Successfully switched to ${data.model}`, "success");
+        setModelSwitchMessage(
+          data.message || `Model switched to ${data.model}`,
+        );
+        showMessage(
+          data.message || `Successfully switched to ${data.model}`,
+          "success",
+        );
         // Refresh the active model display
         refreshActiveModel();
         // Reset status after a brief delay
@@ -811,14 +952,16 @@ const SettingsPage = () => {
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 8000);
-      const r = await fetch("/api/model/resources", { signal: controller.signal });
+      const r = await fetch("/api/model/resources", {
+        signal: controller.signal,
+      });
       clearTimeout(timeoutId);
       if (r.ok) {
         const d = await r.json();
-        if (d.success) setGpuResources(d.data);
+        if (d.success) setGpuResources(payloadOf(d));
       }
     } catch (e) {
-      if (e.name === 'AbortError') return; // Timeout or navigation — not an error
+      if (e.name === "AbortError") return; // Timeout or navigation — not an error
       // Silently skip network errors during polling — don't spam console
     }
   }, []);
@@ -835,8 +978,12 @@ const SettingsPage = () => {
             // Match active name to model list (handles "mxbai-embed-large" vs "mxbai-embed-large:latest")
             const active = d.data.active;
             const exact = models.find((m) => m.name === active);
-            const partial = models.find((m) => m.name.split(":")[0] === active.split(":")[0]);
-            setSelectedEmbeddingModel(exact ? exact.name : partial ? partial.name : active);
+            const partial = models.find(
+              (m) => m.name.split(":")[0] === active.split(":")[0],
+            );
+            setSelectedEmbeddingModel(
+              exact ? exact.name : partial ? partial.name : active,
+            );
           }
         }
       }
@@ -861,12 +1008,17 @@ const SettingsPage = () => {
   }, [modelSwitchStatus, fetchResources]);
 
   const handleAutoresearchSettingChange = async (key, value) => {
-    const updated = { ...autoresearchSettings, [key]: String(value) };
-    setAutoresearchSettings(updated);
+    const previous = autoresearchSettings;
+    setAutoresearchSettings({ ...autoresearchSettings, [key]: String(value) });
     try {
       await ragAutoresearchService.updateSettings({ [key]: String(value) });
     } catch (e) {
-      console.error('Failed to update autoresearch setting:', e);
+      console.error("Failed to update autoresearch setting:", e);
+      setAutoresearchSettings(previous);
+      showMessage(
+        "Could not save the autoresearch setting; it was not changed.",
+        "error",
+      );
     }
   };
 
@@ -874,7 +1026,8 @@ const SettingsPage = () => {
     const fetchVersion = async () => {
       try {
         const result = await apiService.getVersion();
-        if (result?.version) setAppVersion(result.version);
+        const version = payloadOf(result)?.version ?? result?.version;
+        if (version) setAppVersion(version);
       } catch (err) {
         console.warn("Failed to fetch app version:", err);
       }
@@ -891,10 +1044,13 @@ const SettingsPage = () => {
       // The chat components will handle their own state clearing via the event
     };
 
-    window.addEventListener('chatHistoryCleared', handleChatHistoryCleared);
+    window.addEventListener("chatHistoryCleared", handleChatHistoryCleared);
 
     return () => {
-      window.removeEventListener('chatHistoryCleared', handleChatHistoryCleared);
+      window.removeEventListener(
+        "chatHistoryCleared",
+        handleChatHistoryCleared,
+      );
     };
   }, []);
 
@@ -907,13 +1063,21 @@ const SettingsPage = () => {
         if (data.success) {
           setImageGenStatus(data.data);
         } else {
-          setImageGenStatus({ service_available: false, error: "Failed to get status" });
+          setImageGenStatus({
+            service_available: false,
+            error: "Failed to get status",
+          });
         }
       } catch (err) {
         setImageGenStatus({ service_available: false, error: err.message });
       }
     };
     fetchImageGenStatus();
+    // ComfyUI can be started from the Plugins page while this one is open.
+    const timer = setInterval(() => {
+      if (!document.hidden) fetchImageGenStatus();
+    }, 30000);
+    return () => clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -946,8 +1110,7 @@ const SettingsPage = () => {
     const fetchAdvDebug = async () => {
       try {
         const result = await apiService.getAdvancedDebug();
-        const advDebug =
-          result?.data?.advanced_debug ?? result?.advanced_debug;
+        const advDebug = result?.data?.advanced_debug ?? result?.advanced_debug;
         if (typeof advDebug === "boolean") {
           setAdvancedDebug(advDebug);
         }
@@ -962,10 +1125,12 @@ const SettingsPage = () => {
     const fetchVerbatim = async () => {
       try {
         const result = await apiService.getVerbatimPrompts();
-        const verbatimOn = result?.data?.enabled ?? result?.enabled;
+        const payload = result?.data ?? result;
+        const verbatimOn = payload?.enabled;
         if (typeof verbatimOn === "boolean") {
           setVerbatimPromptsState(verbatimOn);
         }
+        setVerbatimForcedByEnv(Boolean(payload?.forced_by_env));
       } catch (err) {
         console.warn("Failed to fetch verbatim prompts setting:", err);
       }
@@ -979,12 +1144,17 @@ const SettingsPage = () => {
         const result = await apiService.getMediaModels();
         const data = result?.data ?? result;
         if (data && typeof data === "object" && !data.error) {
+          if (data.character_lora_strength && typeof data.character_lora_strength === "object") {
+            lastSavedLoraRef.current = { ...data.character_lora_strength };
+            setLoraSaveState({ zimage: "saved", sdxl: "saved", flux: "saved" });
+          }
           setMediaModelsState((prev) => ({
             ...prev,
             stills_model: data.stills_model || prev.stills_model,
             cast_train_base: data.cast_train_base || prev.cast_train_base,
             max_quality_model: data.max_quality_model || prev.max_quality_model,
-            character_lora_strength: data.character_lora_strength || prev.character_lora_strength,
+            character_lora_strength:
+              data.character_lora_strength || prev.character_lora_strength,
             train_profiles: data.train_profiles || data.profiles || [],
             stills_profiles: data.stills_profiles || data.profiles || [],
           }));
@@ -1073,27 +1243,9 @@ const SettingsPage = () => {
           if (typeof data.advanced_rag === "boolean") {
             setAdvancedRag(data.advanced_rag);
           }
-          if (typeof data.rag_debug === "boolean") {
-            setRagDebug(data.rag_debug);
-          }
-        } else {
-          // Fallback to individual RAG debug call if new API fails
-          const ragResult = await getRagDebug();
-          if (ragResult && typeof ragResult.rag_debug_enabled === "boolean") {
-            setRagDebug(ragResult.rag_debug_enabled);
-          }
         }
       } catch (err) {
         console.warn("Failed to fetch RAG features:", err);
-        // Fallback to individual call
-        try {
-          const ragResult = await getRagDebug();
-          if (ragResult && typeof ragResult.rag_debug_enabled === "boolean") {
-            setRagDebug(ragResult.rag_debug_enabled);
-          }
-        } catch (fallbackErr) {
-          console.warn("Failed to fetch RAG debug setting:", fallbackErr);
-        }
       }
     };
     fetchRagFeatures();
@@ -1140,7 +1292,7 @@ const SettingsPage = () => {
     try {
       localStorage.setItem(VOICE_SETTINGS_KEY, JSON.stringify(voiceSettings));
       // Notify voice components in the same tab (storage events only fire cross-tab)
-      window.dispatchEvent(new Event('voiceSettingsChanged'));
+      window.dispatchEvent(new Event("voiceSettingsChanged"));
     } catch (e) {
       console.warn("Failed to persist voice settings:", e);
     }
@@ -1223,7 +1375,10 @@ const SettingsPage = () => {
     try {
       const result = await apiService.setModel(selectedModel);
       // Backend returns 202 for async processing
-      if (result?.status === "switching" || result?.message?.includes("Switching")) {
+      if (
+        result?.status === "switching" ||
+        result?.message?.includes("Switching")
+      ) {
         // Socket events will handle the rest
         debugLog("Model switch initiated, waiting for socket events");
       } else if (result?.error) {
@@ -1269,41 +1424,6 @@ const SettingsPage = () => {
     setRebootProgressModalOpen(false);
     setRebootInProgress(false);
   };
-  const handleClearChatHistoryClick = async () => {
-    const counts = await apiService.getChatHistoryCounts();
-    let confirmMsg = "Clear ALL chat history? This cannot be undone.";
-    if (counts && !counts.error) {
-      const parts = [];
-      if (counts.messages) parts.push(`${counts.messages} messages`);
-      if (counts.sessions) parts.push(`${counts.sessions} sessions`);
-      const files = (counts.context_files || 0) + (counts.conversation_files || 0);
-      if (files) parts.push(`${files} cached files`);
-      if (parts.length > 0) {
-        confirmMsg = `Clear ALL chat history (${parts.join(", ")})? This cannot be undone.`;
-      } else {
-        confirmMsg = "No chat history found. Clear anyway?";
-      }
-    }
-    handleActionClick(
-      apiService.clearChatHistory,
-      ["all"],
-      confirmMsg,
-      "Clearing chat history...",
-      "Chat history cleared successfully.",
-      "Failed to clear chat history",
-    );
-  };
-  const _handleResetIndexClick = () => {
-    /* ... (unchanged from v3.4) ... */
-    handleActionClick(
-      apiService.resetIndexStorage,
-      [],
-      "Reset the LlamaIndex vector store? ALL indexed document knowledge will be lost and require re-indexing.",
-      "Resetting index storage...",
-      "Index storage cleared. Please re-index documents.",
-      "Failed to reset index storage",
-    );
-  };
 
   const handleOpenPurgeModal = () => {
     setPurgeModalOpen(true);
@@ -1326,27 +1446,6 @@ const SettingsPage = () => {
     setIsPurging(false);
     setPurgeModalOpen(false);
   };
-  const _handlePurgeBehaviorLearningClick = () => {
-    handleActionClick(
-      apiService.purgeBehaviorLearning,
-      [],
-      "Purge all learned behaviors? This cannot be undone.",
-      "Purging learned behaviors...",
-      "Learned behaviors purged.",
-      "Failed to purge learned behaviors",
-    );
-  };
-
-  const _handleClearBehaviorLogClick = () => {
-    handleActionClick(
-      clearBehaviorLog,
-      [],
-      "Clear the user behavior log file? This cannot be undone.",
-      "Clearing behavior log...",
-      "Behavior log cleared successfully",
-      "Failed to clear behavior log",
-    );
-  };
 
   // Support both Chip clicks (no checked field) and Switch/Checkbox events
   const deriveToggleValue = (eventOrValue, currentValue) => {
@@ -1360,10 +1459,89 @@ const SettingsPage = () => {
     }
     return !currentValue;
   };
+  const formatByteSize = (bytes) => {
+    const n = Number(bytes) || 0;
+    if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(2)} GB`;
+    if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+    if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+    return `${n} B`;
+  };
+
+  // Delete History: batch image, batch video and audio generation history —
+  // records and media, plus the DB rows that mirror them. The dialog shows
+  // real counts first because this frees disk space that cannot come back.
+  const handleDeleteGenerationHistoryClick = async () => {
+    setIsLoading(true);
+    try {
+      const counts = await apiService.getGenerationHistoryCounts();
+      setDeleteHistoryCounts(counts && !counts.error ? counts : null);
+      setDeleteHistoryDialogOpen(true);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleCancelDeleteHistory = () => {
+    if (deleteHistoryInProgress) return;
+    setDeleteHistoryDialogOpen(false);
+  };
+
+  const handleConfirmDeleteHistory = async () => {
+    setDeleteHistoryInProgress(true);
+    setIsLoading(true);
+    showMessage("Deleting generation history...", "info");
+    try {
+      const result = await apiService.deleteGenerationHistory();
+      const d = result?.deleted || {};
+      const parts = [];
+      if (d.images?.batches) parts.push(`${d.images.batches} image batch(es)`);
+      if (d.videos?.batches) parts.push(`${d.videos.batches} video batch(es)`);
+      if (d.audio?.files || d.audio?.jobs)
+        parts.push(
+          `${d.audio.files || 0} audio file(s), ${d.audio.jobs || 0} audio job(s)`,
+        );
+      const comfyFiles =
+        (d.comfyui?.output?.files || 0) + (d.comfyui?.input?.files || 0);
+      if (comfyFiles) parts.push(`${comfyFiles} ComfyUI scratch file(s)`);
+      const dbRows =
+        (d.documents || 0) + (d.folders || 0) + (d.job_history || 0);
+      if (dbRows) parts.push(`${dbRows} database row(s)`);
+      let message = parts.length
+        ? `Deleted ${parts.join(", ")} (${formatByteSize(result?.bytes_freed)} freed).`
+        : "No generation history to delete.";
+      const skipped = result?.skipped || {};
+      const skippedCount =
+        (skipped.images?.length || 0) +
+        (skipped.videos?.length || 0) +
+        (skipped.audio?.length || 0);
+      if (skippedCount) message += ` Skipped ${skippedCount} running job(s).`;
+      if (skipped.comfyui?.length)
+        message += ` ComfyUI is still rendering ${skipped.comfyui.length} prompt(s); its output and input folders were left alone.`;
+      if (result?.sidecar_available === false)
+        message +=
+          " Audio service was not running; its job records were removed directly.";
+      if (result?.errors?.length)
+        message += ` ${result.errors.length} error(s): ${result.errors[0]}`;
+      showMessage(
+        message,
+        skippedCount || result?.errors?.length ? "warning" : "success",
+      );
+      setDeleteHistoryDialogOpen(false);
+    } catch (err) {
+      showMessage(
+        `Failed to delete generation history: ${err.message}`,
+        "error",
+      );
+    } finally {
+      setDeleteHistoryInProgress(false);
+      setIsLoading(false);
+    }
+  };
+
   const handleClearPycacheFoldersClick = async () => {
     if (
       !window.confirm(
-        "Clear Python bytecode cache (__pycache__)? This can help apply code changes but does not affect data or memory."
+        "Clear Python bytecode cache (__pycache__)? This can help apply code changes but does not affect data or memory.",
       )
     ) {
       return;
@@ -1378,22 +1556,19 @@ const SettingsPage = () => {
       }
 
       // Build detailed success message with statistics
-      let message = result?.message || "Python cache folders cleared successfully.";
+      let message =
+        result?.message || "Python cache folders cleared successfully.";
 
       if (result?.statistics) {
         const stats = result.statistics;
         const details = [];
 
         if (stats.directories_cleaned > 0) {
-          details.push(
-            `${stats.directories_cleaned} directory(ies) cleaned`
-          );
+          details.push(`${stats.directories_cleaned} directory(ies) cleaned`);
         }
 
         if (stats.pyc_files_deleted > 0) {
-          details.push(
-            `${stats.pyc_files_deleted} .pyc file(s) deleted`
-          );
+          details.push(`${stats.pyc_files_deleted} .pyc file(s) deleted`);
         }
 
         if (stats.size_formatted) {
@@ -1401,7 +1576,9 @@ const SettingsPage = () => {
         }
 
         if (result?.modules_purged_count > 0) {
-          details.push(`${result.modules_purged_count} module(s) purged from memory`);
+          details.push(
+            `${result.modules_purged_count} module(s) purged from memory`,
+          );
         }
 
         if (details.length > 0) {
@@ -1426,41 +1603,15 @@ const SettingsPage = () => {
       showMessage(message, severity);
     } catch (err) {
       if (err.message !== "User aborted") {
-        showMessage(`Failed to clear Python cache folders: ${err.message}`, "error");
+        showMessage(
+          `Failed to clear Python cache folders: ${err.message}`,
+          "error",
+        );
       }
     } finally {
       setIsLoading(false);
     }
   };
-  const handleRagDebugChange = async (event) => {
-    const isEnabled = deriveToggleValue(event, ragDebug);
-
-    try {
-      // Update backend first
-      const result = await setRagDebugAPI(isEnabled);
-
-      if (result.error) {
-        throw new Error(result.error);
-      }
-
-      // Update local state only if backend update succeeds
-      setRagDebug(isEnabled);
-
-      debugLog("RAG Debug Mode toggled", { isEnabled });
-      showMessage(
-        `RAG Debug mode ${isEnabled ? "enabled" : "disabled"}.`,
-        "success",
-      );
-    } catch (err) {
-      console.error("Failed to update RAG debug setting:", err);
-      showMessage(
-        `Failed to ${isEnabled ? "enable" : "disable"} RAG Debug mode: ${err.message}`,
-        "error",
-      );
-      // Don't update local state if backend update failed
-    }
-  };
-
   const handleEnhancedContextChange = async (event) => {
     const isEnabled = deriveToggleValue(event, enhancedContext);
 
@@ -1511,444 +1662,143 @@ const SettingsPage = () => {
     }
   };
 
-  const handleWebSearchToggle = (nextValue) => {
-    const isEnabled = typeof nextValue === "boolean"
-      ? nextValue
-      : !webSearchEnabled;
+  // Web access is a server-side gate: allow_web_search is read by the web,
+  // browser and address-lookup tools. The localStorage copy only seeds the
+  // first paint, so a failed save has to roll both back or they disagree.
+  const handleWebSearchToggle = async (nextValue) => {
+    const previous = webSearchEnabled;
+    const isEnabled =
+      typeof nextValue === "boolean" ? nextValue : !webSearchEnabled;
 
     setWebSearchEnabled(isEnabled);
     try {
       localStorage.setItem(WEB_SEARCH_ENABLED_KEY, String(isEnabled));
-      apiService
-        .setWebAccess(isEnabled)
-        .catch((err) =>
-          console.warn("Failed to update web access setting:", err),
-        );
     } catch (e) {
       console.warn("Failed to persist web search setting:", e);
     }
-    debugLog("Web Search toggled", { isEnabled });
-    showMessage(
-      `Web Search ${isEnabled ? "enabled" : "disabled"} (UI only).`,
-      "info",
-    );
-  };
-
-  const handleAdvancedDebugToggle = (event) => {
-    const isEnabled = deriveToggleValue(event, advancedDebug);
-    setAdvancedDebug(isEnabled);
     try {
-      localStorage.setItem(ADV_DEBUG_ENABLED_KEY, String(isEnabled));
-      apiService
-        .setAdvancedDebug(isEnabled)
-        .catch((err) =>
-          console.warn("Failed to update advanced debug setting:", err),
-        );
-    } catch (e) {
-      console.warn("Failed to persist advanced debug setting:", e);
-    }
-    debugLog("Advanced Debug toggled", { isEnabled });
-    showMessage(
-      `Advanced debugging ${isEnabled ? "enabled" : "disabled"}.`,
-      "info",
-    );
-  };
-  const handleVerbatimPromptsToggle = (event) => {
-    const isEnabled = deriveToggleValue(event, verbatimPrompts);
-    setVerbatimPromptsState(isEnabled);
-    apiService
-      .setVerbatimPrompts(isEnabled)
-      .catch((err) =>
-        console.warn("Failed to update verbatim prompts setting:", err),
-      );
-    showMessage(
-      isEnabled
-        ? "Verbatim prompts ON — your exact words go to the image/video model (no AI rewrite)."
-        : "Verbatim prompts OFF — prompts get AI enhancement again.",
-      "info",
-    );
-  };
-  const handleLlmDebugToggle = (event) => {
-    const isEnabled = deriveToggleValue(event, llmDebug);
-    setLlmDebugState(isEnabled);
-    try {
-      localStorage.setItem(LLM_DEBUG_ENABLED_KEY, String(isEnabled));
-      apiService
-        .setLlmDebug(isEnabled)
-        .catch((err) =>
-          console.warn("Failed to update LLM debug setting:", err),
-        );
-    } catch (e) {
-      console.warn("Failed to persist LLM debug setting:", e);
-    }
-    showMessage(
-      `LLM debug logging ${isEnabled ? "enabled" : "disabled"}.`,
-      "info",
-    );
-  };
-  const handleBehaviorLearningToggle = (event) => {
-    const isEnabled = deriveToggleValue(event, behaviorLearningEnabled);
-    setBehaviorLearningEnabled(isEnabled);
-    try {
-      localStorage.setItem(BEHAVIOR_LEARNING_ENABLED_KEY, String(isEnabled));
-      apiService
-        .setBehaviorLearning(isEnabled)
-        .catch((err) =>
-          console.warn("Failed to update behavior learning setting:", err),
-        );
-    } catch (e) {
-      console.warn("Failed to persist behavior learning setting:", e);
-    }
-    showMessage(
-      `Behavior learning ${isEnabled ? "enabled" : "disabled"}.`,
-      "info",
-    );
-  };
-
-  // Helper function to get category icon
-  const getCategoryIcon = (categoryKey) => {
-    const iconMap = {
-      core_system: <SystemIcon />,
-      api_health: <ApiIcon />,
-      file_processing: <FolderIcon />,
-      chat_system: <ChatIcon />,
-      security: <SecurityIcon />,
-      performance: <TrendingUpIcon />
-    };
-    return iconMap[categoryKey] || <HelpOutlineIcon />;
-  };
-
-  // Helper function to get status color and icon
-  const getStatusDisplay = (status) => {
-    const statusMap = {
-      pass: { color: "success", icon: <CheckCircleOutlineIcon />, label: "Pass" },
-      fail: { color: "error", icon: <ErrorOutlineIcon />, label: "Failed" },
-      warning: { color: "warning", icon: <WarningIcon />, label: "Warning" },
-      error: { color: "error", icon: <SyncProblemIcon />, label: "Error" },
-      critical: { color: "error", icon: <ErrorOutlineIcon />, label: "Critical" },
-      partial: { color: "warning", icon: <WarningIcon />, label: "Partial" },
-      skip: { color: "default", icon: <InfoOutlinedIcon />, label: "Skipped" },
-    };
-    const key = typeof status === "string" ? status.toLowerCase() : "";
-    return statusMap[key] || { color: "default", icon: <InfoOutlinedIcon />, label: status || "Unknown" };
-  };
-
-  // Enhanced test runner with mode selection
-  const handleRunSystemCheck = async (mode = "basic") => {
-    // Validate mode parameter
-    const validModes = ["basic", "quick", "comprehensive"];
-    const validatedMode = validModes.includes(mode) ? mode : "basic";
-
-    setIsTesting(true);
-    setTestResults(null);
-    setTestMode(validatedMode);
-    setExpandedCategories({}); // Reset expanded categories
-
-    const modeLabels = {
-      basic: "basic system checks",
-      quick: "quick validation",
-      comprehensive: "comprehensive testing"
-    };
-    showMessage(`Running ${modeLabels[validatedMode] || "system checks"}...`, "info");
-
-    try {
-      // Call enhanced API with mode parameter
-      const response = await apiService.runSelfTest({
-        mode: mode,
-        include_legacy: true
-      });
-
-      if (response?.error && typeof response.error === "string")
-        throw new Error(response.error);
-      if (response?.results && typeof response.results === "object") {
-        setTestResults(response.results);
-
-        // Enhanced success message with status
-        const overallStatus = response.results.overall_status || "UNKNOWN";
-        const statusDisplay = getStatusDisplay(overallStatus);
-        let msg = `System Check Complete - ${statusDisplay.label}`;
-
-        if (response.results.categories) {
-          const categoryCount = Object.keys(response.results.categories).length;
-          msg += ` (${categoryCount} categories tested)`;
-        }
-
-        const severity = overallStatus === "PASS" ? "success" :
-          overallStatus === "WARNING" ? "warning" : "error";
-        showMessage(msg, severity);
-      } else {
-        throw new Error("System check did not return valid results.");
+      await apiService.setWebAccess(isEnabled);
+    } catch (err) {
+      console.warn("Failed to update web access setting:", err);
+      setWebSearchEnabled(previous);
+      try {
+        localStorage.setItem(WEB_SEARCH_ENABLED_KEY, String(previous));
+      } catch (e) {
+        console.warn("Failed to restore web search setting:", e);
       }
-    } catch (error) {
       showMessage(
-        `System Check Error: ${error.message || "Could not run system checks."}`,
+        "Could not save web access; the setting was not changed.",
         "error",
       );
-      setTestResults({
-        error: `Failed to run system checks: ${error.message}`,
-      });
-    } finally {
-      setIsTesting(false);
+      return;
     }
-  };
-
-  const handleRunAllTests = async () => {
-    setIsRunningTests(true);
-    setTestSuiteResults(null);
-    setTestSuiteOutputOpen(false);
-    showMessage("Running full test suite...", "info");
-    try {
-      const response = await apiService.runAllTests();
-      if (response?.results) {
-        setTestSuiteResults(response.results);
-        const rc = response.results.returncode;
-        const sev = rc === 0 || rc === 4 || rc === 5 ? "success" : "error";
-        showMessage("Test suite finished.", sev);
-      } else {
-        throw new Error("Invalid response");
-      }
-    } catch (err) {
-      showMessage(`Test suite error: ${err.message}`, "error");
-      setTestSuiteResults({ error: err.message });
-    } finally {
-      setIsRunningTests(false);
-    }
-  };
-  const renderStatusIcon = (value, detailsForKey = "") => {
-    /* ... (unchanged from v3.4) ... */
-    const details = String(detailsForKey).toLowerCase();
-
-    if (typeof value === "boolean") {
-      return value ? (
-        <CheckCircleOutlineIcon
-          sx={{ color: "success.main", verticalAlign: "middle" }}
-        />
-      ) : (
-        <ErrorOutlineIcon
-          sx={{ color: "error.main", verticalAlign: "middle" }}
-        />
-      );
-    }
-    if (typeof value === "string") {
-      const lowerValue = value.toLowerCase();
-      if (
-        [
-          "ok",
-          "good",
-          "healthy",
-          "accessible",
-          "loadable",
-          "active",
-          "true",
-          "responsive",
-          "idle / queue empty",
-          "no recent indexing errors found in db",
-          "no error/critical messages in last ~200 lines",
-        ].some((s) => lowerValue.includes(s))
-      ) {
-        return (
-          <CheckCircleOutlineIcon
-            sx={{ color: "success.main", verticalAlign: "middle" }}
-          />
-        );
-      }
-      if (
-        [
-          "error",
-          "failed",
-          "unhealthy",
-          "inaccessible",
-          "critical",
-          "false",
-          "db error",
-        ].some((s) => lowerValue.includes(s)) ||
-        lowerValue.startsWith("error:") ||
-        lowerValue.includes("error(s). examples:")
-      ) {
-        return (
-          <ErrorOutlineIcon
-            sx={{ color: "error.main", verticalAlign: "middle" }}
-          />
-        );
-      }
-      if (
-        [
-          "warning",
-          "degraded",
-          "not configured",
-          "configured but not responsive/empty response",
-          "items pending/indexing",
-        ].some((s) => lowerValue.includes(s))
-      ) {
-        return (
-          <SyncProblemIcon
-            sx={{ color: "warning.main", verticalAlign: "middle" }}
-          />
-        );
-      }
-      if (lowerValue.includes("unknown") || lowerValue.includes("n/a")) {
-        return (
-          <HelpOutlineIcon
-            sx={{ color: "text.secondary", verticalAlign: "middle" }}
-          />
-        );
-      }
-    }
-    if (details) {
-      if (
-        ["ok", "found", "connected", "accessible", "responsive", "idle"].some(
-          (s) => details.includes(s),
-        )
-      ) {
-        return (
-          <CheckCircleOutlineIcon
-            sx={{ color: "success.main", verticalAlign: "middle" }}
-          />
-        );
-      }
-      if (
-        [
-          "failed",
-          "error",
-          "inaccessible",
-          "not found/empty",
-          "not found or not active for the current model",
-        ].some((s) => details.includes(s))
-      ) {
-        return (
-          <ErrorOutlineIcon
-            sx={{ color: "error.main", verticalAlign: "middle" }}
-          />
-        );
-      }
-      if (
-        details.includes("pending/indexing") ||
-        details.includes("not configured")
-      ) {
-        return (
-          <SyncProblemIcon
-            sx={{ color: "warning.main", verticalAlign: "middle" }}
-          />
-        );
-      }
-    }
-    return (
-      <InfoOutlinedIcon
-        sx={{ color: "text.secondary", verticalAlign: "middle" }}
-      />
+    debugLog("Web Search toggled", { isEnabled });
+    showMessage(
+      isEnabled
+        ? "Web access enabled: tools may fetch pages and search the web."
+        : "Web access disabled: web and browser tools are blocked.",
+      "info",
     );
   };
-  const systemCheckItems = [
-    /* ... (unchanged from v3.4) ... */
-    {
-      key: "ollama_reachable",
-      label: "Ollama Service Reachable",
-      icon: <DnsIcon />,
-      format: (v) => (v ? "OK" : "Failed"),
-    },
-    {
-      key: "active_model_name",
-      label: "Active LLM Name",
-      icon: <DnsIcon />,
-      format: (v) => v || "N/A",
-    },
-    {
-      key: "active_model_status",
-      label: "Active LLM Status",
-      icon: <DnsIcon />,
-      format: (v) => v || "Unknown",
-    },
-    {
-      key: "active_model_health",
-      label: "Ollama Model Loaded",
-      icon: <DnsIcon />,
-      format: (v) => v || "Unknown",
-    },
-    {
-      key: "llm_basic_response",
-      label: "LLM Basic Response Test",
-      icon: <DnsIcon />,
-      format: (v) => (v ? "OK" : "Failed/Empty"),
-    },
-    {
-      key: "model_count",
-      label: "Discovered Ollama Models",
-      format: (v) => `${v ?? "N/A"} models found`,
-    },
-    {
-      key: "db_connection",
-      label: "Database Connection",
-      icon: <StorageIcon />,
-      format: (v) => (v ? "OK" : "Failed"),
-    },
-    {
-      key: "document_count_db",
-      label: "Document Count (DB)",
-      format: (v) => `${v ?? "N/A"} documents in DB`,
-    },
-    {
-      key: "storage_dir_accessible",
-      label: "Storage Directory",
-      icon: <StorageIcon />,
-      format: (v, r) =>
-        `${r.storage_dir_path || "N/A"} (${v ? "Accessible" : "Inaccessible"})`,
-    },
-    {
-      key: "upload_dir_accessible",
-      label: "Upload Directory",
-      icon: <StorageIcon />,
-      format: (v, r) =>
-        `${r.upload_dir_path || "N/A"} (${v ? "Accessible" : "Inaccessible"})`,
-    },
-    {
-      key: "output_dir_accessible",
-      label: "Output Directory",
-      icon: <StorageIcon />,
-      format: (v, r) =>
-        `${r.output_dir_path || "N/A"} (${v ? "Accessible" : "Inaccessible"})`,
-    },
-    {
-      key: "index_storage_exists",
-      label: "Index Storage Exists",
-      icon: <SpeedIcon />,
-      format: (v) => (v ? "OK" : "Not Found/Empty"),
-    },
-    {
-      key: "qa_prompt_loadable",
-      label: "QA Default Prompt",
-      format: (v) => (v ? "Loadable" : "Not Found/Error"),
-    },
-    {
-      key: "indexing_queue_status",
-      label: "Indexing Queue",
-      icon: <SpeedIcon />,
-      format: (v) => v || "N/A",
-    },
-    {
-      key: "recent_indexing_errors",
-      label: "Recent Indexing Errors",
-      icon: <ErrorOutlineIcon />,
-      format: (v) => v || "N/A",
-    },
-    {
-      key: "backend_log_errors",
-      label: "Backend Log Criticals",
-      icon: <ErrorOutlineIcon />,
-      format: (v) => v || "N/A",
-    },
-    {
-      key: "gpu_tools_available",
-      label: "GPU Monitor Available",
-      icon: <SpeedIcon />,
-      format: (v) => (v ? "Available" : "Unavailable"),
-    },
-    {
-      key: "last_metrics_fetch_status",
-      label: "Last Metrics Fetch",
-      icon: <SpeedIcon />,
-      format: (v) => v || "N/A",
-    },
-  ];
+
+  // A toggle that mirrors to localStorage for first paint and persists to the
+  // server. On failure both roll back, so the chip never shows a state the
+  // server does not have.
+  const persistToggle = async ({
+    next,
+    previous,
+    setState,
+    storageKey,
+    save,
+    onText,
+    offText,
+  }) => {
+    setState(next);
+    try {
+      localStorage.setItem(storageKey, String(next));
+    } catch {
+      // non-fatal
+    }
+    try {
+      const result = await save(next);
+      if (result?.error) throw new Error(result.error.message || result.error);
+      showMessage(next ? onText : offText, "info");
+    } catch (err) {
+      setState(previous);
+      try {
+        localStorage.setItem(storageKey, String(previous));
+      } catch {
+        // non-fatal
+      }
+      showMessage(
+        `Could not save: ${err.message}. The setting was not changed.`,
+        "error",
+      );
+    }
+  };
+
+  const handleAdvancedDebugToggle = (event) =>
+    persistToggle({
+      next: deriveToggleValue(event, advancedDebug),
+      previous: advancedDebug,
+      setState: setAdvancedDebug,
+      storageKey: ADV_DEBUG_ENABLED_KEY,
+      save: apiService.setAdvancedDebug,
+      onText: "Verbose logging enabled.",
+      offText: "Verbose logging disabled.",
+    });
+  const handleVerbatimPromptsToggle = async (event) => {
+    if (verbatimSaving) return;
+    if (verbatimForcedByEnv) {
+      showMessage(
+        "Verbatim prompts are forced on by VERBATIM_PROMPTS in the server environment. Remove that variable and restart to control it here.",
+        "info",
+      );
+      return;
+    }
+    const isEnabled = deriveToggleValue(event, verbatimPrompts);
+    setVerbatimSaving(true);
+    try {
+      const result = await apiService.setVerbatimPrompts(isEnabled);
+      if (result?.error) throw new Error(result.error.message || result.error);
+      const payload = result?.data ?? result;
+      if (typeof payload?.enabled !== "boolean") {
+        throw new Error("Server did not confirm the prompt setting");
+      }
+      setVerbatimPromptsState(payload.enabled);
+      setVerbatimForcedByEnv(Boolean(payload.forced_by_env));
+      showMessage(
+        payload.enabled
+          ? "Verbatim prompts ON — AI prompt rewriting is disabled."
+          : "Verbatim prompts OFF — prompts get AI enhancement again.",
+        "info",
+      );
+    } catch (err) {
+      showMessage(`Could not save Verbatim prompts: ${err.message}`, "error");
+    } finally {
+      setVerbatimSaving(false);
+    }
+  };
+  const handleLlmDebugToggle = (event) =>
+    persistToggle({
+      next: deriveToggleValue(event, llmDebug),
+      previous: llmDebug,
+      setState: setLlmDebugState,
+      storageKey: LLM_DEBUG_ENABLED_KEY,
+      save: apiService.setLlmDebug,
+      onText: "LLM debug logging enabled.",
+      offText: "LLM debug logging disabled.",
+    });
+  const handleBehaviorLearningToggle = (event) =>
+    persistToggle({
+      next: deriveToggleValue(event, behaviorLearningEnabled),
+      previous: behaviorLearningEnabled,
+      setState: setBehaviorLearningEnabled,
+      storageKey: BEHAVIOR_LEARNING_ENABLED_KEY,
+      save: apiService.setBehaviorLearning,
+      onText: "Behaviour learning enabled.",
+      offText: "Behaviour learning disabled.",
+    });
 
   // --- NEW HANDLERS FOR IMPORT/EXPORT ---
   const handleExportRulesClick = async () => {
@@ -1993,10 +1843,6 @@ const SettingsPage = () => {
       setSelectedFileForImport(null);
       setSelectedFileNameForImport("");
     }
-  };
-
-  const _triggerFileImportInput = () => {
-    fileImportInputRef.current?.click();
   };
 
   const handleImportRulesClick = async () => {
@@ -2067,10 +1913,20 @@ const SettingsPage = () => {
   };
   const closeManageBackups = () => setManageBackupsOpen(false);
 
-  const handleCreateBackupConfirm = async ({ type, components, name, include_plugins }) => {
+  const handleCreateBackupConfirm = async ({
+    type,
+    components,
+    name,
+    include_plugins,
+  }) => {
     setIsProcessingBackup(true);
     try {
-      const res = await apiService.createServerBackup(type, components, name, include_plugins);
+      const res = await apiService.createServerBackup(
+        type,
+        components,
+        name,
+        include_plugins,
+      );
       showMessage(`Backup created: ${res.file}`, "success");
     } catch (e) {
       showMessage(e.message, "error");
@@ -2092,391 +1948,1639 @@ const SettingsPage = () => {
   };
   // --- END NEW HANDLERS ---
 
-  const categoryStatusAccent = (statusColor) => {
-    if (statusColor === "success") return "success.main";
-    if (statusColor === "error") return "error.main";
-    if (statusColor === "warning") return "warning.main";
-    return "divider";
+  // ── v3 handlers: lifted from inline JSX so the panels stay declarative ──
+  const saveNickname = async () => {
+    const trimmedName = brandingName.trim();
+    if (!trimmedName) return;
+    if (trimmedName === (persistedSystemName || "")) return;
+    try {
+      const fd = new FormData();
+      fd.append("system_name", trimmedName);
+      await updateBranding(fd);
+      const refreshed = await fetchBranding();
+      const latestName =
+        refreshed?.system_name ?? trimmedName ?? persistedSystemName ?? "";
+      setSystemInfo(latestName, systemLogo || persistedSystemLogo || null);
+      showMessage("Nickname saved", "success");
+    } catch (err) {
+      showMessage("Failed to update nickname: " + err.message, "error");
+    }
   };
 
-  const categorySummaryBg = (theme, statusColor) => {
-    if (statusColor === "success") return alpha(theme.palette.success.main, 0.08);
-    if (statusColor === "error") return alpha(theme.palette.error.main, 0.1);
-    if (statusColor === "warning") return alpha(theme.palette.warning.main, 0.1);
-    return theme.palette.action.hover;
+  const saveMusicDirectory = async () => {
+    try {
+      const result = await setMusicDirectoryAPI(musicDirectory.trim());
+      if (result?.error) throw new Error(result.error);
+      setMusicDirectorySaved(musicDirectory);
+      showMessage(
+        `Media library path saved: ${musicDirectory || "(default)"}`,
+        "success",
+      );
+    } catch (err) {
+      showMessage(
+        "Failed to save media library path: " + (err.message || err),
+        "error",
+      );
+    }
   };
 
-  // Categorized self-test results: card list + muted accordions (no cramped tables)
-  const renderCategorizedResults = (results) => {
-    if (!results.categories) return null;
+  const handleRulesToggle = async (next) => {
+    // Optimistic UI + localStorage mirror; roll back on failure.
+    setRulesEnabledState(next);
+    try {
+      localStorage.setItem(RULES_ENABLED_KEY, String(next));
+    } catch {
+      // non-fatal
+    }
+    try {
+      const result = await apiService.setRulesEnabled(next);
+      if (result?.error) throw new Error(result.error);
+      showMessage(
+        next
+          ? "Rules enabled: the active rules from the Rules page apply"
+          : "Rules disabled: chat uses the built-in prompt",
+        "info",
+      );
+    } catch (err) {
+      console.error("Failed to update rules_enabled:", err);
+      setRulesEnabledState(!next);
+      try {
+        localStorage.setItem(RULES_ENABLED_KEY, String(!next));
+      } catch {
+        // non-fatal
+      }
+      showMessage("Failed to update Rules setting", "error");
+    }
+  };
 
-    return (
-      <Box mt={2} sx={{ width: "100%", minWidth: 0 }}>
-        {results.overall_status && (
-          <Box
-            mb={2}
-            sx={{
-              display: "flex",
-              flexWrap: "wrap",
-              gap: 1,
-              alignItems: "center",
-            }}
-          >
-            <Chip
-              icon={getStatusDisplay(results.overall_status).icon}
-              label={`Overall: ${getStatusDisplay(results.overall_status).label}`}
-              color={getStatusDisplay(results.overall_status).color}
-              variant="outlined"
-              size="small"
-            />
-            {results.execution_time != null && (
-              <Chip
-                icon={<SpeedIcon sx={{ fontSize: "1rem !important" }} />}
-                label={`${Number(results.execution_time).toFixed(2)}s`}
-                variant="outlined"
-                size="small"
-              />
-            )}
-          </Box>
-        )}
+  const handleChatThinkingToggle = async (next) => {
+    setChatThinkingDefaultState(next);
+    try {
+      const result = await apiService.setChatThinkingDefault(next);
+      if (result?.error) throw new Error(result.error);
+      showMessage(
+        next
+          ? "Thinking on by default: thinking models reason step by step (slower). Use /thinking off per chat."
+          : "Thinking off by default: faster replies. Use /thinking on per chat.",
+        "info",
+      );
+    } catch (err) {
+      console.error("Failed to update chat_thinking_default:", err);
+      setChatThinkingDefaultState(!next);
+      showMessage("Failed to update Chat thinking setting", "error");
+    }
+  };
 
-        {Object.entries(results.categories).map(([categoryKey, categoryData]) => {
-          const isExpanded = expandedCategories[categoryKey] || false;
-          const statusDisplay = getStatusDisplay(categoryData.status);
+  const handleSetEmbeddingClick = async () => {
+    if (
+      !window.confirm(
+        "Switch the embedding model?\n\n" +
+          "Same vector width: the existing index is kept.\n" +
+          "Different width: the index is emptied and every document must be re-indexed.\n\nContinue?",
+      )
+    )
+      return;
+    setIsSwitchingEmbedding(true);
+    try {
+      const r = await fetch("/api/model/embedding/set", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: selectedEmbeddingModel }),
+      });
+      const d = await r.json();
+      if (d.success) {
+        setEmbeddingModel(selectedEmbeddingModel);
+        const payload = payloadOf(d);
+        const dims = payload?.dimensions;
+        showMessage(
+          payload?.index_cleared
+            ? `Embedding switched to ${selectedEmbeddingModel} (${dims}d). The index was emptied; re-index your documents.`
+            : `Embedding switched to ${selectedEmbeddingModel} (${dims}d). Same width, index kept.`,
+          payload?.index_cleared ? "warning" : "success",
+        );
+        fetchResources();
+        setProfilesReloadKey((k) => k + 1);
+      } else {
+        showMessage(d.error || "Failed to switch embedding", "error");
+      }
+    } catch (e) {
+      showMessage(`Failed: ${e.message}`, "error");
+    } finally {
+      setIsSwitchingEmbedding(false);
+    }
+  };
 
-          return (
-            <Accordion
-              key={categoryKey}
-              expanded={isExpanded}
-              disableGutters
-              elevation={0}
-              onChange={() =>
-                setExpandedCategories((prev) => ({
-                  ...prev,
-                  [categoryKey]: !prev[categoryKey],
-                }))
-              }
-              sx={{
-                mb: 1,
-                border: 1,
-                borderColor: "divider",
-                borderRadius: 1,
-                overflow: "hidden",
-                "&:before": { display: "none" },
-              }}
-            >
-              <AccordionSummary
-                expandIcon={<ExpandMoreIcon />}
-                sx={(theme) => ({
-                  minHeight: 48,
-                  px: 1.5,
-                  borderLeft: "3px solid",
-                  borderLeftColor: categoryStatusAccent(statusDisplay.color),
-                  bgcolor: categorySummaryBg(theme, statusDisplay.color),
-                  "&.Mui-expanded": { minHeight: 48 },
-                })}
-              >
-                <Box
-                  sx={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 1,
-                    width: "100%",
-                    minWidth: 0,
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <Box sx={{ color: "text.secondary", display: "flex" }}>{getCategoryIcon(categoryKey)}</Box>
-                  <Typography variant="subtitle2" sx={{ flex: "1 1 140px", minWidth: 0, fontWeight: 600 }}>
-                    {categoryData.name || categoryKey}
-                  </Typography>
-                  <Chip
-                    icon={statusDisplay.icon}
-                    label={statusDisplay.label}
-                    color={statusDisplay.color}
-                    size="small"
-                    variant="outlined"
-                  />
-                  {categoryData.duration != null && (
-                    <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>
-                      {categoryData.duration.toFixed(2)}s
-                    </Typography>
-                  )}
-                </Box>
-              </AccordionSummary>
-              <AccordionDetails sx={{ pt: 0, px: 1.5, pb: 1.5, bgcolor: "background.default" }}>
-                {categoryData.summary && (
-                  <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5, wordBreak: "break-word" }}>
-                    {categoryData.summary}
-                  </Typography>
-                )}
+  // Media model selects: optimistic, rolled back when the server refuses.
+  const saveMediaModel = async (field, value, label) => {
+    const previous = mediaModels[field];
+    setMediaModelsState((p) => ({ ...p, [field]: value }));
+    try {
+      const res = await apiService.setMediaModels({ [field]: value });
+      const data = res?.data ?? res;
+      if (res?.error || data?.error) throw new Error(res?.error || data?.error);
+      showMessage(`${label}: ${value}`, "success");
+    } catch (err) {
+      setMediaModelsState((p) => ({ ...p, [field]: previous }));
+      showMessage(
+        err.message || `Failed to save ${label.toLowerCase()}`,
+        "error",
+      );
+    }
+  };
 
-                {categoryData.tests && categoryData.tests.length > 0 && (
-                  <Stack spacing={1} sx={{ mt: 0.5 }}>
-                    {categoryData.tests.map((test, index) => {
-                      const testStatus = getStatusDisplay(test.status);
-                      const shortName = (test.name || "").replace(/^.*\//, "");
-                      return (
-                        <Paper
-                          key={index}
-                          variant="outlined"
-                          sx={{
-                            p: 1.25,
-                            borderRadius: 1,
-                            bgcolor: "background.paper",
-                            borderColor: "divider",
-                          }}
-                        >
-                          <Box
-                            sx={{
-                              display: "flex",
-                              flexWrap: "wrap",
-                              alignItems: "flex-start",
-                              gap: 1,
-                              minWidth: 0,
-                            }}
-                          >
-                            <Chip
-                              icon={testStatus.icon}
-                              label={testStatus.label}
-                              color={testStatus.color}
-                              size="small"
-                              variant="outlined"
-                              sx={{ flexShrink: 0 }}
-                            />
-                            <Box sx={{ flex: "1 1 200px", minWidth: 0 }}>
-                              <Typography
-                                variant="body2"
-                                component="div"
-                                sx={{
-                                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                                  fontSize: "0.8rem",
-                                  wordBreak: "break-word",
-                                  overflowWrap: "anywhere",
-                                }}
-                              >
-                                {shortName || test.name || "Unnamed test"}
-                              </Typography>
-                              {test.duration != null && (
-                                <Typography variant="caption" color="text.secondary">
-                                  {test.duration.toFixed(2)}s
-                                </Typography>
-                              )}
-                            </Box>
-                          </Box>
-                          {(test.details || test.error_message) && (
-                            <Box sx={{ mt: 1, pt: 1, borderTop: 1, borderColor: "divider" }}>
-                              {test.details && (
-                                <Typography variant="body2" color="text.secondary" sx={{ wordBreak: "break-word" }}>
-                                  {test.details}
-                                </Typography>
-                              )}
-                              {test.error_message && (
-                                <Typography variant="caption" color="error" component="div" sx={{ mt: 0.5, wordBreak: "break-word" }}>
-                                  {test.error_message}
-                                </Typography>
-                              )}
-                            </Box>
-                          )}
-                        </Paper>
-                      );
-                    })}
-                  </Stack>
-                )}
-              </AccordionDetails>
-            </Accordion>
-          );
-        })}
-      </Box>
+  const saveLoraStrength = async (key, field, label, raw) => {
+    const v = parseFloat(raw);
+    if (Number.isNaN(v)) return;
+    if (lastSavedLoraRef.current[key] === v) {
+      setLoraSaveState((s) => ({ ...s, [key]: "saved" }));
+      return;
+    }
+    try {
+      const res = await apiService.setMediaModels({ [field]: v });
+      if (res?.error) throw new Error(res.error);
+      const data = res?.data ?? res;
+      if (data?.character_lora_strength) {
+        setMediaModelsState((p) => ({
+          ...p,
+          character_lora_strength: data.character_lora_strength,
+        }));
+        lastSavedLoraRef.current = { ...data.character_lora_strength };
+      } else {
+        lastSavedLoraRef.current = { ...lastSavedLoraRef.current, [key]: v };
+      }
+      setLoraSaveState((s) => ({ ...s, [key]: "saved" }));
+      showMessage(`${label} LoRA strength: ${v}`, "success");
+    } catch (err) {
+      setLoraSaveState((s) => ({ ...s, [key]: "error" }));
+      showMessage(err.message || "Failed to save LoRA strength", "error");
+    }
+  };
+
+  const handleIndexingPausedToggle = async (next) => {
+    try {
+      if (next) {
+        await apiService.pauseIndexing();
+        setIndexingPaused(true);
+        showMessage(
+          "Indexing paused: new documents wait until you resume",
+          "warning",
+        );
+      } else {
+        await apiService.resumeIndexing();
+        setIndexingPaused(false);
+        showMessage("Indexing resumed", "success");
+      }
+    } catch (e) {
+      showMessage(
+        "Failed to change indexing pause: " + (e.message || e),
+        "error",
+      );
+    }
+  };
+
+  // Read-modify-write on the plugin config. If the read fails we stop rather
+  // than write a config that contains only is_enabled.
+  const handleInterconnectorToggle = async (next) => {
+    try {
+      const currentConfig = await interconnectorApi.getInterconnectorConfig();
+      const cfg = currentConfig?.data?.config || currentConfig?.config;
+      if (!cfg)
+        throw new Error("could not read the current Interconnector config");
+      await interconnectorApi.updateInterconnectorConfig({
+        ...cfg,
+        is_enabled: next,
+      });
+      setInterconnectorEnabled(next);
+      showMessage(
+        next ? "Interconnector enabled" : "Interconnector disabled",
+        "info",
+      );
+    } catch (err) {
+      console.error("Failed to toggle Interconnector:", err);
+      showMessage(
+        `Interconnector was not changed: ${err.message || err}`,
+        "error",
+      );
+    }
+  };
+
+  const openClearChatDialog = async () => {
+    try {
+      const counts = await apiService.getChatHistoryCounts();
+      setChatHistoryCounts(counts && !counts.error ? counts : null);
+    } catch {
+      setChatHistoryCounts(null);
+    }
+    setClearChatOpen(true);
+  };
+
+  const confirmClearChat = async () => {
+    setClearChatBusy(true);
+    try {
+      const result = await apiService.clearChatHistory("all");
+      if (result?.error && !result.warning)
+        throw new Error(result.error.message || result.error);
+      showMessage(
+        result?.message || "Chat history cleared.",
+        result?.warning ? "warning" : "success",
+      );
+      setClearChatOpen(false);
+    } catch (err) {
+      showMessage(`Failed to clear chat history: ${err.message}`, "error");
+    } finally {
+      setClearChatBusy(false);
+    }
+  };
+
+  const fetchMemoryCount = useCallback(async () => {
+    try {
+      const res = await fetch("/api/memory?status=active&limit=1");
+      const body = await res.json();
+      const data = body?.data ?? body;
+      if (typeof data?.total === "number") setMemoryCount(data.total);
+    } catch (err) {
+      console.warn("Failed to count memories:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchMemoryCount();
+  }, [fetchMemoryCount]);
+
+  useEffect(() => {
+    getMcpStatus()
+      .then(setMcpStatus)
+      .catch((err) => console.warn("Failed to read MCP status:", err));
+    apiService.getConfineToolPaths().then((result) => {
+      const on = result?.data?.confine_tool_paths ?? result?.confine_tool_paths;
+      if (typeof on === "boolean") setConfineToolPaths(on);
+    });
+  }, []);
+
+  const handleConfineToolPathsToggle = async (next) => {
+    const previous = confineToolPaths;
+    setConfineToolPaths(next);
+    const result = await apiService.setConfineToolPaths(next);
+    if (result?.error) {
+      setConfineToolPaths(previous);
+      showMessage(`Could not save: ${result.error.message || result.error}. The setting was not changed.`, "error");
+      return;
+    }
+    showMessage(
+      next
+        ? "File tools now stay inside the project folder."
+        : "File tools can read outside the project folder again.",
+      "info",
     );
   };
 
-  const renderLegacyDiagnosticsCards = (ds) => (
-    <Stack spacing={1} sx={{ mt: 1.5 }}>
-      {systemCheckItems.map((item) => {
-        const val = ds[item.key];
-        const details = val !== undefined ? item.format(val, ds) : "N/A";
-        return (
-          <Paper
-            key={item.key}
-            variant="outlined"
-            sx={{
-              p: 1.25,
-              borderRadius: 1,
-              bgcolor: "background.paper",
-              borderColor: "divider",
-            }}
-          >
-            <Box sx={{ display: "flex", gap: 1.25, alignItems: "flex-start", minWidth: 0 }}>
-              <Box sx={{ color: "text.secondary", display: "flex", flexShrink: 0, pt: 0.25 }}>
-                {item.icon ? React.cloneElement(item.icon, { fontSize: "small" }) : renderStatusIcon(val, details)}
-              </Box>
-              <Box sx={{ minWidth: 0, flex: 1 }}>
-                <Typography variant="body2" fontWeight={600} sx={{ wordBreak: "break-word" }}>
-                  {item.label}
-                </Typography>
-                <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, wordBreak: "break-word", overflowWrap: "anywhere" }}>
-                  {details}
-                </Typography>
-              </Box>
-            </Box>
-          </Paper>
-        );
-      })}
-    </Stack>
+  const confirmClearLearning = async () => {
+    setLearningBusy(true);
+    try {
+      const result =
+        learningClear === "rules"
+          ? await apiService.purgeBehaviorLearning()
+          : await clearBehaviorLog();
+      if (result?.error) throw new Error(result.error.message || result.error);
+      showMessage(
+        result?.message ||
+          (learningClear === "rules"
+            ? "Learned rules cleared."
+            : "Behaviour log cleared."),
+        "success",
+      );
+      setLearningClear(null);
+    } catch (err) {
+      showMessage(`Failed to clear: ${err.message}`, "error");
+    } finally {
+      setLearningBusy(false);
+    }
+  };
+
+  const confirmClearMemories = async () => {
+    setClearMemoriesBusy(true);
+    try {
+      const res = await fetch("/api/memory/clear", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmation: "CLEAR_MEMORIES" }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok)
+        throw new Error(body?.error || body?.message || `HTTP ${res.status}`);
+      showMessage("Agent memory cleared.", "success");
+      setClearMemoriesOpen(false);
+      fetchMemoryCount();
+    } catch (err) {
+      showMessage(`Failed to clear agent memory: ${err.message}`, "error");
+    } finally {
+      setClearMemoriesBusy(false);
+    }
+  };
+
+  // ── Layout: independent stacked columns so panels reflow instead of
+  // aligning to a row. 3 columns from xl (1536), 2 from md (900), else 1.
+  const columns = isXl ? 3 : isMd ? 2 : 1;
+
+  const activeModelEntry = availableModels.find((m) => m.name === activeModel);
+  const activeEmbeddingEntry = embeddingModels.find(
+    (m) => m.name === embeddingModel,
+  );
+  const gpu = gpuResources?.gpu;
+  const indexTotals = indexProfiles.reduce(
+    (acc, p) => {
+      const proj = p.projection || {};
+      if (proj.exists) {
+        acc.rows += proj.rows || 0;
+        acc.bytes += proj.size_bytes || 0;
+      }
+      if (p.active) acc.active += 1;
+      return acc;
+    },
+    { rows: 0, bytes: 0, active: 0 },
+  );
+  const chatModelPending =
+    Boolean(selectedModel) && selectedModel !== activeModel;
+  const embeddingPending =
+    Boolean(selectedEmbeddingModel) &&
+    selectedEmbeddingModel !== embeddingModel;
+  const musicDirectoryPending =
+    (musicDirectory || "") !== (musicDirectorySaved || "");
+
+  const chatSizeOf = (m) => {
+    const num = parseFloat(m.details?.parameter_size || "");
+    if (Number.isNaN(num)) return null;
+    if (num <= 3) return "small";
+    if (num <= 10) return "medium";
+    return "large";
+  };
+  const chatSizes = [
+    ...new Set(availableModels.map(chatSizeOf).filter(Boolean)),
+  ];
+  const chatSizeLabels = { small: "≤3B", medium: "3–10B", large: ">10B" };
+  const embedDims = [
+    ...new Set(embeddingModels.map((m) => m.dimensions).filter(Boolean)),
+  ].sort((a, b) => a - b);
+
+  const strip = (
+    <DashboardStrip>
+      <DashboardTile
+        label="Chat model"
+        tone={isLoadingModel ? "warn" : activeModel ? "ok" : "off"}
+        value={activeModel || "none"}
+        sub={
+          activeModelEntry?.details?.parameter_size
+            ? `${activeModelEntry.details.parameter_size} · ${formatByteSize(activeModelEntry.size)}`
+            : undefined
+        }
+        onClick={() =>
+          document
+            .getElementById("settings-models")
+            ?.scrollIntoView({ behavior: "smooth", block: "start" })
+        }
+      />
+      <DashboardTile
+        label="Embedding"
+        tone={
+          embeddingModel &&
+          embeddingModel !== "Not Set" &&
+          embeddingModel !== "Not Available"
+            ? "ok"
+            : "off"
+        }
+        value={embeddingModel || "none"}
+        sub={
+          activeEmbeddingEntry?.dimensions
+            ? `${activeEmbeddingEntry.dimensions}d`
+            : undefined
+        }
+      />
+      {gpu?.total_mb > 0 && (
+        <DashboardTile
+          label="VRAM"
+          value={`${(gpu.used_mb / 1024).toFixed(1)} / ${(gpu.total_mb / 1024).toFixed(1)} GB`}
+          progress={gpu.utilization_pct}
+        />
+      )}
+      {gpuResources && (
+        <DashboardTile
+          label="Loaded in VRAM"
+          tone={gpuResources?.loaded_models?.length ? "ok" : "off"}
+          value={
+            gpuResources?.loaded_models?.length
+              ? `${gpuResources.loaded_models.length} model${gpuResources.loaded_models.length === 1 ? "" : "s"}`
+              : "nothing"
+          }
+          sub={gpuResources?.loaded_models?.map((m) => m.name).join(", ")}
+        />
+      )}
+      <DashboardTile
+        label="Index"
+        tone={indexTotals.rows > 0 ? "ok" : "off"}
+        value={
+          indexTotals.rows > 0
+            ? `${indexTotals.rows.toLocaleString()} vectors · ${formatByteSize(indexTotals.bytes)}`
+            : "empty"
+        }
+        sub={`${indexTotals.active} of ${indexProfiles.length} profiles active${indexingPaused ? " · paused" : ""}`}
+        onClick={() =>
+          document
+            .getElementById("settings-knowledge")
+            ?.scrollIntoView({ behavior: "smooth", block: "start" })
+        }
+      />
+      <DashboardTile
+        label="Image generation"
+        tone={
+          imageGenAvailable
+            ? "ok"
+            : imageGenStatus === null
+              ? "warn"
+              : "off"
+        }
+        value={
+          imageGenStatus === null
+            ? "checking"
+            : imageGenAvailable
+              ? "Available"
+              : "Unavailable"
+        }
+        sub={
+          imageGenAvailable ? undefined : imageGenUnavailableHint
+        }
+      />
+      {interconnectorEnabled && (
+        <DashboardTile
+          label="Interconnector"
+          tone={
+            interconnectorPendingCount > 0 ||
+            interconnectorUpdateStatus?.summary?.total > 0
+              ? "warn"
+              : "ok"
+          }
+          value={
+            interconnectorUpdateStatus?.summary?.total > 0
+              ? `${interconnectorUpdateStatus.summary.total} code updates`
+              : interconnectorPendingCount > 0
+                ? `${interconnectorPendingCount} pending`
+                : "In sync"
+          }
+          onClick={() => setInterconnectorModalOpen(true)}
+        />
+      )}
+    </DashboardStrip>
   );
 
-  const renderTestSuitePanel = (suite) => {
-    if (!suite || typeof suite !== "object") return null;
-    const rc = suite.returncode;
-    const passed = rc === 0 || rc === 4 || rc === 5;
-    const summary = suite.summary || {};
-    const counts = summary.counts || {};
-    const failures = Array.isArray(summary.failures) ? summary.failures : [];
-    const stdout = typeof suite.stdout === "string" ? suite.stdout : "";
-    const stderr = typeof suite.stderr === "string" ? suite.stderr : "";
-
-    return (
-      <Box
-        mt={2}
-        sx={{
-          width: "100%",
-          minWidth: 0,
-          p: 1.5,
-          borderRadius: 1,
-          border: 1,
-          borderColor: "divider",
-          bgcolor: (theme) => alpha(theme.palette.action.hover, theme.palette.mode === "dark" ? 0.35 : 0.6),
+  const generalPanel = (
+    <SettingsPanel
+      id="settings-general"
+      title="General"
+      description="Identity, appearance, paths."
+    >
+      <input
+        type="file"
+        accept="image/*"
+        onChange={(e) => {
+          const file = e.target.files[0];
+          if (file) {
+            setBrandingFile(file);
+            (async () => {
+              try {
+                const fd = new FormData();
+                fd.append("logo", file);
+                if (brandingName.trim())
+                  fd.append("system_name", brandingName.trim());
+                await updateBranding(fd);
+                setBrandingFile(null);
+                e.target.value = "";
+                const refreshed = await fetchBranding();
+                const latestLogo =
+                  refreshed?.logo_path ??
+                  systemLogo ??
+                  persistedSystemLogo ??
+                  null;
+                setSystemInfo(
+                  brandingName || persistedSystemName || "",
+                  latestLogo,
+                );
+                showMessage("Profile image updated", "success");
+              } catch (err) {
+                showMessage("Failed to update image: " + err.message, "error");
+              }
+            })();
+          }
         }}
+        style={{ display: "none" }}
+        id="logo-upload"
+      />
+      <Line nowrap>
+        <Tooltip title="Change profile image">
+          <label
+            htmlFor="logo-upload"
+            style={{ cursor: "pointer", display: "inline-flex" }}
+          >
+            <Avatar
+              src={
+                brandingFile
+                  ? URL.createObjectURL(brandingFile)
+                  : systemLogo
+                    ? `/api/uploads/${systemLogo}`
+                    : persistedSystemLogo
+                      ? `/api/uploads/${persistedSystemLogo}`
+                      : `/api/uploads/system/profile-default.png`
+              }
+              variant="rounded"
+              sx={{
+                width: 40,
+                height: 40,
+                border: 1,
+                borderColor: "divider",
+                "&:hover": { opacity: 0.8 },
+              }}
+            >
+              <AccountBoxIcon />
+            </Avatar>
+          </label>
+        </Tooltip>
+        <TextField
+          label="Nickname"
+          value={brandingName}
+          onChange={(e) => setBrandingName(e.target.value)}
+          size="small"
+          className="grow"
+          onBlur={saveNickname}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.target.blur();
+          }}
+        />
+        <ActionButton
+          onClick={() => setThemeModalOpen(true)}
+          tooltip={`Current theme: ${themeName}`}
+        >
+          Theme
+        </ActionButton>
+      </Line>
+      <Cluster label="Navigation" note="how pages are listed">
+        <Line>
+          <ChoiceChips
+            ariaLabel="Navigation mode"
+            value={navChrome}
+            onChange={setNavChrome}
+            options={[
+              {
+                value: NAV_CHROME.SIDEBAR,
+                label: "Sidebar",
+                tooltip: "Every page in one list",
+              },
+              {
+                value: NAV_CHROME.SOFTWARE,
+                label: "Workspaces",
+                tooltip: "Pages grouped by workspace in the top bar",
+              },
+            ]}
+          />
+        </Line>
+      </Cluster>
+      <Cluster
+        label="Media library"
+        note="where Audio Studio and Music Video look for tracks"
       >
-        <Box sx={{ display: "flex", flexWrap: "wrap", gap: 1, alignItems: "center" }}>
-          <Chip label={passed ? "Suite passed" : "Suite failed"} color={passed ? "success" : "error"} size="small" variant="outlined" />
-          <Chip label={`Exit ${rc ?? "?"}`} size="small" variant="outlined" />
-          {typeof counts.passed === "number" && (
-            <Chip label={`${counts.passed} passed`} size="small" variant="outlined" />
-          )}
-          {typeof counts.failed === "number" && counts.failed > 0 && (
-            <Chip label={`${counts.failed} failed`} size="small" color="error" variant="outlined" />
-          )}
-          {typeof counts.errors === "number" && counts.errors > 0 && (
-            <Chip label={`${counts.errors} errors`} size="small" color="warning" variant="outlined" />
-          )}
-          {typeof counts.skipped === "number" && counts.skipped > 0 && (
-            <Chip label={`${counts.skipped} skipped`} size="small" variant="outlined" />
-          )}
-        </Box>
+        <Line nowrap>
+          <TextField
+            size="small"
+            className="grow"
+            value={musicDirectory}
+            onChange={(e) => setMusicDirectory(e.target.value)}
+            placeholder="~/Music"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && musicDirectoryPending)
+                saveMusicDirectory();
+            }}
+          />
+          <ActionButton
+            kind={musicDirectoryPending ? "primary" : "neutral"}
+            disabled={!musicDirectoryPending}
+            onClick={saveMusicDirectory}
+          >
+            Save
+          </ActionButton>
+        </Line>
+      </Cluster>
+      <ProfileSection />
+    </SettingsPanel>
+  );
 
-        {suite.log_path && (
-          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1, wordBreak: "break-all" }}>
-            Log: {suite.log_path}
-          </Typography>
+  const modelsPanel = (
+    <SettingsPanel
+      id="settings-models"
+      title="Models"
+      description="Which models answer chat and index documents."
+    >
+      <Cluster
+        label="Chat"
+        note={chatSizes.length > 1 ? "filter by size" : undefined}
+      >
+        {chatSizes.length > 1 && (
+          <ChoiceChips
+            ariaLabel="Chat model size filter"
+            value={chatSizeFilter || "all"}
+            onChange={(v) => setChatSizeFilter(v === "all" ? null : v)}
+            options={[
+              { value: "all", label: "All" },
+              ...["small", "medium", "large"]
+                .filter((s) => chatSizes.includes(s))
+                .map((s) => ({
+                  value: s,
+                  label: `${chatSizeLabels[s]} · ${availableModels.filter((m) => chatSizeOf(m) === s).length}`,
+                })),
+            ]}
+          />
         )}
-
-        {failures.length > 0 && (
-          <Box sx={{ mt: 1.5 }}>
-            <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5 }}>
-              Failure details
-            </Typography>
-            <Stack spacing={1} sx={{ mt: 1 }}>
-              {failures.map((block, i) => (
-                <Paper
-                  key={i}
-                  variant="outlined"
-                  sx={{
-                    p: 1,
-                    borderRadius: 1,
-                    bgcolor: "background.paper",
-                    borderColor: "error.dark",
-                    maxHeight: 220,
-                    overflow: "auto",
-                  }}
-                >
-                  <Typography
-                    component="pre"
-                    variant="caption"
-                    sx={{
-                      m: 0,
-                      whiteSpace: "pre-wrap",
-                      wordBreak: "break-word",
-                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                      fontSize: "0.7rem",
-                    }}
-                  >
-                    {block}
-                  </Typography>
-                </Paper>
-              ))}
-            </Stack>
+        <Line nowrap>
+          <FormControl
+            size="small"
+            className="grow"
+            disabled={isLoading || isLoadingModel}
+          >
+            <InputLabel>Chat model</InputLabel>
+            <Select
+              value={selectedModel}
+              label="Chat model"
+              onChange={(e) => setSelectedModel(e.target.value)}
+              error={
+                availableModels.length > 0 &&
+                !availableModels.some((m) => m.name === selectedModel)
+              }
+            >
+              {availableModels
+                .filter(
+                  (m) =>
+                    chatSizeFilter === null ||
+                    chatSizeOf(m) === chatSizeFilter ||
+                    m.name === activeModel,
+                )
+                .map((m) => (
+                  <MenuItem key={m.name} value={m.name}>
+                    {m.name}
+                    {m.details?.parameter_size
+                      ? ` (${m.details.parameter_size}`
+                      : ""}
+                    {m.size
+                      ? `${m.details?.parameter_size ? ", " : " ("}${formatByteSize(m.size)})`
+                      : m.details?.parameter_size
+                        ? ")"
+                        : ""}
+                  </MenuItem>
+                ))}
+            </Select>
+          </FormControl>
+          <ActionButton
+            kind={chatModelPending ? "primary" : "neutral"}
+            onClick={handleSetModelClick}
+            disabled={!chatModelPending || isLoading || isLoadingModel}
+            loading={isLoadingModel}
+            tooltip="Loads the model, unloads the previous one and rebuilds the query engine. Can take minutes on a cold GPU."
+          >
+            Set active
+          </ActionButton>
+          <ActionButton
+            onClick={async () => {
+              setIsTestingLLM(true);
+              try {
+                const result = await apiService.testLLM();
+                if (result?.error) throw new Error(result.error);
+                showMessage(
+                  `${activeModel || "Active model"} answered in ${result?.duration_sec ?? "?"}s`,
+                  "success",
+                );
+              } catch (err) {
+                showMessage(`LLM test failed: ${err.message}`, "error");
+              } finally {
+                setIsTestingLLM(false);
+              }
+            }}
+            loading={isTestingLLM}
+            disabled={isLoading || isLoadingModel}
+            tooltip="Sends one short prompt to the ACTIVE model, not the one selected above"
+          >
+            Test
+          </ActionButton>
+          <ActionButton
+            onClick={fetchAvailableModels}
+            disabled={isLoading}
+            tooltip="Refresh the model list from Ollama"
+            aria-label="Refresh chat models"
+            sx={{ px: 1, minWidth: 0 }}
+          >
+            <RefreshIcon sx={{ fontSize: 16 }} />
+          </ActionButton>
+        </Line>
+        {modelSwitchStatus === "loading" && (
+          <Box>
+            <LinearProgress sx={{ height: 4, borderRadius: 2 }} />
+            <Hint>{modelSwitchMessage || "Switching model…"}</Hint>
           </Box>
         )}
+      </Cluster>
 
-        {(stdout || stderr) && (
-          <>
-            <Divider sx={{ my: 1.5 }} />
-            <Button size="small" variant="text" onClick={() => setTestSuiteOutputOpen((o) => !o)} sx={{ textTransform: "none", p: 0, minWidth: 0 }}>
-              {testSuiteOutputOpen ? "Hide raw output" : "Show raw output"}
-            </Button>
-            <Collapse in={testSuiteOutputOpen}>
-              {stderr ? (
-                <Box sx={{ mt: 1 }}>
-                  <Typography variant="caption" color="error" sx={{ fontWeight: 600 }}>
-                    stderr
-                  </Typography>
-                  <Typography
-                    component="pre"
-                    variant="caption"
-                    sx={{
-                      display: "block",
-                      mt: 0.5,
-                      p: 1,
-                      borderRadius: 1,
-                      bgcolor: "action.hover",
-                      whiteSpace: "pre-wrap",
-                      wordBreak: "break-word",
-                      overflowWrap: "anywhere",
-                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                      fontSize: "0.7rem",
-                      maxHeight: 240,
-                      overflow: "auto",
-                    }}
-                  >
-                    {stderr}
-                  </Typography>
-                </Box>
-              ) : null}
-              {stdout ? (
-                <Box sx={{ mt: stderr ? 1.5 : 1 }}>
-                  <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>
-                    stdout
-                  </Typography>
-                  <Typography
-                    component="pre"
-                    variant="caption"
-                    sx={{
-                      display: "block",
-                      mt: 0.5,
-                      p: 1,
-                      borderRadius: 1,
-                      bgcolor: "action.hover",
-                      whiteSpace: "pre-wrap",
-                      wordBreak: "break-word",
-                      overflowWrap: "anywhere",
-                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                      fontSize: "0.7rem",
-                      maxHeight: 280,
-                      overflow: "auto",
-                    }}
-                  >
-                    {stdout}
-                  </Typography>
-                </Box>
-              ) : null}
-            </Collapse>
-          </>
+      <Cluster
+        label="Embedding"
+        note={embedDims.length > 1 ? "filter by width" : undefined}
+      >
+        {embedDims.length > 1 && (
+          <ChoiceChips
+            ariaLabel="Embedding dimension filter"
+            value={embedDimFilter === null ? "all" : String(embedDimFilter)}
+            onChange={(v) => setEmbedDimFilter(v === "all" ? null : Number(v))}
+            options={[
+              { value: "all", label: "All" },
+              ...embedDims.map((d) => ({
+                value: String(d),
+                label: `${d}d · ${embeddingModels.filter((m) => m.dimensions === d).length}`,
+              })),
+            ]}
+          />
         )}
-      </Box>
-    );
-  };
+        <Line nowrap>
+          <FormControl
+            size="small"
+            className="grow"
+            disabled={isSwitchingEmbedding}
+          >
+            <InputLabel>Embedding model</InputLabel>
+            <Select
+              value={selectedEmbeddingModel}
+              label="Embedding model"
+              onChange={(e) => setSelectedEmbeddingModel(e.target.value)}
+            >
+              {embeddingModels
+                .filter(
+                  (m) =>
+                    embedDimFilter === null ||
+                    m.dimensions === embedDimFilter ||
+                    m.name === embeddingModel,
+                )
+                .map((m) => (
+                  <MenuItem key={m.name} value={m.name}>
+                    {m.name}
+                    {m.size_mb ? ` (${m.size_mb}MB` : ""}
+                    {m.dimensions
+                      ? `${m.size_mb ? ", " : " ("}${m.dimensions}d)`
+                      : m.size_mb
+                        ? ")"
+                        : ""}
+                  </MenuItem>
+                ))}
+            </Select>
+          </FormControl>
+          <ActionButton
+            kind={embeddingPending ? "primary" : "neutral"}
+            disabled={!embeddingPending}
+            loading={isSwitchingEmbedding}
+            onClick={handleSetEmbeddingClick}
+            tooltip="Same vector width keeps the index. A different width empties it and every document must be re-indexed."
+          >
+            Set active
+          </ActionButton>
+          <ActionButton
+            onClick={fetchEmbeddingModels}
+            tooltip="Refresh embedding models (probes each one, can take a moment)"
+            aria-label="Refresh embedding models"
+            sx={{ px: 1, minWidth: 0 }}
+          >
+            <RefreshIcon sx={{ fontSize: 16 }} />
+          </ActionButton>
+        </Line>
+      </Cluster>
+    </SettingsPanel>
+  );
+
+  const chatPanel = (
+    <SettingsPanel
+      id="settings-chat"
+      title="Chat"
+      description="What every conversation can do by default."
+    >
+      <Cluster label="Capabilities" note="gear opens that feature's settings">
+        <Line>
+          <SettingChip
+            label="Rules"
+            on={rulesEnabled}
+            onToggle={handleRulesToggle}
+            onSettings={() => navigate("/rules")}
+            tooltip="Persona and behaviour rules from the Rules page. Off swaps them for a plain built-in prompt."
+          />
+          <SettingChip
+            label="Chat thinking"
+            on={chatThinkingDefault}
+            onToggle={handleChatThinkingToggle}
+            tooltip="Default for thinking models. Per chat: /thinking on or off."
+          />
+          <SettingChip
+            label="Web access"
+            on={webSearchEnabled}
+            onToggle={handleWebSearchToggle}
+            tooltip="Lets the web, browser and address tools reach the internet."
+          />
+          <SettingChip
+            label="Voice chat"
+            on={voiceChatEnabled}
+            onToggle={setVoiceChatEnabled}
+            onSettings={() => setVoiceSettingsModalOpen(true)}
+            tooltip="Speak to the assistant and hear replies. Stored in this browser."
+          />
+        </Line>
+      </Cluster>
+      <Cluster label="Retrieval" note="how answers use your documents">
+        <Line>
+          <SettingChip
+            label="Enhanced context"
+            on={enhancedContext}
+            onToggle={(next) => handleEnhancedContextChange(next)}
+            tooltip="Adds conversation and document context to every prompt. Applies from the next message."
+          />
+          <SettingChip
+            label="Advanced RAG"
+            on={advancedRag}
+            onToggle={(next) => handleAdvancedRagChange(next)}
+            tooltip="Query rewriting and reranking before retrieval. Applies from the next message."
+          />
+          <SettingChip
+            label="Behaviour learning"
+            on={behaviorLearningEnabled}
+            onToggle={(next) => handleBehaviorLearningToggle(next)}
+            tooltip="Learns from corrections and preferences across chats."
+          />
+        </Line>
+      </Cluster>
+    </SettingsPanel>
+  );
+
+  const generationPanel = (
+    <SettingsPanel
+      id="settings-generation"
+      title="Generation"
+      description="Defaults for images, video and voice."
+    >
+      <Cluster label="Prompts">
+        <Line>
+          <SettingChip
+            label="Verbatim prompts"
+            on={verbatimPrompts}
+            onToggle={() => handleVerbatimPromptsToggle()}
+            disabled={verbatimForcedByEnv || verbatimSaving}
+            note={verbatimForcedByEnv ? "forced by environment" : undefined}
+            tooltip={
+              verbatimForcedByEnv
+                ? "VERBATIM_PROMPTS is set in the server environment. Remove it and restart to control this here."
+                : "On: disables AI prompt rewriting and automatic style additions. Model prompt limits and instruction-following still apply. Off: allows prompt enhancement."
+            }
+          />
+        </Line>
+      </Cluster>
+      <Cluster
+        label="Stills models"
+        note="Z-Image Turbo by default; FLUX for max quality; the train base must match the LoRA family"
+      >
+        <Line>
+          <FormControl size="small" className="grow">
+            <InputLabel id="media-stills-label">Stills</InputLabel>
+            <Select
+              labelId="media-stills-label"
+              label="Stills"
+              value={mediaModels.stills_model || "zimage-turbo"}
+              onChange={(e) =>
+                saveMediaModel("stills_model", e.target.value, "Stills model")
+              }
+            >
+              {(mediaModels.stills_profiles?.length
+                ? mediaModels.stills_profiles
+                : [
+                    { id: "zimage-turbo", name: "Z-Image Turbo" },
+                    { id: "flux-dev", name: "FLUX.1 Dev" },
+                    { id: "krea2-turbo", name: "Krea 2 Turbo" },
+                    { id: "sdxl-legacy", name: "SDXL (Legacy)" },
+                  ]
+              ).map((p) => (
+                <MenuItem key={p.id} value={p.id}>
+                  {p.name || p.id}
+                  {p.recommended ? " ★" : ""}
+                  {p.deprecated ? " (legacy)" : ""}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          <FormControl size="small" className="grow">
+            <InputLabel id="media-train-label">Cast LoRA base</InputLabel>
+            <Select
+              labelId="media-train-label"
+              label="Cast LoRA base"
+              value={mediaModels.cast_train_base || "zimage-turbo"}
+              onChange={(e) =>
+                saveMediaModel(
+                  "cast_train_base",
+                  e.target.value,
+                  "Cast train base",
+                )
+              }
+            >
+              {(mediaModels.train_profiles?.length
+                ? mediaModels.train_profiles
+                : [
+                    { id: "zimage-turbo", name: "Z-Image Turbo" },
+                    { id: "sdxl-legacy", name: "SDXL (Legacy)" },
+                  ]
+              ).map((p) => (
+                <MenuItem key={p.id} value={p.id}>
+                  {p.name || p.id}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          <FormControl size="small" className="grow">
+            <InputLabel id="media-max-label">Max quality</InputLabel>
+            <Select
+              labelId="media-max-label"
+              label="Max quality"
+              value={mediaModels.max_quality_model || "flux-dev"}
+              onChange={(e) =>
+                saveMediaModel(
+                  "max_quality_model",
+                  e.target.value,
+                  "Max quality model",
+                )
+              }
+            >
+              <MenuItem value="flux-dev">FLUX.1 Dev</MenuItem>
+              <MenuItem value="zimage-turbo">Z-Image Turbo</MenuItem>
+            </Select>
+          </FormControl>
+        </Line>
+      </Cluster>
+      <Cluster
+        label="Character LoRA strength"
+        note="for stills and keyframes; video motion models keep the identity baked into the still"
+      >
+        <Line>
+          {[
+            {
+              key: "zimage",
+              label: "Z-Image",
+              field: "character_lora_strength_zimage",
+              def: 0.9,
+            },
+            {
+              key: "sdxl",
+              label: "SDXL",
+              field: "character_lora_strength_sdxl",
+              def: 0.25,
+            },
+            {
+              key: "flux",
+              label: "FLUX",
+              field: "character_lora_strength_flux",
+              def: 0.9,
+            },
+          ].map(({ key, label, field, def }) => (
+            <Box key={key} className="grow" sx={{ display: "flex", flexDirection: "column", gap: 0.5, minWidth: 0 }}>
+              <TextField
+                size="small"
+                type="number"
+                label={label}
+                inputProps={{ min: 0, max: 1.5, step: 0.05 }}
+                value={mediaModels.character_lora_strength?.[key] ?? def}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setMediaModelsState((p) => ({
+                    ...p,
+                    character_lora_strength: {
+                      ...(p.character_lora_strength || {}),
+                      [key]: v,
+                    },
+                  }));
+                  setLoraSaveState((s) => ({ ...s, [key]: "unsaved" }));
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    saveLoraStrength(key, field, label, e.target.value);
+                  }
+                }}
+                onBlur={(e) => saveLoraStrength(key, field, label, e.target.value)}
+              />
+              <StatusPill
+                tone={
+                  loraSaveState[key] === "saved"
+                    ? "ok"
+                    : loraSaveState[key] === "error"
+                      ? "error"
+                      : "warn"
+                }
+                label={
+                  loraSaveState[key] === "saved"
+                    ? "saved"
+                    : loraSaveState[key] === "error"
+                      ? "not saved"
+                      : "unsaved"
+                }
+              />
+            </Box>
+          ))}
+        </Line>
+      </Cluster>
+      <Cluster
+        label="Model libraries"
+        note="download and manage the models behind each studio"
+      >
+        <Line>
+          <StatusPill
+            tone={
+              imageGenAvailable
+                ? "ok"
+                : imageGenStatus === null
+                  ? "warn"
+                  : "neutral"
+            }
+            label={
+              imageGenStatus === null
+                ? "Image generation: checking"
+                : imageGenAvailable
+                  ? "Image generation available"
+                  : "Image generation unavailable"
+            }
+            tooltip={
+              imageGenAvailable
+                ? ""
+                : imageGenUnavailableHint
+            }
+          />
+          <ActionButton onClick={() => setImageModelsModalOpen(true)}>
+            Image
+          </ActionButton>
+          <ActionButton onClick={() => setInfographicModelsModalOpen(true)}>
+            Infographic
+          </ActionButton>
+          <ActionButton onClick={() => setVideoModelsModalOpen(true)}>
+            Video
+          </ActionButton>
+          <ActionButton onClick={() => setVoiceModelsModalOpen(true)}>
+            Voice
+          </ActionButton>
+          <ActionButton onClick={() => setAudioModelsModalOpen(true)}>
+            Audio
+          </ActionButton>
+        </Line>
+      </Cluster>
+    </SettingsPanel>
+  );
+
+  const knowledgePanel = (
+    <SettingsPanel
+      id="settings-knowledge"
+      title="Knowledge"
+      description="Index profiles, indexing, nightly research."
+    >
+      <Cluster
+        label="Index profiles"
+        note="one corpus, several projections; lit = built and queried"
+      >
+        <IndexProfileChips
+          onLoaded={setIndexProfiles}
+          reloadKey={profilesReloadKey}
+          showMessage={showMessage}
+          onEdit={setEditProfile}
+        />
+      </Cluster>
+      <Cluster label="Indexing">
+        <Line>
+          <SettingChip
+            label="Indexing paused"
+            on={indexingPaused}
+            onToggle={handleIndexingPausedToggle}
+            tooltip="Paused: new documents wait instead of embedding. Useful during heavy GPU work."
+          />
+          <Sep />
+          <ActionButton
+            onClick={() =>
+              handleActionClick(
+                apiService.optimizeIndex,
+                [],
+                null,
+                "Optimizing index...",
+                "Index optimized.",
+                "Failed to optimize index",
+              )
+            }
+            disabled={isLoading}
+            tooltip="Removes vectors whose document is gone. Nothing else changes."
+          >
+            Optimize
+          </ActionButton>
+          <ActionButton
+            onClick={() =>
+              handleActionClick(
+                apiService.buildCorpusSummaries,
+                [{ replace: true }],
+                "Build corpus summaries? This replaces the previous summary tree and uses the GPU for several minutes.",
+                "Queuing summary build...",
+                "Summary build queued.",
+                "Failed to queue the summary build",
+              )
+            }
+            disabled={isLoading}
+            tooltip="Builds the RAPTOR summary tree on the indexing queue. Several minutes of GPU."
+          >
+            Build summaries
+          </ActionButton>
+          <ActionButton
+            onClick={async () => {
+              try {
+                const res = await apiService.resumePendingIndexing();
+                showMessage(
+                  res?.message || "Pending documents queued for indexing",
+                  "success",
+                );
+              } catch (e) {
+                showMessage(
+                  "Failed to resume pending: " + (e.message || e),
+                  "error",
+                );
+              }
+            }}
+            disabled={isLoading || indexingPaused}
+            tooltip={
+              indexingPaused
+                ? "Turn off Indexing paused first"
+                : "Queues every document still pending or in error"
+            }
+          >
+            Index pending
+          </ActionButton>
+        </Line>
+      </Cluster>
+      <Cluster
+        label="Autoresearch"
+        note="overnight retrieval tuning; parameters and history on its own page"
+      >
+        <Line>
+          <SettingChip
+            label="Nightly auto-start"
+            on={autoresearchSettings?.rag_autoresearch_auto_enabled === "true"}
+            onToggle={(next) =>
+              handleAutoresearchSettingChange(
+                "rag_autoresearch_auto_enabled",
+                next,
+              )
+            }
+            note={
+              autoresearchSettings?.autoresearch_nightly_window || undefined
+            }
+            tooltip="Runs one research pass in the nightly window when the machine is idle."
+          />
+          <ActionButton
+            kind="link"
+            startIcon={<OpenInNewIcon sx={{ fontSize: 14 }} />}
+            onClick={() => navigate("/autoresearch")}
+          >
+            Autoresearch
+          </ActionButton>
+          <ActionButton
+            kind="link"
+            startIcon={<OpenInNewIcon sx={{ fontSize: 14 }} />}
+            onClick={() => navigate("/dev-tools")}
+          >
+            Retrieval health
+          </ActionButton>
+        </Line>
+      </Cluster>
+    </SettingsPanel>
+  );
+
+  const agentsPanel = (
+    <SettingsPanel
+      id="settings-agents"
+      title="Agents"
+      description="The mentor, what it remembers, where it can see."
+    >
+      <UncleClaudeSection />
+      <Cluster
+        label="Memory"
+        note="facts, preferences and lessons the agent has learned"
+      >
+        <Line>
+          <StatusPill
+            tone={memoryCount > 0 ? "ok" : "neutral"}
+            label={memoryCount === null ? "counting" : `${memoryCount} active`}
+          />
+          <ActionButton onClick={() => navigate("/agents/memory")}>
+            Manage memory
+          </ActionButton>
+        </Line>
+      </Cluster>
+      <Cluster label="File access" note="where system_command and codegen may read">
+        <Line>
+          <SettingChip
+            label="Project folder only"
+            on={confineToolPaths}
+            onToggle={handleConfineToolPathsToggle}
+            tooltip="On: file tools read only inside the project, its data and uploads, and GUAARDVARK_ALLOWED_PATHS. Off: they can read anywhere this account can."
+          />
+        </Line>
+      </Cluster>
+      <Cluster label="MCP servers" note="local programs that give the agent more tools">
+        <Line>
+          <StatusPill
+            tone={mcpStatus?.servers_connected > 0 ? "ok" : "neutral"}
+            label={
+              mcpStatus
+                ? `${mcpStatus.servers_connected}/${mcpStatus.servers_configured} connected`
+                : "checking"
+            }
+          />
+          <ActionButton onClick={() => navigate("/agents/mcp")}>
+            Manage MCP servers
+          </ActionButton>
+        </Line>
+      </Cluster>
+      <Cluster label="Display" note="the virtual screen agents act on">
+        <AgentDisplaySection showMessage={showMessage} />
+      </Cluster>
+    </SettingsPanel>
+  );
+
+  const syncPanel = (
+    <SettingsPanel
+      id="settings-sync"
+      title="Sync"
+      description="Other Guaardvark machines on your network."
+    >
+      <Line>
+        <SettingChip
+          label="Interconnector"
+          on={interconnectorEnabled}
+          onToggle={handleInterconnectorToggle}
+          onSettings={() => setInterconnectorModalOpen(true)}
+          tooltip="Sync rules, memories and code with the other machines you have connected."
+        />
+        {interconnectorEnabled && interconnectorPendingCount > 0 && (
+          <StatusPill
+            tone="warn"
+            label={`${interconnectorPendingCount} pending`}
+            tooltip="Changes waiting for review"
+          />
+        )}
+        {interconnectorEnabled &&
+          interconnectorIsClient &&
+          interconnectorUpdateStatus?.summary?.total > 0 && (
+            <>
+              <StatusPill
+                tone="warn"
+                label={`${interconnectorUpdateStatus.summary.total} code updates`}
+                tooltip={`${interconnectorUpdateStatus.summary.backend || 0} backend · ${interconnectorUpdateStatus.summary.frontend || 0} frontend · ${interconnectorUpdateStatus.summary.other || 0} other`}
+              />
+              <ActionButton
+                onClick={handleApplyInterconnectorUpdates}
+                loading={interconnectorApplying}
+                tooltip="Pulls every pending file from the master. Existing files are backed up first; a frontend change needs a rebuild."
+              >
+                Apply updates
+              </ActionButton>
+            </>
+          )}
+      </Line>
+    </SettingsPanel>
+  );
+
+  const dataPanel = (
+    <SettingsPanel
+      id="settings-data"
+      title="Data"
+      description="Backups, exports and imports."
+    >
+      <Cluster label="Backups">
+        <Line>
+          <ActionButton
+            onClick={openCreateBackup}
+            disabled={isProcessingBackup || isLoading}
+          >
+            Create
+          </ActionButton>
+          <ActionButton
+            onClick={openRestoreBackup}
+            disabled={isProcessingBackup || isLoading}
+            tooltip="Overwrites live data with a backup. Confirmed inside."
+          >
+            Restore
+          </ActionButton>
+          <ActionButton
+            onClick={openManageBackups}
+            disabled={isProcessingBackup || isLoading}
+          >
+            Manage
+          </ActionButton>
+          <Sep />
+          <ExportChatsButton showMessage={showMessage} disabled={isLoading} />
+        </Line>
+      </Cluster>
+      <Cluster label="Rules">
+        <Line>
+          <ActionButton
+            onClick={handleExportRulesClick}
+            loading={isExporting}
+            disabled={isLoading}
+          >
+            Export rules
+          </ActionButton>
+          <input
+            type="file"
+            accept=".json"
+            onChange={handleFileSelectForImport}
+            style={{ display: "none" }}
+            id="import-rules-input"
+          />
+          <label htmlFor="import-rules-input">
+            <ActionButton component="span" disabled={isImporting}>
+              Choose file
+            </ActionButton>
+          </label>
+          {selectedFileNameForImport && (
+            <Hint>{selectedFileNameForImport}</Hint>
+          )}
+          <ActionButton
+            kind={selectedFileForImport ? "primary" : "neutral"}
+            onClick={handleImportRulesClick}
+            loading={isImporting}
+            disabled={!selectedFileForImport || isLoading}
+            tooltip="Creates new rules and updates existing ones with the same name"
+          >
+            Import
+          </ActionButton>
+        </Line>
+      </Cluster>
+    </SettingsPanel>
+  );
+
+  const dangerPanel = (
+    <SettingsPanel
+      id="settings-danger"
+      title="Danger zone"
+      description="Each asks first and says what it removes."
+      danger
+    >
+      <Line>
+        <ActionButton
+          kind="destructive"
+          onClick={openClearChatDialog}
+          disabled={isLoading}
+        >
+          Clear chat history
+        </ActionButton>
+        <ActionButton
+          kind="destructive"
+          onClick={handleDeleteGenerationHistoryClick}
+          disabled={isLoading}
+        >
+          Delete generation history
+        </ActionButton>
+        <ActionButton
+          kind="destructive"
+          onClick={() => setClearMemoriesOpen(true)}
+          disabled={isLoading || !memoryCount}
+        >
+          Clear agent memory
+        </ActionButton>
+        <ActionButton
+          kind="destructive"
+          onClick={() => setRebuildDialogOpen(true)}
+          disabled={isLoading}
+        >
+          Rebuild index
+        </ActionButton>
+        <ActionButton
+          kind="destructive"
+          onClick={() => setLearningClear("rules")}
+          disabled={isLoading}
+          tooltip="Deletes every rule the chat learned on its own; rules you wrote stay"
+        >
+          Clear learned rules
+        </ActionButton>
+        <ActionButton
+          kind="destructive"
+          onClick={() => setLearningClear("log")}
+          disabled={isLoading}
+          tooltip="Empties the behaviour log that Behaviour learning reads from"
+        >
+          Clear behaviour log
+        </ActionButton>
+        <Sep />
+        <ActionButton
+          kind="destructive"
+          onClick={handleRebootClick}
+          disabled={isLoading || rebootInProgress}
+        >
+          Reboot
+        </ActionButton>
+        <ActionButton
+          kind="destructive"
+          onClick={() => setKillSwitchOpen(true)}
+          disabled={isLoading}
+        >
+          Kill switch
+        </ActionButton>
+      </Line>
+    </SettingsPanel>
+  );
+
+  const developerPanel = (
+    <SettingsPanel
+      id="settings-developer"
+      title="Developer"
+      description="Logging and diagnostics."
+    >
+      <Line>
+        <SettingChip
+          label="Verbose logging"
+          on={advancedDebug}
+          onToggle={(next) => handleAdvancedDebugToggle(next)}
+          tooltip="Adds a debug log sink live; no restart."
+        />
+        <SettingChip
+          label="LLM debug"
+          on={llmDebug}
+          onToggle={(next) => handleLlmDebugToggle(next)}
+          tooltip="Logs every prompt and completion."
+        />
+        <Sep />
+        <ActionButton
+          onClick={handleClearPycacheFoldersClick}
+          disabled={isLoading}
+          tooltip="Deletes Python bytecode caches. No data is touched."
+        >
+          Clear cache
+        </ActionButton>
+        <ActionButton
+          kind="link"
+          startIcon={<OpenInNewIcon sx={{ fontSize: 14 }} />}
+          onClick={() => navigate("/dev-tools")}
+        >
+          Diagnostics and tests
+        </ActionButton>
+      </Line>
+    </SettingsPanel>
+  );
+
+  const aboutPanel = (
+    <SettingsPanel
+      id="settings-about"
+      title="About"
+      description={appVersion ? `Guaardvark v${appVersion}` : "Guaardvark"}
+    >
+      <Cluster
+        label="Support the project"
+        note="built with love by a solo developer"
+      >
+        <Line>
+          <ActionButton
+            startIcon={<StarIcon sx={{ fontSize: 14 }} />}
+            onClick={() =>
+              window.open(
+                SUPPORT_LINKS.githubRepo,
+                "_blank",
+                "noopener,noreferrer",
+              )
+            }
+          >
+            GitHub
+          </ActionButton>
+          <ActionButton
+            onClick={() =>
+              window.open(
+                SUPPORT_LINKS.githubSponsors,
+                "_blank",
+                "noopener,noreferrer",
+              )
+            }
+          >
+            Sponsors
+          </ActionButton>
+          <ActionButton
+            startIcon={<CoffeeIcon sx={{ fontSize: 14 }} />}
+            onClick={() =>
+              window.open(
+                SUPPORT_LINKS.buyMeACoffee,
+                "_blank",
+                "noopener,noreferrer",
+              )
+            }
+          >
+            Buy me a coffee
+          </ActionButton>
+          <ActionButton
+            onClick={() =>
+              window.open(SUPPORT_LINKS.koFi, "_blank", "noopener,noreferrer")
+            }
+          >
+            Ko-fi
+          </ActionButton>
+          <ActionButton
+            onClick={() =>
+              window.open(SUPPORT_LINKS.paypal, "_blank", "noopener,noreferrer")
+            }
+          >
+            PayPal
+          </ActionButton>
+          <ActionButton
+            onClick={() =>
+              window.open(SUPPORT_LINKS.venmo, "_blank", "noopener,noreferrer")
+            }
+          >
+            Venmo
+          </ActionButton>
+          <ActionButton
+            onClick={() =>
+              window.open(
+                SUPPORT_LINKS.cashApp,
+                "_blank",
+                "noopener,noreferrer",
+              )
+            }
+          >
+            Cash App
+          </ActionButton>
+        </Line>
+      </Cluster>
+    </SettingsPanel>
+  );
+
+  const columnSets =
+    columns === 3
+      ? [
+          [generalPanel, chatPanel, dataPanel, aboutPanel],
+          [modelsPanel, knowledgePanel, dangerPanel],
+          [generationPanel, agentsPanel, syncPanel, developerPanel],
+        ]
+      : columns === 2
+        ? [
+            [
+              generalPanel,
+              chatPanel,
+              generationPanel,
+              agentsPanel,
+              developerPanel,
+            ],
+            [
+              modelsPanel,
+              knowledgePanel,
+              syncPanel,
+              dataPanel,
+              dangerPanel,
+              aboutPanel,
+            ],
+          ]
+        : [
+            [
+              generalPanel,
+              modelsPanel,
+              chatPanel,
+              generationPanel,
+              knowledgePanel,
+              agentsPanel,
+              syncPanel,
+              dataPanel,
+              dangerPanel,
+              developerPanel,
+              aboutPanel,
+            ],
+          ];
+
+  const deleteHistoryFacts = deleteHistoryCounts
+    ? [
+        {
+          label: "Images",
+          value: `${deleteHistoryCounts.images?.batches || 0} batches · ${deleteHistoryCounts.images?.files || 0} files · ${formatByteSize(deleteHistoryCounts.images?.bytes)}`,
+        },
+        {
+          label: "Videos",
+          value: `${deleteHistoryCounts.videos?.batches || 0} batches · ${deleteHistoryCounts.videos?.files || 0} files · ${formatByteSize(deleteHistoryCounts.videos?.bytes)}`,
+        },
+        {
+          label: "Audio",
+          value: `${deleteHistoryCounts.audio?.files || 0} files · ${deleteHistoryCounts.audio?.jobs || 0} job records · ${formatByteSize(deleteHistoryCounts.audio?.bytes)}`,
+        },
+        {
+          label: "ComfyUI scratch",
+          value: `${deleteHistoryCounts.comfyui?.output?.files || 0} output · ${deleteHistoryCounts.comfyui?.input?.files || 0} input files · ${formatByteSize(deleteHistoryCounts.comfyui?.bytes)}`,
+        },
+        {
+          label: "Database",
+          value: `${deleteHistoryCounts.db?.documents || 0} documents · ${deleteHistoryCounts.db?.folders || 0} folders · ${deleteHistoryCounts.db?.job_history || 0} job history rows`,
+        },
+      ]
+    : [];
+  const deleteHistoryRunning =
+    deleteHistoryCounts?.images?.running?.length ||
+    deleteHistoryCounts?.videos?.running?.length ||
+    deleteHistoryCounts?.audio?.running?.length;
 
   return (
     <PageLayout
@@ -2484,1161 +3588,34 @@ const SettingsPage = () => {
       variant="standard"
       actions={
         appVersion ? (
-          <Typography variant="caption" color="text.disabled">v{appVersion}</Typography>
+          <Typography variant="caption" color="text.disabled">
+            v{appVersion}
+          </Typography>
         ) : null
       }
     >
-      <Box sx={{ overflow: "auto", p: { xs: 1.5, sm: 2.5 }, pb: 4 }}>
-        {interconnectorPendingCount > 0 && (
-          <MuiAlert
-            severity="warning"
-            icon={<WarningIcon fontSize="inherit" />}
-            sx={{ mb: 2, cursor: "pointer" }}
-            onClick={() => setInterconnectorModalOpen(true)}
-          >
-            Updates Available — {interconnectorPendingCount} Interconnector update{interconnectorPendingCount !== 1 ? "s" : ""} pending — click to review
-          </MuiAlert>
-        )}
-        {interconnectorUpdateStatus?.available && (
-          <Box
-            onClick={() => setInterconnectorModalOpen(true)}
-            sx={{
-              bgcolor: "#FFD700",
-              borderRadius: 1,
-              px: 2,
-              py: 1,
-              mb: 2,
-              display: "flex",
-              alignItems: "center",
-              gap: 1.5,
-              cursor: "pointer",
-              "&:hover": { bgcolor: "#E6C200" },
-            }}
-          >
-            <FileDownloadIcon sx={{ fontSize: 22, color: "#000" }} />
-            <Typography variant="body2" sx={{ color: "#000", fontWeight: 600 }}>
-              {interconnectorUpdateStatus.count} Code Update{interconnectorUpdateStatus.count !== 1 ? "s" : ""} Available
-            </Typography>
-            <Box display="flex" gap={0.5} ml={0.5}>
-              {interconnectorUpdateStatus.summary?.backend > 0 && (
-                <Chip
-                  label={`${interconnectorUpdateStatus.summary.backend} backend`}
-                  size="small"
-                  sx={{
-                    bgcolor: "rgba(0,0,0,0.15)",
-                    color: "#000",
-                    borderRadius: 1,
-                    height: 20,
-                    "& .MuiChip-label": { px: 0.75, fontSize: "0.7rem" },
-                  }}
-                />
-              )}
-              {interconnectorUpdateStatus.summary?.frontend > 0 && (
-                <Chip
-                  label={`${interconnectorUpdateStatus.summary.frontend} frontend`}
-                  size="small"
-                  sx={{
-                    bgcolor: "rgba(0,0,0,0.15)",
-                    color: "#000",
-                    borderRadius: 1,
-                    height: 20,
-                    "& .MuiChip-label": { px: 0.75, fontSize: "0.7rem" },
-                  }}
-                />
-              )}
-              {interconnectorUpdateStatus.summary?.other > 0 && (
-                <Chip
-                  label={`${interconnectorUpdateStatus.summary.other} other`}
-                  size="small"
-                  sx={{
-                    bgcolor: "rgba(0,0,0,0.15)",
-                    color: "#000",
-                    borderRadius: 1,
-                    height: 20,
-                    "& .MuiChip-label": { px: 0.75, fontSize: "0.7rem" },
-                  }}
-                />
-              )}
-            </Box>
-            <Typography variant="caption" sx={{ color: "rgba(0,0,0,0.6)", ml: "auto" }}>
-              Click to review
-            </Typography>
-            <Button
-              variant="contained"
-              size="small"
-              disabled={interconnectorApplying}
-              onClick={handleApplyInterconnectorUpdates}
+      <Box sx={{ display: "flex", flexDirection: "column", gap: 1.75, pb: 4 }}>
+        {strip}
+        <Box sx={{ display: "flex", gap: 1.75, alignItems: "flex-start" }}>
+          {columnSets.map((set, i) => (
+            <Box
+              key={i}
               sx={{
-                ml: 1,
-                bgcolor: "#000",
-                color: "#FFD700",
-                fontWeight: 700,
-                letterSpacing: 0.5,
-                minWidth: 88,
-                "&:hover": { bgcolor: "#222" },
+                flex: 1,
+                minWidth: 0,
+                display: "flex",
+                flexDirection: "column",
+                gap: 1.75,
               }}
             >
-              {interconnectorApplying ? "UPDATING..." : "UPDATE"}
-            </Button>
-          </Box>
-        )}
-        <Box sx={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: "20px", "& > *": { flex: "0 1 798px", minWidth: 560 } }}>
-          <SettingsCardWrapper title="System">
-              <SettingsRow label="Profile">
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={(e) => {
-                    const file = e.target.files[0];
-                    if (file) {
-                      setBrandingFile(file);
-                      (async () => {
-                        try {
-                          const fd = new FormData();
-                          fd.append("logo", file);
-                          if (brandingName.trim()) fd.append("system_name", brandingName.trim());
-                          await updateBranding(fd);
-                          setBrandingFile(null);
-                          e.target.value = "";
-                          const refreshed = await fetchBranding();
-                          const latestLogo = refreshed?.logo_path ?? systemLogo ?? persistedSystemLogo ?? null;
-                          setSystemInfo(brandingName || persistedSystemName || "", latestLogo);
-                          showMessage("Profile image updated", "success");
-                        } catch (err) {
-                          showMessage("Failed to update image: " + err.message, "error");
-                        }
-                      })();
-                    }
-                  }}
-                  style={{ display: "none" }}
-                  id="logo-upload"
-                />
-                <Box sx={{ display: "flex", alignItems: "center", gap: 3 }}>
-                  <Box sx={{ display: "flex", flexDirection: "column", gap: 1.5, justifyContent: "center" }}>
-                    <TextField
-                      label="Nickname"
-                      value={brandingName}
-                      onChange={(e) => setBrandingName(e.target.value)}
-                      size="small"
-                      sx={{ width: 200 }}
-                      onBlur={async () => {
-                        const trimmedName = brandingName.trim();
-                        if (!trimmedName) return;
-                        try {
-                          const fd = new FormData();
-                          fd.append("system_name", trimmedName);
-                          await updateBranding(fd);
-                          const refreshed = await fetchBranding();
-                          const latestName = refreshed?.system_name ?? trimmedName ?? persistedSystemName ?? "";
-                          setSystemInfo(latestName, systemLogo || persistedSystemLogo || null);
-                        } catch (err) {
-                          showMessage("Failed to update nickname: " + err.message, "error");
-                        }
-                      }}
-                      onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }}
-                    />
-                    <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                      <Chip
-                        label="Change Theme"
-                        onClick={() => setThemeModalOpen(true)}
-                        size="small"
-                        variant="outlined"
-                      />
-                      <Typography variant="body2" color="text.secondary">{themeName}</Typography>
-                    </Box>
-                  </Box>
-                  <label htmlFor="logo-upload" style={{ cursor: "pointer" }}>
-                    <Avatar
-                      src={
-                        brandingFile
-                          ? URL.createObjectURL(brandingFile)
-                          : systemLogo
-                            ? `/api/uploads/${systemLogo}`
-                            : persistedSystemLogo
-                              ? `/api/uploads/${persistedSystemLogo}`
-                              : `/api/uploads/system/profile-default.png`
-                      }
-                      variant="rounded"
-                      sx={{ width: 192, height: 192, border: 1, borderColor: "divider", cursor: "pointer", "&:hover": { opacity: 0.8 } }}
-                    >
-                      <AccountBoxIcon sx={{ fontSize: 64 }} />
-                    </Avatar>
-                  </label>
-                </Box>
-              </SettingsRow>
-              <SettingsRow label="Media Library Path">
-                <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                  <TextField
-                    value={musicDirectory}
-                    onChange={(e) => setMusicDirectory(e.target.value)}
-                    size="small"
-                    placeholder="~/Music"
-                    sx={{ width: 240 }}
-                  />
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    onClick={async () => {
-                      try {
-                        const result = await setMusicDirectoryAPI(musicDirectory.trim());
-                        if (result?.error) throw new Error(result.error);
-                        showMessage("Saved", "success");
-                      } catch (err) {
-                        showMessage(`Failed: ${err.message}`, "error");
-                      }
-                    }}
-                  >
-                    Save
-                  </Button>
-                </Box>
-              </SettingsRow>
-              <Button
-                variant="outlined"
-                size="small"
-                onClick={() => navigate("/dev-tools")}
-                sx={{ mt: 1 }}
-              >
-                System Dashboard
-              </Button>
-          </SettingsCardWrapper>
-
-          <SettingsCardWrapper title="Models">
-              {/* GPU Resources Bar */}
-              {gpuResources?.gpu?.total_mb > 0 && (
-                <SettingsRow label="GPU Resources">
-                  <Box sx={{ width: "100%", maxWidth: 320 }}>
-                    <Box sx={{ display: "flex", justifyContent: "space-between", mb: 0.5 }}>
-                      <Typography variant="caption" color="text.secondary">
-                        VRAM: {gpuResources.gpu.used_mb.toLocaleString()} / {gpuResources.gpu.total_mb.toLocaleString()} MB
-                      </Typography>
-                      <Typography variant="caption" color="text.secondary">
-                        {gpuResources.gpu.free_mb.toLocaleString()} MB free
-                      </Typography>
-                    </Box>
-                    <LinearProgress
-                      variant="determinate"
-                      value={Math.min(gpuResources.gpu.utilization_pct, 100)}
-                      sx={{
-                        height: 8,
-                        borderRadius: 1,
-                        backgroundColor: "action.hover",
-                        "& .MuiLinearProgress-bar": {
-                          backgroundColor: gpuResources.gpu.utilization_pct > 90 ? "error.main" : gpuResources.gpu.utilization_pct > 70 ? "warning.main" : "success.main",
-                        },
-                      }}
-                    />
-                    {gpuResources.loaded_models?.length > 0 && (
-                      <Box sx={{ mt: 0.5, display: "flex", gap: 0.5, flexWrap: "wrap" }}>
-                        {gpuResources.loaded_models.map((m) => (
-                          <Chip key={m.name} label={`${m.name} (${m.vram_mb}MB)`} size="small" variant="outlined" sx={{ fontSize: "0.7rem" }} />
-                        ))}
-                      </Box>
-                    )}
-                  </Box>
-                </SettingsRow>
-              )}
-              <SettingsRow label="Chat Model">
-                <Box sx={{ display: "flex", flexDirection: "column", gap: 1, width: "100%", maxWidth: 420 }}>
-                  {/* Size filter chips */}
-                  {(() => {
-                    const getSize = (m) => {
-                      const ps = m.details?.parameter_size || "";
-                      const num = parseFloat(ps);
-                      if (isNaN(num)) return null;
-                      if (num <= 3) return "small";
-                      if (num <= 10) return "medium";
-                      return "large";
-                    };
-                    const sizes = [...new Set(availableModels.map(getSize).filter(Boolean))];
-                    const sizeOrder = ["small", "medium", "large"];
-                    const sizeLabels = { small: "≤3B", medium: "3-10B", large: ">10B" };
-                    return sizes.length > 1 ? (
-                      <Box sx={{ display: "flex", gap: 0.5, flexWrap: "wrap", mb: 0.5 }}>
-                        <Chip label="All" size="small" variant={chatSizeFilter === null ? "filled" : "outlined"}
-                          color={chatSizeFilter === null ? "primary" : "default"}
-                          onClick={() => setChatSizeFilter(null)} sx={{ height: 24, fontSize: "0.75rem" }} />
-                        {sizeOrder.filter((s) => sizes.includes(s)).map((s) => {
-                          const count = availableModels.filter((m) => getSize(m) === s).length;
-                          return (
-                            <Chip key={s} label={`${sizeLabels[s]} (${count})`} size="small"
-                              variant={chatSizeFilter === s ? "filled" : "outlined"}
-                              color={chatSizeFilter === s ? "primary" : "default"}
-                              onClick={() => setChatSizeFilter(chatSizeFilter === s ? null : s)}
-                              sx={{ height: 24, fontSize: "0.75rem" }} />
-                          );
-                        })}
-                      </Box>
-                    ) : null;
-                  })()}
-                  <FormControl fullWidth size="small" disabled={isLoading || isLoadingModel}>
-                    <InputLabel>Select Model</InputLabel>
-                    <Select
-                      value={selectedModel}
-                      label="Select Model"
-                      onChange={(e) => setSelectedModel(e.target.value)}
-                      error={Boolean(selectedModel && !availableModels.some((m) => m.name === selectedModel))}
-                    >
-                      <MenuItem value="" disabled>
-                        <em>{isLoadingModel ? "Loading..." : availableModels.length === 0 ? "No models" : "Select..."}</em>
-                      </MenuItem>
-                      {availableModels
-                        .filter((m) => {
-                          if (chatSizeFilter === null) return true;
-                          const ps = m.details?.parameter_size || "";
-                          const num = parseFloat(ps);
-                          if (isNaN(num)) return chatSizeFilter === null;
-                          if (chatSizeFilter === "small") return num <= 3;
-                          if (chatSizeFilter === "medium") return num > 3 && num <= 10;
-                          return num > 10;
-                        })
-                        .map((m) => {
-                          const ps = m.details?.parameter_size;
-                          const sizeMb = m.size ? Math.round(m.size / (1024 * 1024)) : null;
-                          return (
-                            <MenuItem key={m.name} value={m.name}>
-                              {m.name}{ps ? ` (${ps}` : ""}{sizeMb ? `${ps ? ", " : " ("}${sizeMb >= 1024 ? (sizeMb / 1024).toFixed(1) + "GB" : sizeMb + "MB"}` : ""}{(ps || sizeMb) ? ")" : ""}
-                            </MenuItem>
-                          );
-                        })}
-                    </Select>
-                  </FormControl>
-                  <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
-                    <Tooltip title={modelSwitchStatus === "loading" ? "Model switch in progress..." : isLoadingModel ? "Model is loading..." : isLoading ? "Loading..." : !selectedModel ? "Select a model first" : selectedModel === activeModel ? "This model is already active" : ""}>
-                      <span>
-                        <Button
-                          variant="contained"
-                          size="small"
-                          onClick={handleSetModelClick}
-                          disabled={isLoading || isLoadingModel || modelSwitchStatus === "loading" || !selectedModel || selectedModel === activeModel}
-                        >
-                          {modelSwitchStatus === "loading" ? <><CircularProgress size={16} sx={{ mr: 0.5 }} /> Switching...</> : "Set Active"}
-                        </Button>
-                      </span>
-                    </Tooltip>
-                    <Tooltip title={isLoadingModel ? "Model is loading..." : isLoading ? "Loading..." : ""}>
-                      <span>
-                        <Button variant="outlined" size="small" onClick={fetchAvailableModels} disabled={isLoadingModel || isLoading}>Refresh</Button>
-                      </span>
-                    </Tooltip>
-                    <Tooltip title={isTestingLLM ? "Test in progress..." : isLoadingModel ? "Model is loading..." : isLoading ? "Loading..." : ""}>
-                      <span>
-                        <Button
-                          variant="outlined"
-                          size="small"
-                          onClick={async () => {
-                            setIsTestingLLM(true);
-                            try {
-                              const r = await apiService.testLLM();
-                              showMessage(`LLM responded in ${r.duration_sec}s`, "info");
-                            } catch (e) {
-                              showMessage(`Test failed: ${e.message}`, "error");
-                            } finally {
-                              setIsTestingLLM(false);
-                            }
-                          }}
-                          disabled={isLoadingModel || isLoading || isTestingLLM}
-                          sx={{ minWidth: 80 }}
-                        >
-                          {isTestingLLM ? "Testing..." : "Test"}
-                        </Button>
-                      </span>
-                    </Tooltip>
-                  </Box>
-                  {modelSwitchStatus === "loading" && (
-                    <Box>
-                      <LinearProgress />
-                      <Typography variant="caption" color="text.secondary">{modelSwitchMessage}</Typography>
-                    </Box>
-                  )}
-                </Box>
-              </SettingsRow>
-              {/* Embedding Model Switcher */}
-              <SettingsRow label="Embedding Model">
-                <Box sx={{ display: "flex", flexDirection: "column", gap: 1, width: "100%", maxWidth: 420 }}>
-                  {/* Dimension filter chips */}
-                  {(() => {
-                    const dims = [...new Set(embeddingModels.map((m) => m.dimensions).filter(Boolean))].sort((a, b) => a - b);
-                    return dims.length > 1 ? (
-                      <Box sx={{ display: "flex", gap: 0.5, flexWrap: "wrap", mb: 0.5 }}>
-                        <Chip label="All" size="small" variant={embedDimFilter === null ? "filled" : "outlined"}
-                          color={embedDimFilter === null ? "primary" : "default"}
-                          onClick={() => setEmbedDimFilter(null)} sx={{ height: 24, fontSize: "0.75rem" }} />
-                        {dims.map((d) => {
-                          const count = embeddingModels.filter((m) => m.dimensions === d).length;
-                          return (
-                            <Chip key={d} label={`${d}d (${count})`} size="small"
-                              variant={embedDimFilter === d ? "filled" : "outlined"}
-                              color={embedDimFilter === d ? "primary" : "default"}
-                              onClick={() => setEmbedDimFilter(embedDimFilter === d ? null : d)}
-                              sx={{ height: 24, fontSize: "0.75rem" }} />
-                          );
-                        })}
-                      </Box>
-                    ) : null;
-                  })()}
-                  <FormControl fullWidth size="small" disabled={isSwitchingEmbedding}>
-                    <InputLabel>Embedding Model</InputLabel>
-                    <Select
-                      value={selectedEmbeddingModel}
-                      label="Embedding Model"
-                      onChange={(e) => setSelectedEmbeddingModel(e.target.value)}
-                    >
-                      {embeddingModels.length === 0 ? (
-                        <MenuItem value="" disabled><em>No embedding models found</em></MenuItem>
-                      ) : (
-                        embeddingModels
-                          .filter((m) => embedDimFilter === null || m.dimensions === embedDimFilter)
-                          .map((m) => (
-                          <MenuItem key={m.name} value={m.name}>
-                            {m.name} ({m.size_mb}MB{m.dimensions ? `, ${m.dimensions}d` : ""})
-                          </MenuItem>
-                        ))
-                      )}
-                    </Select>
-                  </FormControl>
-                  <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-                    <Tooltip title={isSwitchingEmbedding ? "Embedding model switch in progress..." : !selectedEmbeddingModel ? "Select an embedding model first" : selectedEmbeddingModel === embeddingModel ? "This embedding model is already active" : ""}>
-                      <span>
-                        <Button
-                          variant="contained"
-                          size="small"
-                          disabled={isSwitchingEmbedding || !selectedEmbeddingModel || selectedEmbeddingModel === embeddingModel}
-                          onClick={async () => {
-                            if (!window.confirm(
-                              "Switching embedding models?\n\n" +
-                              "If the new model produces the same dimension vectors, your existing index will be preserved.\n\n" +
-                              "If the dimensions differ, the index will be cleared and you'll need to re-index.\n\nContinue?"
-                            )) return;
-                            setIsSwitchingEmbedding(true);
-                            try {
-                              const r = await fetch("/api/model/embedding/set", {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ model: selectedEmbeddingModel }),
-                              });
-                              const d = await r.json();
-                              if (d.success) {
-                                setEmbeddingModel(selectedEmbeddingModel);
-                                showMessage(`Embedding switched to ${selectedEmbeddingModel} (${d.data.dimensions}d).${d.data.index_cleared ? " Index cleared — please re-index your documents." : " Index preserved — same dimensions."}`, "success");
-                                fetchResources();
-                              } else {
-                                showMessage(d.error || "Failed to switch embedding", "error");
-                              }
-                            } catch (e) {
-                              showMessage(`Failed: ${e.message}`, "error");
-                            } finally {
-                              setIsSwitchingEmbedding(false);
-                            }
-                          }}
-                        >
-                          {isSwitchingEmbedding ? <><CircularProgress size={16} sx={{ mr: 0.5 }} /> Switching...</> : "Set Active"}
-                        </Button>
-                      </span>
-                    </Tooltip>
-                    <Button variant="outlined" size="small" onClick={fetchEmbeddingModels}>Refresh</Button>
-                    {embeddingModel && embeddingModel !== "Not Available" && embeddingModel !== "Not Set" && (
-                      <Chip label={`Active: ${embeddingModel}`} size="small" color="secondary" variant="outlined" />
-                    )}
-                  </Box>
-                </Box>
-              </SettingsRow>
-          </SettingsCardWrapper>
-
-          <SettingsCardWrapper title="RAG Autoresearch">
-                <Typography variant="caption" color="text.secondary" sx={{ mb: 2, display: "block" }}>
-                  Autonomous RAG optimization — experiments run while the system is idle
-                </Typography>
-
-                <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", mb: 2 }}>
-                  <Typography variant="body2">Auto-optimize when idle</Typography>
-                  <Switch
-                    size="small"
-                    checked={autoresearchSettings.rag_autoresearch_auto_enabled === "true"}
-                    onChange={(e) => handleAutoresearchSettingChange("rag_autoresearch_auto_enabled", e.target.checked)}
-                  />
-                </Box>
-
-                <Box sx={{ mb: 2 }}>
-                  <Typography variant="body2" gutterBottom>
-                    Idle threshold: {autoresearchSettings.rag_autoresearch_idle_minutes || 10} minutes
-                  </Typography>
-                  <Slider
-                    value={parseInt(autoresearchSettings.rag_autoresearch_idle_minutes || "10")}
-                    min={5}
-                    max={120}
-                    step={5}
-                    marks={[{ value: 5, label: "5m" }, { value: 60, label: "60m" }, { value: 120, label: "120m" }]}
-                    onChange={(e, val) => handleAutoresearchSettingChange("rag_autoresearch_idle_minutes", val)}
-                    sx={{ width: "100%" }}
-                  />
-                </Box>
-
-                <Box sx={{ mb: 2 }}>
-                  <Typography variant="body2">Phase 1 — query-time parameters</Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    Chunking and embedding phases return in a later release
-                  </Typography>
-                </Box>
-
-                <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", mb: 2 }}>
-                  <Typography variant="body2">Proposer model</Typography>
-                  <TextField
-                    size="small"
-                    placeholder="(active model)"
-                    value={autoresearchSettings.autoresearch_proposer_model || ""}
-                    onChange={(e) => setAutoresearchSettings({ ...autoresearchSettings, autoresearch_proposer_model: e.target.value })}
-                    onBlur={(e) => handleAutoresearchSettingChange("autoresearch_proposer_model", e.target.value)}
-                    sx={{ minWidth: 220 }}
-                  />
-                </Box>
-
-                <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", mb: 2 }}>
-                  <Typography variant="body2">Judge model</Typography>
-                  <TextField
-                    size="small"
-                    placeholder="(active model)"
-                    value={autoresearchSettings.autoresearch_judge_model || ""}
-                    onChange={(e) => setAutoresearchSettings({ ...autoresearchSettings, autoresearch_judge_model: e.target.value })}
-                    onBlur={(e) => handleAutoresearchSettingChange("autoresearch_judge_model", e.target.value)}
-                    sx={{ minWidth: 220 }}
-                  />
-                </Box>
-
-                <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", mb: 2 }}>
-                  <Typography variant="body2">Nightly window</Typography>
-                  <TextField
-                    size="small"
-                    placeholder="01:00-06:00"
-                    value={autoresearchSettings.autoresearch_nightly_window || ""}
-                    onChange={(e) => setAutoresearchSettings({ ...autoresearchSettings, autoresearch_nightly_window: e.target.value })}
-                    onBlur={(e) => handleAutoresearchSettingChange("autoresearch_nightly_window", e.target.value)}
-                    sx={{ minWidth: 220 }}
-                  />
-                </Box>
-
-                <Box sx={{ display: "flex", gap: 1 }}>
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    onClick={async () => {
-                      try {
-                        await ragAutoresearchService.resetConfig();
-                        const data = await ragAutoresearchService.getSettings();
-                        setAutoresearchSettings(data);
-                        showMessage("Autoresearch config reset to defaults", "success");
-                      } catch (e) {
-                        showMessage("Failed to reset autoresearch config", "error");
-                      }
-                    }}
-                  >
-                    Reset to Defaults
-                  </Button>
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    startIcon={<OpenInNewIcon sx={{ fontSize: 14 }} />}
-                    onClick={() => navigate("/autoresearch")}
-                  >
-                    Open Autoresearch page
-                  </Button>
-                </Box>
-          </SettingsCardWrapper>
-
-          <SettingsCardWrapper title="A.I. Features">
-              <SettingsRow label="Voice Chat">
-                <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                  <Chip
-                    label={voiceChatEnabled ? "On" : "Off"}
-                    onClick={() => {
-                      setVoiceChatEnabled(!voiceChatEnabled);
-                      showMessage(`Voice chat ${!voiceChatEnabled ? "enabled" : "disabled"}`, "info");
-                    }}
-                    size="small"
-                    color={voiceChatEnabled ? "primary" : "default"}
-                    variant={voiceChatEnabled ? "filled" : "outlined"}
-                  />
-                  <Typography
-                    component="button"
-                    variant="body2"
-                    onClick={() => setVoiceSettingsModalOpen(true)}
-                    sx={{ background: "none", border: "none", cursor: "pointer", color: "primary.main", textDecoration: "underline" }}
-                  >
-                    Settings
-                  </Typography>
-                </Box>
-              </SettingsRow>
-              <SettingsRow label="Image Generation">
-                <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                  {imageGenStatus === null ? (
-                    <CircularProgress size={16} />
-                  ) : (
-                    <Chip
-                      label={imageGenStatus.service_available ? "Available" : "Unavailable"}
-                      color={imageGenStatus.service_available ? "success" : "default"}
-                      size="small"
-                      variant="outlined"
-                    />
-                  )}
-                  <Button variant="outlined" size="small" onClick={() => setImageModelsModalOpen(true)}>
-                    Image Models
-                  </Button>
-                  <Button variant="outlined" size="small" onClick={() => setInfographicModelsModalOpen(true)}>
-                    Infographic Models
-                  </Button>
-                  <Button variant="outlined" size="small" onClick={() => setVideoModelsModalOpen(true)}>
-                    Video Models
-                  </Button>
-                  <Button variant="outlined" size="small" onClick={() => setVoiceModelsModalOpen(true)}>
-                    Voice Models
-                  </Button>
-                </Box>
-              </SettingsRow>
-              {/* Agent Routing and Unified Agentic Chat toggles removed — always enabled */}
-              <SettingsRow label="Agents">
-                <Button variant="outlined" size="small" onClick={() => setAgentsModalOpen(true)}>
-                  Open
-                </Button>
-              </SettingsRow>
-              <SettingsRow label="Rules">
-                <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                  <Chip
-                    label={rulesEnabled ? "On" : "Off"}
-                    onClick={async () => {
-                      const next = !rulesEnabled;
-                      // Optimistic UI + localStorage mirror; roll back on failure.
-                      setRulesEnabledState(next);
-                      try {
-                        localStorage.setItem(RULES_ENABLED_KEY, String(next));
-                      } catch {
-                        // non-fatal
-                      }
-                      try {
-                        const result = await apiService.setRulesEnabled(next);
-                        if (result?.error) throw new Error(result.error);
-                        showMessage(
-                          next
-                            ? "Rules enabled — RulesPage active rules will apply"
-                            : "Rules disabled — chat will use the hardcoded prompt",
-                          "info",
-                        );
-                      } catch (err) {
-                        console.error("Failed to update rules_enabled:", err);
-                        setRulesEnabledState(!next);
-                        try {
-                          localStorage.setItem(RULES_ENABLED_KEY, String(!next));
-                        } catch {
-                          // non-fatal
-                        }
-                        showMessage("Failed to update Rules setting", "error");
-                      }
-                    }}
-                    size="small"
-                    color={rulesEnabled ? "primary" : "default"}
-                    variant={rulesEnabled ? "filled" : "outlined"}
-                  />
-                  <Typography
-                    component="button"
-                    variant="body2"
-                    onClick={() => navigate("/rules")}
-                    sx={{ background: "none", border: "none", cursor: "pointer", color: "primary.main", textDecoration: "underline" }}
-                  >
-                    Manage
-                  </Typography>
-                </Box>
-              </SettingsRow>
-              <SettingsRow label="Chat thinking">
-                <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                  <Chip
-                    label={chatThinkingDefault ? "On" : "Off"}
-                    onClick={async () => {
-                      const next = !chatThinkingDefault;
-                      setChatThinkingDefaultState(next);  // optimistic
-                      try {
-                        const result = await apiService.setChatThinkingDefault(next);
-                        if (result?.error) throw new Error(result.error);
-                        showMessage(
-                          next
-                            ? "Thinking on by default — thinking models reason step-by-step (slower). Use /thinking off per chat."
-                            : "Thinking off by default — faster replies. Use /thinking on per chat.",
-                          "info",
-                        );
-                      } catch (err) {
-                        console.error("Failed to update chat_thinking_default:", err);
-                        setChatThinkingDefaultState(!next);  // roll back
-                        showMessage("Failed to update Chat thinking setting", "error");
-                      }
-                    }}
-                    size="small"
-                    color={chatThinkingDefault ? "primary" : "default"}
-                    variant={chatThinkingDefault ? "filled" : "outlined"}
-                  />
-                  <Typography variant="caption" color="text.secondary">
-                    Default for thinking models (gemma4:12b, qwen3). Per-chat: <code>/thinking on|off</code>
-                  </Typography>
-                </Box>
-              </SettingsRow>
-          </SettingsCardWrapper>
-
-          <SettingsCardWrapper title="RAG Performance">
-              <RAGDebugSection ragDebugEnabled={ragDebug} />
-          </SettingsCardWrapper>
-
-          <SettingsCardWrapper title="Uncle Claude">
-              <UncleClaudeSection compact />
-
-          </SettingsCardWrapper>
-
-          <SettingsCardWrapper title="Agent Memory">
-              <MemoryManagementSection />
-          </SettingsCardWrapper>
-
-          <SettingsCardWrapper title="Agent Display">
-              <AgentDisplaySection showMessage={showMessage} />
-          </SettingsCardWrapper>
-
-          <SettingsCardWrapper title="Data">
-              <SettingsRow label="System Backup / Restore">
-                <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
-                  <Tooltip title={isProcessingBackup ? "Backup operation in progress..." : isLoading ? "Loading..." : ""}>
-                    <span>
-                      <Button variant="outlined" size="small" onClick={openCreateBackup} disabled={isProcessingBackup || isLoading}>Create</Button>
-                    </span>
-                  </Tooltip>
-                  <Tooltip title={isProcessingBackup ? "Backup operation in progress..." : isLoading ? "Loading..." : ""}>
-                    <span>
-                      <Button variant="contained" size="small" onClick={openRestoreBackup} disabled={isProcessingBackup || isLoading}>Restore</Button>
-                    </span>
-                  </Tooltip>
-                  <Button variant="outlined" size="small" onClick={openManageBackups}>Manage</Button>
-                </Box>
-              </SettingsRow>
-              <SettingsRow label="Rules Backup / Restore">
-                <Box sx={{ display: "flex", gap: 1, alignItems: "center", flexWrap: "wrap" }}>
-                  <Button variant="outlined" size="small" onClick={handleExportRulesClick} disabled={isExporting || isLoading}>
-                    {isExporting ? <CircularProgress size={16} /> : "Export"}
-                  </Button>
-                  <input accept=".json" style={{ display: "none" }} id="import-rules-file" type="file" ref={fileImportInputRef} onChange={handleFileSelectForImport} />
-                  <label htmlFor="import-rules-file">
-                    <Button variant="outlined" size="small" component="span" disabled={isImporting || isLoading}>Choose File</Button>
-                  </label>
-                  <Tooltip title={isImporting ? "Import in progress..." : !selectedFileForImport ? "Choose a file first" : isLoading ? "Loading..." : ""}>
-                    <span>
-                      <Button variant="contained" size="small" onClick={handleImportRulesClick} disabled={!selectedFileForImport || isImporting || isLoading}>
-                        {isImporting ? <CircularProgress size={16} color="inherit" /> : "Import"}
-                      </Button>
-                    </span>
-                  </Tooltip>
-                </Box>
-              </SettingsRow>
-              <SettingsRow label="Chat History">
-                <Button variant="outlined" size="small" color="error" onClick={handleClearChatHistoryClick} disabled={isLoading}>Clear All Chat History</Button>
-              </SettingsRow>
-              <SettingsRow label="Index">
-                <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap", alignItems: "center" }}>
-                  <Button variant="outlined" size="small" onClick={handleOpenPurgeModal} disabled={isLoading}>Purge</Button>
-                  <Button variant="outlined" size="small" color="error" onClick={() => handleActionClick(apiService.resetIndexStorage, [], "Reset index? All indexed knowledge will be lost.", "Resetting...", "Index reset.", "Failed")} disabled={isLoading}>Reset</Button>
-                  <Button variant="outlined" size="small" onClick={() => handleActionClick(apiService.optimizeIndex, [], null, "Optimizing...", "Index optimized.", "Failed")} disabled={isLoading}>Optimize</Button>
-                  {/* Pause indexing to relieve system/GPU load during heavy embedding batches */}
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    color={indexingPaused ? "success" : "warning"}
-                    onClick={async () => {
-                      try {
-                        if (indexingPaused) {
-                          await apiService.resumeIndexing();
-                          setIndexingPaused(false);
-                          showMessage("Indexing resumed", "success");
-                        } else {
-                          await apiService.pauseIndexing();
-                          setIndexingPaused(true);
-                          showMessage("Indexing paused (new work will be skipped)", "warning");
-                        }
-                      } catch (e) {
-                        showMessage("Failed to toggle indexing pause: " + (e.message || e), "error");
-                      }
-                    }}
-                    disabled={isLoading}
-                  >
-                    {indexingPaused ? "Resume Indexing" : "Pause Indexing"}
-                  </Button>
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    color="success"
-                    onClick={async () => {
-                      try {
-                        const res = await apiService.resumePendingIndexing();
-                        showMessage(res?.message || "Resume pending started", "success");
-                        setIndexingPaused(false); // in case
-                      } catch (e) {
-                        showMessage("Failed to resume pending: " + (e.message || e), "error");
-                      }
-                    }}
-                    disabled={isLoading}
-                  >
-                    Resume All Pending
-                  </Button>
-                  {indexingPaused && (
-                    <Chip size="small" color="warning" label="Paused" />
-                  )}
-                </Box>
-              </SettingsRow>
-          </SettingsCardWrapper>
-
-          <SettingsCardWrapper title="Network">
-              <SettingsRow label="Web Access">
-                <Chip
-                  label={webSearchEnabled ? "On" : "Off"}
-                  onClick={() => handleWebSearchToggle()}
-                  size="small"
-                  color={webSearchEnabled ? "primary" : "default"}
-                  variant={webSearchEnabled ? "filled" : "outlined"}
-                />
-              </SettingsRow>
-              <SettingsRow label="Interconnector">
-                <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                  <Switch
-                    size="small"
-                    checked={interconnectorEnabled}
-                    onChange={async (e) => {
-                      const newEnabled = e.target.checked;
-                      try {
-                        const currentConfig = await interconnectorApi.getInterconnectorConfig();
-                        const cfg = currentConfig?.data?.config || currentConfig?.config || {};
-                        await interconnectorApi.updateInterconnectorConfig({ ...cfg, is_enabled: newEnabled });
-                        setInterconnectorEnabled(newEnabled);
-                      } catch (err) {
-                        console.error("Failed to toggle Interconnector:", err);
-                      }
-                    }}
-                  />
-                  <Typography
-                    component="button"
-                    variant="body2"
-                    onClick={() => setInterconnectorModalOpen(true)}
-                    sx={{ background: "none", border: "none", cursor: "pointer", color: "primary.main", textDecoration: "underline" }}
-                  >
-                    Configure
-                  </Typography>
-                </Box>
-              </SettingsRow>
-          </SettingsCardWrapper>
-
-          <SettingsCardWrapper title="Maintenance" sx={{ overflow: "visible" }}>
-              <SettingsRow label="Clear Cache">
-                <Button variant="outlined" size="small" onClick={handleClearPycacheFoldersClick} disabled={isLoading}>Clear Cache</Button>
-              </SettingsRow>
-              <SettingsRow label="Diagnostics" stacked>
-                <Box sx={{ display: "flex", flexDirection: "column", gap: 1, width: "100%", minWidth: 0 }}>
-                  <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
-                    <Button variant={isTesting && testMode === "basic" ? "contained" : "outlined"} size="small" onClick={() => handleRunSystemCheck("basic")} disabled={isLoading || isTesting}>Basic</Button>
-                    <Button variant={isTesting && testMode === "quick" ? "contained" : "outlined"} size="small" onClick={() => handleRunSystemCheck("quick")} disabled={isLoading || isTesting}>Quick</Button>
-                    <Button variant={isTesting && testMode === "comprehensive" ? "contained" : "outlined"} size="small" onClick={() => handleRunSystemCheck("comprehensive")} disabled={isLoading || isTesting}>Full</Button>
-                  </Box>
-                  {testResults && (
-                    <Box
-                      sx={{
-                        mt: 1,
-                        p: 1.5,
-                        border: 1,
-                        borderColor: "divider",
-                        borderRadius: 1,
-                        width: "100%",
-                        minWidth: 0,
-                        bgcolor: (theme) => alpha(theme.palette.action.hover, theme.palette.mode === "dark" ? 0.25 : 0.5),
-                      }}
-                    >
-                      {testResults.error && typeof testResults.error === "string" ? (
-                        <MuiAlert severity="error">{testResults.error}</MuiAlert>
-                      ) : (
-                        <>
-                          {testResults.categories && renderCategorizedResults(testResults)}
-                          {(testResults.legacy_diagnostics || (!testResults.categories && testResults)) && (
-                            renderLegacyDiagnosticsCards(testResults.legacy_diagnostics || testResults)
-                          )}
-                        </>
-                      )}
-                    </Box>
-                  )}
-                </Box>
-              </SettingsRow>
-              <SettingsRow label="Tests" stacked>
-                <Box sx={{ display: "flex", flexDirection: "column", gap: 1, width: "100%", minWidth: 0 }}>
-                  <Button variant="outlined" size="small" onClick={handleRunAllTests} disabled={isRunningTests} sx={{ alignSelf: "flex-start" }}>
-                    {isRunningTests ? "Running..." : "Run Tests"}
-                  </Button>
-                  {testSuiteResults && (
-                    <Box sx={{ width: "100%", minWidth: 0 }}>
-                      {testSuiteResults.error ? (
-                        <MuiAlert severity="error">{testSuiteResults.error}</MuiAlert>
-                      ) : (
-                        renderTestSuitePanel(testSuiteResults)
-                      )}
-                    </Box>
-                  )}
-                </Box>
-              </SettingsRow>
-              <SettingsRow label="Developer" stacked>
-                <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.75 }}>
-                  <Chip label="RAG Debug" onClick={handleRagDebugChange} size="small" color={ragDebug ? "primary" : "default"} variant={ragDebug ? "filled" : "outlined"} />
-                  <Chip label="Enhanced Context" onClick={handleEnhancedContextChange} size="small" color={enhancedContext ? "primary" : "default"} variant={enhancedContext ? "filled" : "outlined"} />
-                  <Chip label="Advanced RAG" onClick={handleAdvancedRagChange} size="small" color={advancedRag ? "primary" : "default"} variant={advancedRag ? "filled" : "outlined"} />
-                  <Chip label="Behavior Learning" onClick={handleBehaviorLearningToggle} size="small" color={behaviorLearningEnabled ? "primary" : "default"} variant={behaviorLearningEnabled ? "filled" : "outlined"} />
-                  <Chip label="Verbose Logging" onClick={handleAdvancedDebugToggle} size="small" color={advancedDebug ? "primary" : "default"} variant={advancedDebug ? "filled" : "outlined"} />
-                  <Chip label="LLM Debug" onClick={handleLlmDebugToggle} size="small" color={llmDebug ? "success" : "default"} variant={llmDebug ? "filled" : "outlined"} />
-                </Box>
-              </SettingsRow>
-              <SettingsRow label="Generation" stacked>
-                <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.75 }}>
-                  <Chip label="Verbatim Prompts (no AI rewrite)" onClick={handleVerbatimPromptsToggle} size="small" color={verbatimPrompts ? "primary" : "default"} variant={verbatimPrompts ? "filled" : "outlined"} />
-                </Box>
-              </SettingsRow>
-              <SettingsRow label="Media models" stacked>
-                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
-                  Stills default: Z-Image Turbo. Max quality: FLUX. Cast train base must match LoRA family
-                  (Z-Image trains by default; SDXL Legacy kept for old LoRAs).
-                </Typography>
-                <Box sx={{ display: "flex", flexDirection: "column", gap: 1.25, maxWidth: 420 }}>
-                  <FormControl size="small" fullWidth>
-                    <InputLabel id="media-stills-label">Stills (image gen)</InputLabel>
-                    <Select
-                      labelId="media-stills-label"
-                      label="Stills (image gen)"
-                      value={mediaModels.stills_model || "zimage-turbo"}
-                      onChange={async (e) => {
-                        const v = e.target.value;
-                        setMediaModelsState((p) => ({ ...p, stills_model: v }));
-                        try {
-                          await apiService.setMediaModels({ stills_model: v });
-                          showMessage?.(`Stills model → ${v}`, "success");
-                        } catch (err) {
-                          showMessage?.(err.message || "Failed to save stills model", "error");
-                        }
-                      }}
-                    >
-                      {(mediaModels.stills_profiles?.length
-                        ? mediaModels.stills_profiles
-                        : [
-                            { id: "zimage-turbo", name: "Z-Image Turbo" },
-                            { id: "flux-dev", name: "FLUX.1 Dev" },
-                            { id: "krea2-turbo", name: "Krea 2 Turbo" },
-                            { id: "sdxl-legacy", name: "SDXL (Legacy)" },
-                          ]
-                      ).map((p) => (
-                        <MenuItem key={p.id} value={p.id}>
-                          {p.name || p.id}
-                          {p.recommended ? " ★" : ""}
-                          {p.deprecated ? " (legacy)" : ""}
-                        </MenuItem>
-                      ))}
-                    </Select>
-                  </FormControl>
-                  <FormControl size="small" fullWidth>
-                    <InputLabel id="media-train-label">Cast LoRA train base</InputLabel>
-                    <Select
-                      labelId="media-train-label"
-                      label="Cast LoRA train base"
-                      value={mediaModels.cast_train_base || "zimage-turbo"}
-                      onChange={async (e) => {
-                        const v = e.target.value;
-                        setMediaModelsState((p) => ({ ...p, cast_train_base: v }));
-                        try {
-                          const res = await apiService.setMediaModels({ cast_train_base: v });
-                          const data = res?.data ?? res;
-                          if (data?.error) throw new Error(data.error.message || data.error);
-                          showMessage?.(`Cast train base → ${v}`, "success");
-                        } catch (err) {
-                          showMessage?.(err.message || "Failed to save train base", "error");
-                        }
-                      }}
-                    >
-                      {(mediaModels.train_profiles?.length
-                        ? mediaModels.train_profiles
-                        : [
-                            { id: "zimage-turbo", name: "Z-Image Turbo", train_ready: true },
-                            { id: "flux-dev", name: "FLUX.1 Dev", train_ready: false },
-                            { id: "sdxl-legacy", name: "SDXL (Legacy)", train_ready: true },
-                          ]
-                      ).map((p) => (
-                        <MenuItem key={p.id} value={p.id}>
-                          {p.name || p.id}
-                          {p.train_ready === false ? " — train soon" : ""}
-                          {p.deprecated ? " (legacy)" : ""}
-                        </MenuItem>
-                      ))}
-                    </Select>
-                  </FormControl>
-                  <FormControl size="small" fullWidth>
-                    <InputLabel id="media-maxq-label">Max quality stills</InputLabel>
-                    <Select
-                      labelId="media-maxq-label"
-                      label="Max quality stills"
-                      value={mediaModels.max_quality_model || "flux-dev"}
-                      onChange={async (e) => {
-                        const v = e.target.value;
-                        setMediaModelsState((p) => ({ ...p, max_quality_model: v }));
-                        try {
-                          await apiService.setMediaModels({ max_quality_model: v });
-                          showMessage?.(`Max quality → ${v}`, "success");
-                        } catch (err) {
-                          showMessage?.(err.message || "Failed to save max quality model", "error");
-                        }
-                      }}
-                    >
-                      <MenuItem value="flux-dev">FLUX.1 Dev</MenuItem>
-                      <MenuItem value="zimage-turbo">Z-Image Turbo</MenuItem>
-                    </Select>
-                  </FormControl>
-                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
-                    Character LoRA strength (Cast / Batch / FilmCrew / MusicVideo / VideoGen keyframes).
-                    Video motion models do not reload face LoRAs — identity is baked into the still.
-                  </Typography>
-                  {[
-                    { key: 'zimage', label: 'Z-Image', field: 'character_lora_strength_zimage', def: 0.9 },
-                    { key: 'sdxl', label: 'SDXL', field: 'character_lora_strength_sdxl', def: 0.25 },
-                    { key: 'flux', label: 'FLUX', field: 'character_lora_strength_flux', def: 0.9 },
-                  ].map(({ key, label, field, def }) => (
-                    <TextField
-                      key={key}
-                      size="small"
-                      type="number"
-                      label={`${label} LoRA strength`}
-                      inputProps={{ min: 0, max: 1.5, step: 0.05 }}
-                      value={mediaModels.character_lora_strength?.[key] ?? def}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        setMediaModelsState((p) => ({
-                          ...p,
-                          character_lora_strength: {
-                            ...(p.character_lora_strength || {}),
-                            [key]: v,
-                          },
-                        }));
-                      }}
-                      onBlur={async (e) => {
-                        const v = parseFloat(e.target.value);
-                        if (Number.isNaN(v)) return;
-                        try {
-                          const res = await apiService.setMediaModels({ [field]: v });
-                          const data = res?.data ?? res;
-                          if (data?.character_lora_strength) {
-                            setMediaModelsState((p) => ({
-                              ...p,
-                              character_lora_strength: data.character_lora_strength,
-                            }));
-                          }
-                          showMessage?.(`${label} LoRA strength → ${v}`, 'success');
-                        } catch (err) {
-                          showMessage?.(err.message || 'Failed to save LoRA strength', 'error');
-                        }
-                      }}
-                      fullWidth
-                      sx={{ mt: 1 }}
-                    />
-                  ))}
-                </Box>
-              </SettingsRow>
-              <Box sx={{ borderTop: 1, borderColor: "divider", mt: 2, pt: 2 }}>
-                <Typography variant="overline" sx={{ fontSize: "0.75rem", color: "error.main" }}>System Control</Typography>
-                <Box sx={{ display: "flex", gap: 1, mt: 1 }}>
-                  <Tooltip title={isLoading ? "Please wait for current operation to finish" : ""}>
-                    <span>
-                      <Button variant="outlined" size="small" color="error" onClick={handleRebootClick} disabled={isLoading}>Reboot</Button>
-                    </span>
-                  </Tooltip>
-                  <Tooltip title={isLoading ? "Please wait for current operation to finish" : ""}>
-                    <span>
-                      <Button variant="outlined" size="small" color="error" onClick={() => setKillSwitchOpen(true)} disabled={isLoading}>Kill Switch</Button>
-                    </span>
-                  </Tooltip>
-                </Box>
-              </Box>
-          </SettingsCardWrapper>
-
-          {/* Training */}
-          <SettingsCardWrapper title="Training" icon={<SchoolIcon sx={{ fontSize: 18 }} />}>
-            <SettingsRow label="Interactive Trainer">
-              <Button
-                variant="outlined"
-                size="small"
-                startIcon={<SchoolIcon sx={{ fontSize: 14 }} />}
-                onClick={() => setTrainerOpen(true)}
-                sx={{ fontSize: '0.75rem', textTransform: 'none' }}
-              >
-                Launch Trainer
-              </Button>
-            </SettingsRow>
-            <SettingsRow label="Description">
-              <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                Record demonstrations on the virtual display, then watch the agent learn to replicate them with graduated autonomy.
-              </Typography>
-            </SettingsRow>
-          </SettingsCardWrapper>
-
-          {/* Support / Donate + GitHub links */}
-          <SettingsCardWrapper title="Support the Project" icon={<CoffeeIcon sx={{ fontSize: 18 }} />}>
-            <Typography variant="body2" sx={{ mb: 1, color: "text.secondary" }}>
-              Guaardvark is built with love by a solo developer. If it's useful to you:
-            </Typography>
-            <Box sx={{ display: "flex", flexWrap: "wrap", gap: 1 }}>
-              <Button
-                variant="outlined"
-                size="small"
-                startIcon={<StarIcon sx={{ fontSize: 14 }} />}
-                onClick={() => window.open(SUPPORT_LINKS.githubRepo, "_blank", "noopener,noreferrer")}
-                sx={{ fontSize: "0.75rem", textTransform: "none" }}
-              >
-                Star on GitHub
-              </Button>
-              <Button
-                variant="outlined"
-                size="small"
-                startIcon={<OpenInNewIcon sx={{ fontSize: 14 }} />}
-                onClick={() => window.open(SUPPORT_LINKS.githubRepo, "_blank", "noopener,noreferrer")}
-                sx={{ fontSize: "0.75rem", textTransform: "none" }}
-              >
-                Repo
-              </Button>
-              <Button
-                variant="outlined"
-                size="small"
-                onClick={() => window.open(SUPPORT_LINKS.githubSponsors, "_blank", "noopener,noreferrer")}
-                sx={{ fontSize: "0.75rem", textTransform: "none" }}
-              >
-                GitHub Sponsors
-              </Button>
-              <Button
-                variant="outlined"
-                size="small"
-                startIcon={<CoffeeIcon sx={{ fontSize: 14 }} />}
-                onClick={() => window.open(SUPPORT_LINKS.buyMeACoffee, "_blank", "noopener,noreferrer")}
-                sx={{ fontSize: "0.75rem", textTransform: "none" }}
-              >
-                Buy Me a Coffee
-              </Button>
-              <Button
-                variant="outlined"
-                size="small"
-                onClick={() => window.open(SUPPORT_LINKS.koFi, "_blank", "noopener,noreferrer")}
-                sx={{ fontSize: "0.75rem", textTransform: "none" }}
-              >
-                Ko-fi
-              </Button>
-              <Button
-                variant="outlined"
-                size="small"
-                onClick={() => window.open(SUPPORT_LINKS.paypal, "_blank", "noopener,noreferrer")}
-                sx={{ fontSize: "0.75rem", textTransform: "none" }}
-              >
-                PayPal
-              </Button>
+              {set.map((panel, j) => (
+                <React.Fragment key={j}>{panel}</React.Fragment>
+              ))}
             </Box>
-          </SettingsCardWrapper>
+          ))}
         </Box>
       </Box>
 
-      {/* Modals */}
       <CreateBackupModal
         open={createBackupOpen}
         onClose={() => setCreateBackupOpen(false)}
@@ -3694,56 +3671,147 @@ const SettingsPage = () => {
         installDefaultVoiceModel={installDefaultVoiceModel}
         testVoice={testVoice}
         systemName={persistedSystemName}
+        whisperManualInstall={whisperManualInstall}
+        onCopyWhisperCommand={copyWhisperCommand}
       />
-      <AgentsSettingsModal open={agentsModalOpen} onClose={() => setAgentsModalOpen(false)} />
       <InterconnectorSettingsModal
         open={interconnectorModalOpen}
         onClose={() => {
           setInterconnectorModalOpen(false);
-          interconnectorApi.getInterconnectorConfig().then((res) => {
-            if (res?.data?.config?.is_enabled || res?.config?.is_enabled) setInterconnectorEnabled(true);
-            else if (!res?.error) setInterconnectorEnabled(false);
-          }).catch(() => {});
+          interconnectorApi
+            .getInterconnectorConfig()
+            .then((res) => {
+              if (res?.data?.config?.is_enabled || res?.config?.is_enabled)
+                setInterconnectorEnabled(true);
+              else if (!res?.error) setInterconnectorEnabled(false);
+            })
+            .catch(() => {});
         }}
       />
-      <Dialog
+      <ConfirmActionDialog
         open={rebootDialogOpen}
         onClose={handleCancelReboot}
-        aria-labelledby="reboot-dialog-title"
-      >
-        <DialogTitle id="reboot-dialog-title">Confirm Reboot</DialogTitle>
-        <DialogContent dividers>
-          <DialogContentText component="div">
-            <Typography variant="body2" gutterBottom>
-              Backend services will restart. The UI will briefly disconnect and reload automatically.
-            </Typography>
-            <Typography variant="body2">
-              Save any unsaved work before proceeding.
-            </Typography>
-          </DialogContentText>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={handleCancelReboot} disabled={rebootInProgress}>
-            Cancel
-          </Button>
-          <Button
-            onClick={handleConfirmReboot}
-            color="error"
-            variant="contained"
-            disabled={rebootInProgress}
-          >
-            {rebootInProgress ? "Rebooting..." : "Reboot Now"}
-          </Button>
-        </DialogActions>
-      </Dialog>
-      {purgeModalOpen && (
-        <PurgeIndexModal
-          open={purgeModalOpen}
-          onClose={handleClosePurgeModal}
-          onConfirm={handleConfirmPurge}
-          isProcessing={isPurging}
-        />
-      )}
+        onConfirm={handleConfirmReboot}
+        title="Reboot Guaardvark"
+        description="Restarts the backend, the workers and ComfyUI. Every generation, index job and chat reply in flight is lost, and this page will disconnect until the services are back."
+        keeps="documents, chats, media, rules and settings."
+        confirmLabel="Reboot now"
+        busy={rebootInProgress}
+      />
+      <ConfirmActionDialog
+        open={deleteHistoryDialogOpen}
+        onClose={handleCancelDeleteHistory}
+        onConfirm={handleConfirmDeleteHistory}
+        title="Delete generation history"
+        description={
+          <>
+            Permanently deletes every batch image, batch video and audio
+            generation: the files, their entries in Documents and Job History,
+            and ComfyUI&apos;s own output and input folders.
+            {deleteHistoryRunning
+              ? " Batches still generating are skipped and left in place."
+              : ""}
+            {deleteHistoryCounts?.comfyui?.running?.length
+              ? " ComfyUI is still rendering; its folders are left alone this time."
+              : ""}
+            {!deleteHistoryCounts
+              ? " Could not read the current counts; deletion still works."
+              : ""}
+          </>
+        }
+        facts={deleteHistoryFacts}
+        keeps="Film Crew productions, video editor projects, the cast library, trained LoRAs and chat history."
+        confirmLabel="Delete history"
+        busy={deleteHistoryInProgress}
+      />
+      <ConfirmActionDialog
+        open={clearChatOpen}
+        onClose={() => !clearChatBusy && setClearChatOpen(false)}
+        onConfirm={confirmClearChat}
+        title="Clear all chat history"
+        description="Deletes every conversation and message, the cached context files, and this browser's session ids."
+        facts={
+          chatHistoryCounts
+            ? [
+                { label: "Messages", value: chatHistoryCounts.messages || 0 },
+                { label: "Sessions", value: chatHistoryCounts.sessions || 0 },
+                {
+                  label: "Cached files",
+                  value:
+                    (chatHistoryCounts.context_files || 0) +
+                    (chatHistoryCounts.conversation_files || 0),
+                },
+              ]
+            : []
+        }
+        keeps="documents, the index, generated media and rules."
+        confirmLabel="Clear chat history"
+        busy={clearChatBusy}
+      />
+      <ConfirmActionDialog
+        open={clearMemoriesOpen}
+        onClose={() => !clearMemoriesBusy && setClearMemoriesOpen(false)}
+        onConfirm={confirmClearMemories}
+        title="Clear agent memory"
+        description="Deletes every memory the agent has stored: facts, preferences and lessons, whatever their status. The filters on the memory page do not narrow this."
+        facts={
+          memoryCount !== null
+            ? [{ label: "Active memories", value: memoryCount }]
+            : []
+        }
+        keeps="rules, chats and documents."
+        confirmLabel="Clear memory"
+        busy={clearMemoriesBusy}
+      />
+      <ConfirmActionDialog
+        open={learningClear !== null}
+        onClose={() => !learningBusy && setLearningClear(null)}
+        onConfirm={confirmClearLearning}
+        title={
+          learningClear === "rules"
+            ? "Clear learned rules"
+            : "Clear behaviour log"
+        }
+        description={
+          learningClear === "rules"
+            ? "Deletes every rule marked as learned, the ones the chat added on its own from corrections and preferences."
+            : "Empties the behaviour log file that Behaviour learning reads to adapt replies. Learning starts again from nothing."
+        }
+        keeps={
+          learningClear === "rules"
+            ? "rules you wrote or imported, chats, memories."
+            : "learned rules, chats, memories."
+        }
+        confirmLabel={
+          learningClear === "rules" ? "Clear learned rules" : "Clear log"
+        }
+        busy={learningBusy}
+      />
+      <IndexProfileEditDialog
+        open={editProfile !== null}
+        profile={editProfile}
+        onClose={() => setEditProfile(null)}
+        onSaved={(message) => {
+          showMessage(message, "success");
+          setProfilesReloadKey((k) => k + 1);
+        }}
+      />
+      <RebuildIndexDialog
+        open={rebuildDialogOpen}
+        profiles={indexProfiles}
+        onClose={() => setRebuildDialogOpen(false)}
+        onOpenPurge={handleOpenPurgeModal}
+        onDone={(message, severity) => {
+          showMessage(message, severity);
+          setProfilesReloadKey((k) => k + 1);
+        }}
+      />
+      <PurgeIndexModal
+        open={purgeModalOpen}
+        onClose={handleClosePurgeModal}
+        onConfirm={handleConfirmPurge}
+        isProcessing={isPurging}
+      />
       <KillSwitchModal
         open={killSwitchOpen}
         onClose={() => setKillSwitchOpen(false)}
@@ -3757,8 +3825,8 @@ const SettingsPage = () => {
         onClose={() => {
           setImageModelsModalOpen(false);
           fetch("/api/batch-image/status")
-            .then(res => res.json())
-            .then(data => data.success && setImageGenStatus(data.data))
+            .then((res) => res.json())
+            .then((data) => data.success && setImageGenStatus(data.data))
             .catch(console.error);
         }}
         showMessage={showMessage}
@@ -3776,6 +3844,11 @@ const SettingsPage = () => {
       <VoiceModelsModal
         open={voiceModelsModalOpen}
         onClose={() => setVoiceModelsModalOpen(false)}
+        showMessage={showMessage}
+      />
+      <AudioFoundryModelsModal
+        open={audioModelsModalOpen}
+        onClose={() => setAudioModelsModalOpen(false)}
         showMessage={showMessage}
       />
     </PageLayout>

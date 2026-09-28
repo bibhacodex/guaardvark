@@ -6,11 +6,13 @@ This API enables the frontend ToolsPage and agent-based chat routing.
 """
 
 import logging
+import re
 import os
 import base64
 import time
 from flask import Blueprint, request, jsonify, current_app, send_from_directory, abort
 from typing import Dict, Any, Optional
+from backend.utils.path_guard import PathEscapesRoot, contained, contained_path
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +258,12 @@ def execute_tool():
 
         # Execute tool
         logger.info(f"Executing tool '{tool_name}' with parameters: {list(parameters.keys())}")
-        result = registry.execute_tool(tool_name, **parameters)
+        # A person invoking a tool directly (Tools page / API, behind auth_guard)
+        # is the approval, so confirmation-gated tools run without a prompt.
+        from backend.services.tool_confirmation import trusted_caller
+
+        with trusted_caller("rest:tools_api"):
+            result = registry.execute_tool(tool_name, **parameters)
 
         return jsonify({
             "success": True,
@@ -376,7 +383,11 @@ def route_message():
                 screen_active = bool(context.get("agent_screen_active") or context.get("session_mode") == "agent")
                 # Reuse brain's classification where possible (avoids duplicating hard regex here).
                 is_vision = getattr(brain, '_is_vision_task', lambda m, i=None: False)(message, None) if hasattr(brain, '_is_vision_task') else False
-                if screen_active or is_vision or 'agent' in message.lower() or 'screen' in message.lower():
+                # Whole words only: "Agents" (a workspace) and "screenshot" are
+                # not requests to drive the desktop. Substring matching sent a
+                # plain file request to the screen-agent loop (2026-09-05).
+                asks_for_agent = bool(re.search(r"\b(?:agent|screen)\b", message, re.I))
+                if screen_active or is_vision or asks_for_agent:
                     route = type('obj', (object,), {
                         'route_type': type('rt', (object,), {'value': 'agent_loop'})(),
                         'tool_name': 'agent_task_execute' if 'execute' in message.lower() or 'do' in message.lower() else None,
@@ -515,9 +526,13 @@ def route_and_execute():
         if not is_error and result.get("type") == "agent_result" and result.get("success") is False:
             is_error = True
         agent_error = result.get("error") if result.get("type") == "agent_result" else None
+        # display_content is what was just persisted as the assistant turn;
+        # the client shows it first so a tool_result or file_generation shape
+        # (no final_answer field) is not reported as "no response".
         return jsonify({
             "success": not is_error,
             "result": result,
+            "display_content": display_content,
             **({"error": result.get("error") or agent_error} if is_error else {})
         }), 500 if is_error else 200
 
@@ -535,8 +550,9 @@ def serve_screenshot(filename):
     screenshots_dir = os.path.join(
         current_app.config.get("OUTPUT_DIR", "data/outputs"), "screenshots"
     )
-    safe_path = os.path.normpath(os.path.abspath(os.path.join(screenshots_dir, filename)))
-    if not safe_path.startswith(os.path.abspath(screenshots_dir) + os.sep):
+    try:
+        safe_path = contained_path(screenshots_dir, filename)
+    except PathEscapesRoot:
         abort(403)
     if not os.path.isfile(safe_path):
         abort(404)

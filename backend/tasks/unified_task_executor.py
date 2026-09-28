@@ -268,12 +268,12 @@ def _detect_code_file_request(task: Dict[str, Any]) -> bool:
 def _generate_llm_content(task: Dict[str, Any], model_name: str, progress_callback) -> str:
     """Generate content using LLM"""
     try:
-        from llama_index.llms.ollama import Ollama
+        from backend.utils.ollama_resource_manager import build_ollama
 
         ollama_base_url = os.environ.get('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')
         timeout = float(os.environ.get('LLM_REQUEST_TIMEOUT', '300'))
 
-        llm = Ollama(model=model_name, base_url=ollama_base_url, request_timeout=min(timeout, 300.0))
+        llm = build_ollama(model_name, base_url=ollama_base_url, request_timeout=min(timeout, 300.0))
 
         prompt = task.get('prompt_text') or task.get('name')
 
@@ -296,13 +296,13 @@ def _generate_llm_content(task: Dict[str, Any], model_name: str, progress_callba
 def _generate_code_file(task: Dict[str, Any], model_name: str, progress_callback) -> str:
     """Generate code file content using specialized prompting"""
     try:
-        from llama_index.llms.ollama import Ollama
+        from backend.utils.ollama_resource_manager import build_ollama
         from llama_index.core.llms import ChatMessage, MessageRole
 
         ollama_base_url = os.environ.get('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')
         timeout = float(os.environ.get('LLM_REQUEST_TIMEOUT', '600'))
 
-        llm = Ollama(model=model_name, base_url=ollama_base_url, request_timeout=min(timeout, 600.0))
+        llm = build_ollama(model_name, base_url=ollama_base_url, request_timeout=min(timeout, 600.0))
 
         prompt = task.get('prompt_text') or task.get('name')
         output_filename = task.get('output_filename', '')
@@ -508,6 +508,15 @@ def execute_unified_task(self, task_id: int):
         # Try to find a specific handler for the task type
         output = None
         handler_used = None
+
+        # Handlers an extension registered for its own task types run first,
+        # so a vertical never edits this chain (backend/services/task_handler_registry.py).
+        from backend.services.task_handler_registry import get_task_handler
+        ext_handler = get_task_handler(task_type)
+        if ext_handler is not None:
+            update_progress(10, f"Running {task_type}")
+            output = ext_handler(task, update_progress)
+            handler_used = task_type
 
         # Check for CSV generation handler
         if task_type in ['file_generation', 'csv_generation'] and task.get('workflow_config'):
@@ -871,10 +880,10 @@ def _execute_csv_generation(task: Dict[str, Any], progress_callback) -> Optional
 
         # Get LLM
         if model_name:
-            from llama_index.llms.ollama import Ollama
+            from backend.utils.ollama_resource_manager import build_ollama
             ollama_base_url = os.environ.get('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')
             timeout = float(os.environ.get('LLM_REQUEST_TIMEOUT', '180'))
-            llm = Ollama(model=model_name, base_url=ollama_base_url, request_timeout=min(timeout, 180.0))
+            llm = build_ollama(model_name, base_url=ollama_base_url, request_timeout=min(timeout, 180.0))
         else:
             llm = get_default_llm()
 

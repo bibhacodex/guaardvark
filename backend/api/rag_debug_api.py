@@ -5,14 +5,12 @@
 import logging
 import time
 import json
-from functools import wraps
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 from dataclasses import dataclass, asdict
 from flask import Blueprint, request, jsonify, current_app
 
-from backend.utils.settings_utils import get_setting
 
 from backend.utils.unified_index_manager import get_global_index_manager
 from backend.utils.enhanced_rag_chunking import EnhancedRAGChunker
@@ -537,18 +535,7 @@ class RAGDebugManager:
 debug_manager = RAGDebugManager()
 
 
-def require_rag_debug(f):
-    """Gate endpoint behind rag_debug_enabled setting."""
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if not get_setting("rag_debug_enabled", default=True, cast=bool):
-            return jsonify({"error": "RAG Debug is disabled. Enable it in Settings."}), 403
-        return f(*args, **kwargs)
-    return wrapper
-
-
 @rag_debug_bp.route("/retrieve", methods=["POST"])
-@require_rag_debug
 def debug_retrieve():
     """Debug a retrieval operation"""
     try:
@@ -596,7 +583,6 @@ def debug_retrieve():
         return error_response(f"RAG debug retrieve failed: {str(e)}", 500)
 
 @rag_debug_bp.route("/context-quality", methods=["POST"])
-@require_rag_debug
 def analyze_context():
     """Analyze context quality for a session"""
     try:
@@ -619,7 +605,6 @@ def analyze_context():
         return error_response(str(e), 500)
 
 @rag_debug_bp.route("/performance", methods=["GET"])
-@require_rag_debug
 def get_performance():
     """Get performance summary"""
     try:
@@ -632,7 +617,6 @@ def get_performance():
         return error_response(str(e), 500)
 
 @rag_debug_bp.route("/query-patterns", methods=["GET"])
-@require_rag_debug
 def get_patterns():
     """Get query patterns analysis"""
     try:
@@ -644,7 +628,6 @@ def get_patterns():
         return error_response(str(e), 500)
 
 @rag_debug_bp.route("/system-health", methods=["GET"])
-@require_rag_debug
 def get_system_health():
     """Get overall system health metrics"""
     try:
@@ -661,10 +644,27 @@ def get_system_health():
         docstore_path = os.path.join(index_root, "docstore.json")
         if os.path.exists(docstore_path):
             docstore_size = os.path.getsize(docstore_path)
-            vector_store_path = os.path.join(index_root, "default__vector_store.json")
-            vector_size = os.path.getsize(vector_store_path) if os.path.exists(vector_store_path) else 0
+            # Under pgvector the embeddings are not on disk here; asking the database
+            # keeps this from reporting a vector store of zero bytes.
+            vector_size = 0
+            vector_info = {}
+            try:
+                from backend.services.indexing_service import vector_store_stats
+                vector_info = vector_store_stats()
+                if vector_info.get("backend") == "pgvector":
+                    vector_size = vector_info.get("size_bytes", 0)
+                else:
+                    vector_store_path = os.path.join(index_root, "default__vector_store.json")
+                    vector_size = os.path.getsize(vector_store_path) if os.path.exists(vector_store_path) else 0
+            except Exception:
+                vector_store_path = os.path.join(index_root, "default__vector_store.json")
+                vector_size = os.path.getsize(vector_store_path) if os.path.exists(vector_store_path) else 0
             total_memory = docstore_size + vector_size
-            persisted_indexes["global"] = {"project_id": "global", "size": docstore_size + vector_size}
+            persisted_indexes["global"] = {
+                "project_id": "global",
+                "size": docstore_size + vector_size,
+                "vector_store": vector_info,
+            }
 
         # Check for per-project indexes (subdirectories with docstore.json)
         for entry in os.listdir(index_root):

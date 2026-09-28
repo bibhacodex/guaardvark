@@ -94,6 +94,13 @@ class SelfImprovementService:
     _instance = None
     _lock = threading.Lock()
 
+    # Terminal status a cancelled run ends in; reported by every status route.
+    CANCELLED = "cancelled"
+    # Runs cancelled from inside this process. Class-level so a checkpoint can
+    # read it whatever way the singleton was built; the run row is the flag
+    # that crosses processes (the API usually cancels a Celery worker's run).
+    _cancel_requested_ids: set = set()
+
     def __new__(cls, *args, **kwargs):
         with cls._lock:
             if cls._instance is None:
@@ -145,6 +152,62 @@ class SelfImprovementService:
             return False
         return True
 
+    def request_cancel(self, run_id: int) -> bool:
+        """Ask a running scan to stop at its next checkpoint.
+
+        The run row is the flag: its status flips to ``cancelled`` now, so the
+        status routes report it immediately, and the runner re-reads the row
+        between steps and finishes without overwriting it. The step in flight
+        (the pytest subprocess can take minutes) is not interrupted. Returns
+        False for an unknown run or one that has already finished.
+        """
+        from backend.models import db, SelfImprovementRun
+        run = db.session.get(SelfImprovementRun, run_id)
+        if run is None or run.status != "running":
+            return False
+        run.status = self.CANCELLED
+        run.error_message = "Cancelled by the user"
+        db.session.commit()
+        self._cancel_requested_ids.add(run_id)
+        # run_id is passed explicitly: the API process has no _current_run_id.
+        self._emit_progress("cancelled", "Stopping at the next step", 0.0,
+                            status=self.CANCELLED, run_id=run_id)
+        return True
+
+    def _cancel_requested(self, run_id: Optional[int]) -> bool:
+        """Checkpoint between steps: was this run cancelled, here or elsewhere?
+
+        Reads the status column directly rather than the loaded row, so a
+        cancel committed by another process is seen and the row's pending
+        changes are untouched.
+        """
+        if run_id is None:
+            return False
+        if run_id in self._cancel_requested_ids:
+            return True
+        try:
+            from backend.models import db, SelfImprovementRun
+            status = db.session.query(SelfImprovementRun.status).filter_by(id=run_id).scalar()
+        except Exception as e:
+            logger.debug(f"Cancel checkpoint could not read run {run_id}: {e}")
+            return False
+        if status == self.CANCELLED:
+            self._cancel_requested_ids.add(run_id)
+            return True
+        return False
+
+    def _finish_cancelled(self, run_record, start_time: float, changes: List[Dict]) -> Dict[str, Any]:
+        """Close out a run that hit a cancel checkpoint, keeping what it did."""
+        from backend.models import db
+        run_record.status = self.CANCELLED
+        run_record.changes_made = json.dumps(changes)
+        run_record.duration_seconds = time.time() - start_time
+        db.session.commit()
+        self._emit_progress("cancelled", f"Stopped after {len(changes)} fix(es)", 1.0,
+                            status=self.CANCELLED, fixes_applied=len(changes))
+        return {"success": False, "cancelled": True, "run_id": run_record.id,
+                "fixes_applied": len(changes), "changes": changes}
+
     def dispatch_precheck(self) -> Dict[str, Any]:
         """Public, side-effect-free check of whether a directed dispatch can run.
 
@@ -191,6 +254,45 @@ class SelfImprovementService:
                 })
         return failures
 
+    def snapshot_pytest(self, timeout: int = 120) -> Dict[str, Any]:
+        """Analysis-only pytest snapshot. Never dispatches fixes or writes files.
+
+        Used by the overnight research director as a preflight signal. Tests
+        red is information, not a license to apply. If a self-check is already
+        running, we skip rather than race it.
+        """
+        if _is_codebase_locked():
+            return {"ok": False, "skipped": True, "reason": "codebase_locked", "red": False}
+        if not _is_self_improvement_enabled():
+            return {"ok": False, "skipped": True, "reason": "self_improvement_disabled", "red": False}
+        if self._running:
+            return {"ok": False, "skipped": True, "reason": "si_already_running", "red": False}
+        root = os.environ.get("GUAARDVARK_ROOT", ".")
+        try:
+            result = subprocess.run(
+                ["python3", "-m", "pytest",
+                 "backend/tests/test_self_improvement.py",
+                 "backend/tests/test_code_tools.py",
+                 "-q", "--tb=no", "--no-header"],
+                capture_output=True, text=True, timeout=timeout, cwd=root,
+                env={**os.environ, "GUAARDVARK_MODE": "test"},
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "skipped": False, "reason": "pytest_timeout",
+                    "red": True, "failures": -1, "return_code": None}
+        except Exception as e:
+            return {"ok": False, "skipped": False, "reason": f"pytest_error:{e.__class__.__name__}",
+                    "red": False, "failures": 0, "return_code": None}
+        failures = self._parse_test_failures(result.stdout + result.stderr)
+        red = bool(failures) or result.returncode != 0
+        return {
+            "ok": True,
+            "skipped": False,
+            "red": red,
+            "failures": len(failures),
+            "return_code": result.returncode,
+        }
+
     def run_self_check(self) -> Dict[str, Any]:
         """Mode 1: Run test suite, identify failures, dispatch agent to fix."""
         if not self._is_safe_to_run():
@@ -233,6 +335,9 @@ class SelfImprovementService:
                 "return_code": result.returncode,
             })
 
+            if self._cancel_requested(run_record.id):
+                return self._finish_cancelled(run_record, start_time, [])
+
             self._emit_progress("analyzed", f"Found {len(failures)} failure(s)", 0.3,
                                 failures_found=len(failures), return_code=result.returncode)
 
@@ -249,6 +354,8 @@ class SelfImprovementService:
 
             changes = []
             for i, failure in enumerate(failures):
+                if self._cancel_requested(run_record.id):
+                    return self._finish_cancelled(run_record, start_time, changes)
                 if not self._is_safe_to_run():
                     break
                 progress = 0.3 + (0.6 * (i / max(len(failures), 1)))
@@ -257,6 +364,9 @@ class SelfImprovementService:
                 change = self._attempt_fix(failure)
                 if change:
                     changes.append(change)
+
+            if self._cancel_requested(run_record.id):
+                return self._finish_cancelled(run_record, start_time, changes)
 
             # Verification: re-run tests to confirm fixes worked
             if changes:
@@ -308,8 +418,8 @@ class SelfImprovementService:
             self._running = False
             self._current_run_id = None
 
-    def _attempt_fix(self, failure: Dict[str, str]) -> Optional[Dict[str, Any]]:
-        """Dispatch code_assistant agent to fix a test failure."""
+    def _attempt_fix(self, failure: Dict[str, str], message: str = None) -> Optional[Dict[str, Any]]:
+        """Dispatch code_assistant agent to fix a test failure (or run `message`)."""
         try:
             from backend.services.agent_executor import AgentExecutor
             from backend.services.agent_config import AgentConfigManager
@@ -328,7 +438,7 @@ class SelfImprovementService:
                 max_iterations=agent_config.max_iterations,
             )
 
-            message = (
+            message = message or (
                 f"Fix this failing test. "
                 f"Test file: {failure['file']}, test: {failure['test_name']}. "
                 f"Error: {failure['error']}. "
@@ -439,7 +549,10 @@ class SelfImprovementService:
             }
             change = self._attempt_fix(failure)
 
-            run_record.status = "success" if change else "failed"
+            if self._cancel_requested(run_record.id):
+                run_record.status = self.CANCELLED
+            else:
+                run_record.status = "success" if change else "failed"
             run_record.changes_made = json.dumps([change] if change else [])
             db.session.commit()
 
@@ -449,9 +562,16 @@ class SelfImprovementService:
             self._running = False
 
     def submit_directed_task(
-        self, description: str, target_files: List[str] = None, priority: str = "medium"
+        self, description: str, target_files: List[str] = None, priority: str = "medium",
+        proposal: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Mode 3: User/Claude-submitted improvement task."""
+        """Mode 3: User/Claude-submitted improvement task.
+
+        ``proposal`` is an exact old/new text change already derived from the
+        task's evidence (see system_mapper.actions.mechanical_proposal). It is
+        staged as-is, behind the same human gate, and the agent is not asked to
+        rediscover it: on 2026-09-05 two directed runs on a one-line wiring fix
+        ended with the local model calling a tool that does not exist."""
         if not self._is_safe_to_run():
             return {"success": False, "reason": "Self-improvement cannot run"}
 
@@ -466,23 +586,83 @@ class SelfImprovementService:
             db.session.add(run_record)
             db.session.commit()
 
-            failure = {
-                "file": ", ".join(target_files) if target_files else "unknown",
-                "test_name": "directed_improvement",
-                "error": description,
-            }
-            change = self._attempt_fix(failure)
+            self._current_run_id = run_record.id
+            change = None
+            if proposal:
+                change = self._stage_proposal(proposal, run_record.id)
+            else:
+                failure = {
+                    "file": ", ".join(target_files) if target_files else "unknown",
+                    "test_name": "directed_improvement",
+                    "error": description,
+                }
+                change = self._attempt_fix(failure, message=self._directed_message(
+                    description, target_files))
 
-            run_record.status = "success" if change else "failed"
-            run_record.changes_made = json.dumps([change] if change else [])
+            # A directed run succeeded only if something was actually staged.
+            # The agent's closing prose is not a change: on 2026-08-29 two runs
+            # burned 15 iterations on execute_python, answered with a directory
+            # listing, and were recorded as "success" with nothing in the queue.
+            from backend.models import PendingFix
+            staged = PendingFix.query.filter_by(run_id=run_record.id).all()
+            if self._cancel_requested(run_record.id):
+                run_record.status = self.CANCELLED
+                run_record.changes_made = "[]"
+                db.session.commit()
+                return {"success": False, "cancelled": True, "run_id": run_record.id,
+                        "change": change, "pending_fix_ids": [f.id for f in staged]}
+            if staged:
+                run_record.status = "success"
+                run_record.changes_made = json.dumps([
+                    {"file": f.file_path, "pending_fix_id": f.id,
+                     "fix_description": (f.fix_description or "")[:500]}
+                    for f in staged
+                ])
+            else:
+                run_record.status = "no_change"
+                run_record.changes_made = "[]"
+                run_record.error_message = (
+                    (change or {}).get("fix_description") or "agent produced no answer")
             db.session.commit()
 
-            return {"success": bool(change), "change": change}
+            return {"success": bool(staged), "change": change,
+                    "pending_fix_ids": [f.id for f in staged]}
         except Exception as e:
             logger.error(f"Directed improvement failed: {e}", exc_info=True)
             return {"success": False, "reason": str(e)}
         finally:
             self._running = False
+            self._current_run_id = None
+
+    def _stage_proposal(self, proposal: Dict[str, Any], run_id: int) -> Optional[Dict[str, Any]]:
+        """Stage a mechanical proposal through the guarded path (path, lock,
+        protected-file and exact-match checks apply). Returns the change record,
+        or a description of why staging was refused."""
+        from backend.services.guarded_code_service import GuardedCodeError, stage_pending_fix
+        try:
+            fix_id = stage_pending_fix(
+                proposal["path"], proposal["old_text"], proposal["new_text"],
+                proposal.get("description") or "mechanical proposal",
+                severity=proposal.get("severity") or "medium", run_id=run_id,
+            )
+        except GuardedCodeError as exc:
+            logger.warning("mechanical proposal refused: %s", exc)
+            return {"file": proposal.get("path"), "fix_description": f"not staged: {exc}"}
+        return {"file": proposal.get("path"), "pending_fix_id": fix_id,
+                "fix_description": (proposal.get("description") or "")[:500]}
+
+    @staticmethod
+    def _directed_message(description: str, target_files: List[str] = None) -> str:
+        """Prompt for a dispatched finding — a change proposal, not a test repair."""
+        files = ", ".join(target_files) if target_files else "(find them with search_code)"
+        return (
+            f"Directed improvement task. This is not a failing test.\n\n{description}\n\n"
+            f"Target file(s): {files}.\n"
+            "Steps: read the target file with read_code; decide the smallest correct "
+            "change; propose it with edit_code (in this context edit_code stages a "
+            "proposal for human review — it does not write to disk). "
+            "Do not use execute_python. If no change is warranted, say why and stop."
+        )
 
 
     def optimize_servo(self) -> Dict[str, Any]:

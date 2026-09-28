@@ -55,19 +55,22 @@ class ProductionService(PipelineService):
     valid_transitions = VALID_TRANSITIONS
     stage_to_agent = STAGE_TO_AGENT
     task_namespace = "production"
+    stage_context = "film-crew"
 
-    # P2: dispatch_agent and resume_all in PipelineService now wire
-    # ensure_plugins_for_stage(self.task_namespace, row.current_stage)
-    # for auto-sequencing of plugins per Film Crew stages (see STAGE_PLUGIN_REQUIREMENTS).
+    # dispatch_agent runs the stage prep for stage_context + current_stage when
+    # GUAARDVARK_PIPELINE_STAGE_PREP is on (see STAGE_PLUGIN_REQUIREMENTS).
 
-    def create(self, *, name: str, script_text: str, project_id: int | None) -> Production:
+    def create(self, *, name: str, script_text: str, project_id: int | None,
+               settings: dict | None = None) -> Production:
+        # settings_json carries per-production choices the agents read later,
+        # such as video_model (which family renders the shots).
         p = Production(
             name=name,
             script_text=script_text,
             project_id=project_id,
             status="draft",
             current_stage="draft",
-            settings_json={},
+            settings_json=dict(settings or {}),
         )
         self.s.add(p)
         self.s.commit()

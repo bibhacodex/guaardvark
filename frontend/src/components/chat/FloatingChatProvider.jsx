@@ -4,11 +4,16 @@ import FloatingChatCard from "./FloatingChatCard";
 import FloatingChatFAB from "./FloatingChatFAB";
 import { useFloatingChatStore } from "../../stores/useFloatingChatStore";
 import { usePageContext } from "../../hooks/usePageContext";
+import { isFloatingChatHiddenRoute } from "../../config/floatingChat";
+import { useAppStore } from "../../stores/useAppStore";
+import { chatSurfacesFor } from "../../config/profile";
 
 const FloatingChatProvider = () => {
   const location = useLocation();
   const pageContext = usePageContext();
+  const isOpen = useFloatingChatStore((s) => s.isOpen);
   const toggleOpen = useFloatingChatStore((s) => s.toggleOpen);
+  const setIsOpen = useFloatingChatStore((s) => s.setIsOpen);
   const setPageContext = useFloatingChatStore((s) => s.setPageContext);
 
   // Sync page context to store on route change
@@ -28,8 +33,17 @@ const FloatingChatProvider = () => {
     return () => window.removeEventListener("keydown", handler);
   }, [toggleOpen]);
 
-  // Hide on /chat page to avoid two chat UIs
-  if (location.pathname === "/chat") return null;
+  // A chat surface of its own does not get a second chat floating over it.
+  // Close the card too, so it does not pop back open on the next page.
+  const profile = useAppStore((s) => s.profile);
+  const hidden = isFloatingChatHiddenRoute(location.pathname, chatSurfacesFor(profile));
+  useEffect(() => {
+    if (hidden && isOpen) {
+      setIsOpen(false);
+    }
+  }, [hidden, isOpen, setIsOpen]);
+
+  if (hidden) return null;
 
   return (
     <>

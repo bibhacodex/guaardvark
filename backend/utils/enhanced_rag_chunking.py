@@ -2,10 +2,26 @@
 # Enhanced RAG Chunking System
 # Implements hierarchical and semantic chunking with intelligent content analysis
 
+import os
+
+# NLTK's CWE-427 import guard (nltk/inisec.py) blocks any module whose file resolves
+# *under* the current working directory. This project's venv lives at backend/venv/ --
+# inside the repo -- and the backend runs from the repo root, so every site-packages
+# module looks like a CWD import and nltk cannot import its own `regex` dependency.
+# Measured cost: chunking a 29-section document yielded 76 nodes with nltk blocked
+# versus 115 with it working, and semantic chunking degraded to semantic_fallback.
+#
+# The guard defends against a hostile module shadowing a dependency from the CWD.
+# That is not the situation here: the "CWD" is the application's own repository, and
+# nothing attacker-writable is on sys.path (uploads land in data/uploads/, which is
+# not an import path). Set before any import that can pull nltk in.
+os.environ.setdefault("NLTK_DISABLE_IMPORT_SECURITY", "1")
+
 # Force local LlamaIndex configuration BEFORE any LlamaIndex imports
 import backend.utils.llama_index_local_config
 
 import logging
+import threading
 import re
 import hashlib
 from typing import List, Dict, Optional, Any, Tuple
@@ -62,6 +78,59 @@ class ChunkMetadata:
     chunk_position: int  # Position in original document
     parent_chunk_id: Optional[str] = None
     child_chunk_ids: List[str] = field(default_factory=list)
+
+# Per-chunk bookkeeping that must never reach the embedding model. LlamaIndex
+# concatenates the metadata string ahead of the chunk text before embedding, so
+# anything left in here is paid for twice: once in tokens, and once in retrieval
+# quality, because values that are near-identical across every chunk pull all the
+# vectors toward each other. `chunk_id` is a hash, `created_at`/`cached_at` are
+# timestamps, `relationships` is usually empty, and `entities` is every
+# capitalised word in the chunk. None of it describes what the chunk is about.
+# The values stay queryable for filters and citations -- only the embedding
+# stops seeing them.
+# Semantic splitting embeds every sentence window to find its breakpoints, and
+# those chunks are then embedded again on insert -- the same text paid for twice,
+# during the phase that is supposed to be cheap. It also mints its nodes on a path
+# that bypasses the metadata exclusions below, so those chunks carry the full
+# bookkeeping block into their embedding. Off by default until both are fixed;
+# set GUAARDVARK_SEMANTIC_CHUNKING=true to re-enable.
+
+# Document metadata worth embedding. Empty by design: contextual_prepender already
+# writes the filename, heading path and page into the chunk text, so leaving those
+# keys in the metadata budget would spend the chunk twice on the same words. A
+# deployment that drops the contextual prefix should widen this instead.
+EMBEDDABLE_DOC_METADATA = frozenset()
+
+
+def _declare_embed_budget(document) -> None:
+    """Exclude document metadata from the chunk-size budget, before splitting."""
+    meta = getattr(document, "metadata", None) or {}
+    if not meta:
+        return
+    drop = set(meta) - EMBEDDABLE_DOC_METADATA
+    for attr in ("excluded_embed_metadata_keys", "excluded_llm_metadata_keys"):
+        current = list(getattr(document, attr, None) or [])
+        for key in drop:
+            if key not in current:
+                current.append(key)
+        try:
+            setattr(document, attr, current)
+        except Exception:
+            # Some loaders hand back objects that refuse attribute writes; the
+            # post-split pass below still covers those.
+            pass
+
+
+SEMANTIC_CHUNKING_ENABLED = os.environ.get(
+    "GUAARDVARK_SEMANTIC_CHUNKING", "false").lower() == "true"
+
+
+NON_SEMANTIC_CHUNK_METADATA = frozenset({
+    "cached_at", "chunk_id", "chunk_position", "chunk_type", "content_type",
+    "created_at", "entities", "importance_score", "language", "original_text",
+    "relationships", "source_document", "token_count", "topics",
+})
+
 
 @dataclass
 class ChunkingStrategy:
@@ -155,7 +224,7 @@ class BaseChunker(ABC):
         entities.extend(emails)
         
         # Extract URLs
-        urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', text)
+        urls = re.findall(r'https?://[A-Za-z0-9$\-_@.&+!*(),%/?=:#~;]+', text)
         entities.extend(urls)
         
         # Extract phone numbers
@@ -220,6 +289,19 @@ class BaseChunker(ABC):
         
         return min(1.0, importance)
 
+
+def _safe_hierarchical_overlap(max_chunk_size: int, overlap: int) -> int:
+    """Clamp overlap so it stays proportionate to the SMALLEST hierarchical tier.
+
+    HierarchicalNodeParser applies one chunk_overlap across tiers of
+    [n, n/2, n/4]. An overlap sized for the largest tier is close to the whole of
+    the smallest, collapsing the stride and multiplying node count. Returns at
+    most a quarter of the smallest tier.
+    """
+    smallest = max(1, int(max_chunk_size) // 4)
+    return max(0, min(int(overlap), smallest // 4))
+
+
 class HierarchicalChunker(BaseChunker):
     """Hierarchical chunker that creates parent-child relationships"""
     
@@ -227,7 +309,15 @@ class HierarchicalChunker(BaseChunker):
         super().__init__(strategy)
         self.node_parser = HierarchicalNodeParser.from_defaults(
             chunk_sizes=[strategy.max_chunk_size, strategy.max_chunk_size // 2, strategy.max_chunk_size // 4],
-            chunk_overlap=strategy.overlap_size
+            # One overlap applies to EVERY tier, so it has to be safe for the
+            # smallest. The configured 1000/200 gives tiers [1000, 500, 250] and an
+            # overlap of 200 -- a stride of 50 at the finest tier, i.e. 80% overlap,
+            # which multiplies output several-fold per tier. Unnoticeable on small
+            # sections; on a large one it turned 495 KB of source into 353,154 nodes.
+            # Cap at a quarter of the smallest tier so overlap stays proportionate.
+            chunk_overlap=_safe_hierarchical_overlap(
+                strategy.max_chunk_size, strategy.overlap_size
+            )
         )
     
     def chunk_document(self, document: LlamaDocument) -> List[BaseNode]:
@@ -694,7 +784,7 @@ class AdaptiveChunker(BaseChunker):
         elif code_score > 2 or table_count > 2:
             return 'hierarchical'
         elif section_count > 2 and len(content) > 2000:
-            return 'semantic'
+            return 'semantic' if SEMANTIC_CHUNKING_ENABLED else 'hierarchical'
         else:
             return 'adaptive'
     
@@ -1344,12 +1434,23 @@ class CodeChunker(BaseChunker):
 
         return nodes
 
+    # Prose sizing for the non-code branch of the code chunker. The code strategy
+    # runs at 8000 tokens to keep functions whole; applying that to prose yields
+    # ~32k-character chunks that are far too coarse to retrieve against -- one chunk
+    # covers several unrelated topics, so its embedding means nothing in particular.
+    PROSE_CHUNK_SIZE = 1000
+    PROSE_CHUNK_OVERLAP = 200
+
     def _chunk_standard(self, document: LlamaDocument) -> List[BaseNode]:
         """Standard chunking for non-code files"""
-        # Use the existing sentence splitter for non-code content
+        # Deliberately NOT self.strategy.max_chunk_size: this method is reached when
+        # the code chunker is handed content that is not code -- which happens
+        # whenever prose trips the code detector, e.g. a design document quoting
+        # snippets. Inheriting the code size there produced chunks averaging 15k
+        # characters and peaking at 42k.
         splitter = SentenceSplitter(
-            chunk_size=self.strategy.max_chunk_size,
-            chunk_overlap=self.strategy.overlap_size
+            chunk_size=min(self.strategy.max_chunk_size, self.PROSE_CHUNK_SIZE),
+            chunk_overlap=min(self.strategy.overlap_size, self.PROSE_CHUNK_OVERLAP)
         )
 
         nodes = splitter.get_nodes_from_documents([document])
@@ -1366,6 +1467,47 @@ class CodeChunker(BaseChunker):
                 })
 
         return nodes
+
+
+def _ensure_source_relationship(nodes, document) -> int:
+    """Point every chunk back at the document it came from. Returns how many were fixed.
+
+    LlamaIndex derives a node's `ref_doc_id` from its SOURCE relationship, and the
+    vector store writes that into `document_id` -- falling back to the literal
+    string "None" when it is missing. A chunk with "None" there cannot be purged,
+    cannot be replaced on re-index, and is not removed when its document is
+    deleted, so it accumulates silently. Measured on a live corpus: 1,404 of
+    36,522 rows, 3.8%, across every parser.
+
+    Only some chunkers inherit the relationship -- the hierarchical path copies it
+    from the splitter's node, while the paths that build a node from a raw text
+    chunk have no parent node to copy from. Setting it here, once, after whichever
+    chunker ran, covers them all and cannot be missed by the next one added.
+    """
+    try:
+        from llama_index.core.schema import NodeRelationship, RelatedNodeInfo
+    except Exception:  # noqa: BLE001
+        return 0
+    doc_id = getattr(document, "id_", None) or getattr(document, "doc_id", None)
+    if not doc_id:
+        return 0
+    fixed = 0
+    for n in nodes:
+        rels = getattr(n, "relationships", None)
+        if rels is None:
+            try:
+                n.relationships = {}
+                rels = n.relationships
+            except Exception:  # noqa: BLE001
+                continue
+        if rels.get(NodeRelationship.SOURCE) is None:
+            rels[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                node_id=doc_id,
+                metadata=dict(getattr(document, "metadata", None) or {}),
+            )
+            fixed += 1
+    return fixed
+
 
 class EnhancedRAGChunker:
     """Main chunking coordinator that manages different chunking strategies"""
@@ -1441,6 +1583,41 @@ class EnhancedRAGChunker:
         # Use adaptive for other files
         return 'adaptive'
 
+    def _reduce_to_leaf_nodes(self, nodes: List[BaseNode]) -> List[BaseNode]:
+        """Drop hierarchical parent nodes, keeping only the leaves.
+
+        HierarchicalNodeParser emits every tier -- a 1000-token parent, its
+        500-token children, their 250-token children -- and a parent contains its
+        children's text verbatim. Indexing all tiers therefore embeds the same
+        prose two or three times (measured: 1.95x the nodes, 43% of the embedded
+        characters duplicated), doubles the vectors stored, and lets one query
+        match both a parent and its own child so the same passage is returned
+        twice at different granularities.
+
+        Leaves go to the vector store, the docstore and BM25 alike, so every
+        retrieval leg sees one consistent granularity. Set
+        GUAARDVARK_INDEX_LEAF_NODES_ONLY=false to index every tier instead.
+        """
+        if os.environ.get("GUAARDVARK_INDEX_LEAF_NODES_ONLY", "true").lower() != "true":
+            return nodes
+        if not nodes:
+            return nodes
+        try:
+            from llama_index.core.node_parser import get_leaf_nodes
+            leaves = get_leaf_nodes(nodes)
+        except Exception as e:
+            logger.debug(f"leaf-node reduction skipped: {e}")
+            return nodes
+        # A flat parser returns every node as a leaf; only act on a real hierarchy,
+        # and never reduce to nothing.
+        if not leaves or len(leaves) >= len(nodes):
+            return nodes
+        logger.info(
+            "Hierarchical chunking: indexing %d leaf node(s), dropping %d parent copies",
+            len(leaves), len(nodes) - len(leaves),
+        )
+        return leaves
+
     def chunk_documents(self, documents: List[LlamaDocument],
                        strategy_name: str = 'auto') -> List[BaseNode]:
         """Chunk multiple documents using specified strategy"""
@@ -1458,8 +1635,71 @@ class EnhancedRAGChunker:
                     logger.warning(f"Unknown strategy '{actual_strategy}', using adaptive")
                     actual_strategy = 'adaptive'
 
+                # Declare the embed budget on the DOCUMENT, before it is split.
+                # LlamaIndex sizes each chunk as `chunk_size - len(metadata)`, and it
+                # reads that metadata from the document being split, not from the nodes
+                # coming out. Excluding keys afterwards therefore fixes what gets
+                # embedded but not what gets *counted* -- so a document carrying a long
+                # path, a heading breadcrumb, tags and notes silently loses most of its
+                # chunk to metadata it was never going to embed. Measured on a real
+                # corpus: a nominal 250-token tier left as little as 44 tokens of text.
+                #
+                # Set here, the exclusions propagate to every split
+                # (build_nodes_from_splits copies them), so the budget reflects what is
+                # actually embedded. Nothing is lost: the values stay on the nodes for
+                # filtering and citation, and contextual_prepender writes source,
+                # section and page into the chunk text itself.
+                _declare_embed_budget(document)
+
                 chunker = self.chunkers[actual_strategy]
                 nodes = chunker.chunk_document(document)
+
+                # Whatever chunker ran, every chunk must know which document it
+                # came from -- that link is what makes it purgeable, replaceable
+                # and deletable later.
+                _orphaned = _ensure_source_relationship(nodes, document)
+                if _orphaned:
+                    logger.debug("Set source relationship on %d/%d chunk(s) from %s",
+                                 _orphaned, len(nodes),
+                                 (getattr(document, "metadata", None) or {}).get(
+                                     "source_filename", "?"))
+
+                # Carry the source document's metadata onto every chunk. The per-chunk
+                # metadata is built fresh by _create_enhanced_metadata, which never sees
+                # the document, so without this the file name, page label and heading
+                # path are lost at chunk time -- and a chunk that cannot name its source
+                # cannot be cited. setdefault so chunk-specific keys always win.
+                doc_meta = getattr(document, "metadata", None) or {}
+                if doc_meta:
+                    for _n in nodes:
+                        if getattr(_n, "metadata", None) is None:
+                            _n.metadata = {}
+                        for _k, _v in doc_meta.items():
+                            _n.metadata.setdefault(_k, _v)
+
+                        # Keep the carried keys out of the embed/LLM metadata budget.
+                        # LlamaIndex counts metadata against chunk size, and the
+                        # hierarchical splitter's smallest tier is a quarter of the
+                        # configured size -- a long file path plus a heading breadcrumb
+                        # overruns it and the whole document drops to a fallback
+                        # splitter ("Metadata length (409) is longer than chunk size
+                        # (250)"). The information is not lost: it stays queryable for
+                        # filters and citations, and contextual_prepender already puts
+                        # source, section and page into the text itself, so leaving it
+                        # in the metadata budget would double-count it.
+                        try:
+                            for _attr in ("excluded_embed_metadata_keys",
+                                          "excluded_llm_metadata_keys"):
+                                _cur = list(getattr(_n, _attr, None) or [])
+                                _drop = set(doc_meta) | (
+                                    set(_n.metadata) & NON_SEMANTIC_CHUNK_METADATA)
+                                for _k in _drop:
+                                    if _k not in _cur:
+                                        _cur.append(_k)
+                                setattr(_n, _attr, _cur)
+                        except Exception:
+                            pass
+
                 all_nodes.extend(nodes)
 
                 self.chunking_stats['total_documents'] += 1
@@ -1471,6 +1711,8 @@ class EnhancedRAGChunker:
             except Exception as e:
                 logger.error(f"Error chunking document {document.doc_id}: {e}")
                 self.chunking_stats['chunking_errors'] += 1
+
+        all_nodes = self._reduce_to_leaf_nodes(all_nodes)
 
         return all_nodes
     
@@ -1532,3 +1774,29 @@ class EnhancedRAGChunker:
             recommended_strategy = 'adaptive'
         
         return recommended_strategy 
+
+
+_shared_chunker = None
+_shared_chunker_lock = threading.Lock()
+
+
+def get_shared_chunker() -> "EnhancedRAGChunker":
+    """One chunker for the process, built on first use.
+
+    Constructing an EnhancedRAGChunker is not cheap: it eagerly builds four
+    chunkers, and two of them are SemanticChunkers that each construct an
+    OllamaEmbedding -- a pair of httpx clients and a settings lookup apiece. Doing
+    that per document meant four HTTP clients and two database round-trips built
+    and discarded for every file ingested. The chunkers hold configuration, not
+    per-document state, so one instance serves the whole process.
+
+    `chunking_stats` becomes cumulative across documents rather than per call;
+    it is a counter, and callers that want per-document figures read the returned
+    node list instead.
+    """
+    global _shared_chunker
+    if _shared_chunker is None:
+        with _shared_chunker_lock:
+            if _shared_chunker is None:
+                _shared_chunker = EnhancedRAGChunker()
+    return _shared_chunker

@@ -165,6 +165,7 @@ class WebAnalysisTool(BaseTool):
     """
 
     name = "analyze_website"
+    read_only = True
     description = "Analyze a website URL to extract content, SEO information, structure, and provide insights"
 
     parameters = {
@@ -187,7 +188,18 @@ class WebAnalysisTool(BaseTool):
             required=False,
             description="Include metadata analysis (meta tags, Open Graph, etc.)",
             default=True
-        )
+        ),
+        "query": ToolParameter(
+            name="query",
+            type="string",
+            required=False,
+            description=(
+                "What the user wants to know from the page. When given, the content "
+                "excerpt is the stretch of the page about it instead of the top of "
+                "the page (which is often navigation)."
+            ),
+            default="",
+        ),
     }
 
     def __init__(self):
@@ -195,15 +207,17 @@ class WebAnalysisTool(BaseTool):
 
     def execute(self, **kwargs) -> ToolResult:
         """Analyze website and return comprehensive report"""
-        if not _is_web_access_allowed():
+        blocked = _web_access_block_reason("analyze websites")
+        if blocked:
             return ToolResult(
                 success=False,
-                error="Web access is disabled. Enable it in Settings to analyze websites."
+                error=blocked
             )
 
         url = kwargs.get("url", "").strip()
         analysis_type = kwargs.get("analysis_type", "full")
         include_metadata = kwargs.get("include_metadata", True)
+        query = (kwargs.get("query") or "").strip() or None
 
         if not url:
             return ToolResult(
@@ -216,7 +230,7 @@ class WebAnalysisTool(BaseTool):
             from backend.api.web_search_api import extract_website_content
 
             # Extract basic content
-            content_result = extract_website_content(url)
+            content_result = extract_website_content(url, query=query)
             
             if not content_result.get("success"):
                 return ToolResult(
@@ -340,16 +354,30 @@ class WebAnalysisTool(BaseTool):
         }
 
 
-def _is_web_access_allowed() -> bool:
-    """Check if web access is enabled in settings."""
+def _web_access_block_reason(action: str) -> str | None:
+    """None when web access is enabled; otherwise the error the tool returns."""
+    disabled = f"Web access is disabled. Enable it in Settings to {action}."
     try:
         from flask import has_app_context
         from backend.utils.settings_utils import get_web_access
         if has_app_context():
-            return get_web_access()
+            return None if get_web_access() else disabled
     except Exception:
         pass
-    return False
+    from backend.utils.backend_http import BackendError, in_mcp_process, request_json
+    if in_mcp_process():
+        # The MCP server has no Flask app; the backend owns the setting.
+        try:
+            data = request_json("GET", "/api/settings/web_access").data or {}
+        except BackendError as e:
+            return f"Could not check whether web access is enabled: {e}"
+        return None if data.get("allow_web_search") else disabled
+    return disabled
+
+
+def _is_web_access_allowed() -> bool:
+    """Check if web access is enabled in settings."""
+    return _web_access_block_reason("use the web") is None
 
 
 class FetchUrlTool(BaseTool):
@@ -361,6 +389,7 @@ class FetchUrlTool(BaseTool):
     """
 
     name = "fetch_url"
+    read_only = True
     description = (
         "Fetch a specific URL and return its page title, meta description, and "
         "main text content (up to ~2000 chars). Use this for ANY question about "
@@ -380,6 +409,17 @@ class FetchUrlTool(BaseTool):
                 "https:// will be added automatically if missing."
             ),
         ),
+        "query": ToolParameter(
+            name="query",
+            type="string",
+            required=False,
+            description=(
+                "What the user wants to know from the page, in their words. When "
+                "given, the returned text is the ~2000-character stretch of the page "
+                "about it; without it, the top of the page, which is often navigation."
+            ),
+            default="",
+        ),
     }
 
     def __init__(self):
@@ -387,10 +427,11 @@ class FetchUrlTool(BaseTool):
 
     def execute(self, **kwargs) -> ToolResult:
         """Fetch the URL and return its text content."""
-        if not _is_web_access_allowed():
+        blocked = _web_access_block_reason("fetch URLs")
+        if blocked:
             return ToolResult(
                 success=False,
-                error="Web access is disabled. Enable it in Settings to fetch URLs.",
+                error=blocked,
             )
 
         url = (kwargs.get("url") or "").strip()
@@ -399,11 +440,12 @@ class FetchUrlTool(BaseTool):
                 success=False,
                 error="url parameter is required",
             )
+        query = (kwargs.get("query") or "").strip() or None
 
         try:
             from backend.api.web_search_api import extract_website_content
 
-            result = extract_website_content(url)
+            result = extract_website_content(url, query=query)
             if not result.get("success"):
                 return ToolResult(
                     success=False,
@@ -439,6 +481,7 @@ class WebSearchTool(BaseTool):
     """
 
     name = "web_search"
+    read_only = True
     description = (
         "Search the web via DuckDuckGo — returns a ranked list of titles, "
         "snippets, and URLs for a query. Use this for open-ended research or "
@@ -468,10 +511,11 @@ class WebSearchTool(BaseTool):
 
     def execute(self, **kwargs) -> ToolResult:
         """Perform web search"""
-        if not _is_web_access_allowed():
+        blocked = _web_access_block_reason("use web search")
+        if blocked:
             return ToolResult(
                 success=False,
-                error="Web access is disabled. Enable it in Settings to use web search."
+                error=blocked
             )
 
         query = kwargs.get("query", "").strip()

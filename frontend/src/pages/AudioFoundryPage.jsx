@@ -1,5 +1,5 @@
 // frontend/src/pages/AudioFoundryPage.jsx
-import React, { useCallback, useEffect, useState, useRef } from "react";
+import React, { useCallback, useEffect, useState, useRef, Suspense } from "react";
 import { formatUiError } from "../utils/uiError";
 import {
   Box,
@@ -38,6 +38,11 @@ import {
 import PageLayout from "../components/layout/PageLayout";
 import WaveformPlayer from "../components/audio/WaveformPlayer";
 import axios from "axios";
+import { ActionButton, DashboardStrip, DashboardTile } from "../components/settings/ui";
+import AlertSnackbar from "../components/common/AlertSnackbar";
+import SettingsIcon from "@mui/icons-material/Settings";
+
+const AudioFoundryModelsModal = React.lazy(() => import("../components/modals/AudioFoundryModelsModal"));
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
 
@@ -109,6 +114,28 @@ const MUSIC_INSTRUMENTS = [
 // Compose chip selections + free text into the LLM rewriter's input. The
 // rewriter expects natural-ish input (it was trained on prose-to-tags), so
 // we just join with commas and let it sort the vocabulary out.
+const idsForTab = (tab, voiceBackend, musicModel) => {
+  if (tab === 0) {
+    if (voiceBackend === "kokoro") return { ids: ["kokoro"], any: false };
+    if (voiceBackend === "chatterbox") return { ids: ["chatterbox"], any: false };
+    return { ids: ["chatterbox", "kokoro"], any: true };
+  }
+  if (tab === 1) {
+    return {
+      ids: [musicModel === "ace-step" ? "ace-step" : "minimax-music3-int8"],
+      any: false,
+    };
+  }
+  return { ids: ["stable-audio-open"], any: false };
+};
+
+const missingCatalogRows = (catalog, ids, any) => {
+  const rows = ids.map((id) => catalog.find((m) => m.id === id)).filter(Boolean);
+  if (!rows.length) return [];
+  if (any) return rows.some((m) => m.installed) ? [] : rows;
+  return rows.filter((m) => !m.installed);
+};
+
 const composeMusicIntent = (genres, moods, instruments, extraText) => {
   const parts = [
     ...genres,
@@ -148,6 +175,30 @@ const AudioFoundryPage = () => {
   const [musicInstruments, setMusicInstruments] = useState([]);
   const [musicExtra, setMusicExtra] = useState("");
   const [musicInstrumental, setMusicInstrumental] = useState(true);
+  // Music backend: the sidecar's ACE-Step (default) or MiniMax Music 3 through
+  // ComfyUI, which sings tagged lyrics; offered only when its weights are
+  // installed (the registry says), otherwise the option names the modal.
+  const [musicModel, setMusicModel] = useState("ace-step");
+  const [musicLyrics, setMusicLyrics] = useState("");
+  const [catalog, setCatalog] = useState([]);
+  const [pluginInfo, setPluginInfo] = useState({ running: false, enabled: false, status: "unknown" });
+  const [modelsModalOpen, setModelsModalOpen] = useState(false);
+  const [highlightModelId, setHighlightModelId] = useState(null);
+  const [toast, setToast] = useState({ open: false, message: "", severity: "info" });
+  const showMessage = useCallback((message, severity = "info") => {
+    setToast({ open: true, message, severity });
+  }, []);
+  const refreshCatalog = useCallback(() => {
+    axios.get(`${API_BASE}/audio-foundry/models`)
+      .then(({ data }) => {
+        if (!data?.success) return;
+        setCatalog(data.models || []);
+        setPluginInfo(data.plugin || { running: false, enabled: false, status: "unknown" });
+      })
+      .catch(() => {});
+  }, []);
+  useEffect(() => { refreshCatalog(); }, [refreshCatalog]);
+  const music3Ready = catalog.find((m) => m.id === "minimax-music3-int8")?.installed ?? null;
   const [musicPolish, setMusicPolish] = useState(true);
   const [musicPreview, setMusicPreview] = useState(null);
   const [musicPolishing, setMusicPolishing] = useState(false);
@@ -312,7 +363,25 @@ const AudioFoundryPage = () => {
     // The poll loop will observe status === "cancelled" and reset.
   };
 
+  const tabNeed = idsForTab(activeTab, voiceBackend, musicModel);
+  const missingRows = missingCatalogRows(catalog, tabNeed.ids, tabNeed.any);
+  const pluginRunning = !!pluginInfo.running;
+  const openModels = (modelId) => {
+    setHighlightModelId(modelId || missingRows[0]?.id || null);
+    setModelsModalOpen(true);
+  };
+
   const generateAudio = async (type) => {
+    if (!pluginRunning) {
+      setError("Audio Foundry is not running. Start it from Manage models.");
+      openModels();
+      return;
+    }
+    if (missingRows.length) {
+      setError(`${missingRows[0].name} is not installed. Install it first.`);
+      openModels(missingRows[0].id);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
@@ -454,6 +523,17 @@ const AudioFoundryPage = () => {
       negativePrompt = musicPreview.negative_prompt || "";
     }
 
+    if (musicModel === "ace-step" && !pluginRunning) {
+      setError("Audio Foundry is not running. Start it from Manage models.");
+      openModels();
+      return;
+    }
+    if (missingRows.length) {
+      setError(`${missingRows[0].name} is not installed. Install it first.`);
+      openModels(missingRows[0].id);
+      return;
+    }
+
     setLoading(true);
     setError(null);
     try {
@@ -463,6 +543,8 @@ const AudioFoundryPage = () => {
         instrumental_only: musicInstrumental,
       };
       if (negativePrompt) payload.negative_prompt = negativePrompt;
+      if (!musicInstrumental && musicLyrics.trim()) payload.lyrics = musicLyrics.trim();
+      if (musicModel !== "ace-step") payload.model = musicModel;
 
       const res = await axios.post(
         `${API_BASE}/audio-foundry/generate/music`,
@@ -489,10 +571,70 @@ const AudioFoundryPage = () => {
     return "#ff9800"; // FX: Orange
   };
 
+  const installedCount = catalog.filter((m) => m.installed).length;
+  const missingCount = catalog.filter((m) => !m.installed).length;
+
   return (
-    <PageLayout title="Audio Studio" subtitle="Professional AI Audio Production">
+    <PageLayout
+      title="Audio Studio"
+      subtitle="Professional AI Audio Production"
+      actions={
+        <ActionButton onClick={() => openModels()}>Manage models</ActionButton>
+      }
+    >
       <Box sx={{ maxWidth: 1200, mx: "auto", mt: 2, px: 2 }}>
-        <Grid container spacing={3}>
+        <DashboardStrip>
+          <DashboardTile
+            label="Plugin"
+            value={pluginRunning ? "Running" : (pluginInfo.status || "Stopped")}
+            sub={pluginRunning ? "Audio Foundry" : "Start from Manage models"}
+            tone={pluginRunning ? "ok" : "error"}
+            onClick={() => openModels()}
+          />
+          <DashboardTile
+            label="Weights"
+            value={catalog.length ? `${installedCount} installed` : "Checking"}
+            sub={missingCount ? `${missingCount} missing` : (catalog.length ? "ready" : "")}
+            tone={missingCount ? "warn" : catalog.length ? "ok" : "off"}
+            onClick={() => openModels()}
+          />
+        </DashboardStrip>
+
+        {!pluginRunning && (
+          <Alert
+            severity="warning"
+            sx={{ mt: 2, mb: 1 }}
+            action={
+              <Button color="inherit" size="small" startIcon={<SettingsIcon />} onClick={() => openModels()}>
+                Manage models
+              </Button>
+            }
+          >
+            Audio Foundry is not running. Start the plugin, then install any missing weights.
+          </Alert>
+        )}
+
+        {pluginRunning && missingRows.length > 0 && (
+          <Alert
+            severity="warning"
+            sx={{ mt: 2, mb: 1 }}
+            action={
+              <Button
+                color="inherit"
+                size="small"
+                startIcon={<SettingsIcon />}
+                onClick={() => openModels(missingRows[0].id)}
+              >
+                Download {missingRows[0].name}
+              </Button>
+            }
+          >
+            <strong>{missingRows[0].name} is not installed.</strong> Generate will not
+            download it in the background — install it first.
+          </Alert>
+        )}
+
+        <Grid container spacing={3} sx={{ mt: 0.5 }}>
           {/* Left Panel: Controls */}
           <Grid item xs={12} md={5}>
             <Paper elevation={4} sx={{ borderRadius: 3, overflow: "hidden", border: "1px solid rgba(255,255,255,0.05)" }}>
@@ -744,7 +886,35 @@ const AudioFoundryPage = () => {
                         }
                         label={<Typography variant="caption">Instrumental only</Typography>}
                       />
+                      <TextField
+                        select
+                        size="small"
+                        label="Music model"
+                        value={musicModel}
+                        onChange={(e) => setMusicModel(e.target.value)}
+                        sx={{ minWidth: 220 }}
+                        SelectProps={{ native: true }}
+                      >
+                        <option value="ace-step">ACE-Step (Audio Foundry)</option>
+                        <option value="minimax-music3-int8" disabled={music3Ready === false}>
+                          {music3Ready === false ? "MiniMax Music 3 (install in Manage models)" : "MiniMax Music 3 (sings lyrics)"}
+                        </option>
+                      </TextField>
                     </Box>
+                    {!musicInstrumental && (
+                      <TextField
+                        label="Lyrics (optional)"
+                        multiline
+                        minRows={3}
+                        maxRows={8}
+                        size="small"
+                        value={musicLyrics}
+                        onChange={(e) => setMusicLyrics(e.target.value)}
+                        placeholder={"[Verse]\nwe drove all night under a paper moon\n[Chorus]\n..."}
+                        helperText="Section tags like [Verse], [Chorus], [Bridge] shape the song; MiniMax Music 3 sings them, ACE-Step follows them where it can."
+                        fullWidth
+                      />
+                    )}
 
                     <Box>
                       <Typography variant="caption" fontWeight="bold">Duration: {duration} seconds</Typography>
@@ -961,6 +1131,21 @@ const AudioFoundryPage = () => {
           </Grid>
         </Grid>
       </Box>
+      <Suspense fallback={null}>
+        <AudioFoundryModelsModal
+          open={modelsModalOpen}
+          onClose={() => setModelsModalOpen(false)}
+          showMessage={showMessage}
+          highlightModelId={highlightModelId}
+          onChanged={refreshCatalog}
+        />
+      </Suspense>
+      <AlertSnackbar
+        open={toast.open}
+        onClose={() => setToast((t) => ({ ...t, open: false }))}
+        severity={toast.severity}
+        message={toast.message}
+      />
     </PageLayout>
   );
 };

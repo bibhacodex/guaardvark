@@ -5,7 +5,7 @@
 // Mirrors VoiceSettingsContent's Whisper installer — same alert + button shape.
 
 import React, { useEffect, useState, useCallback } from 'react';
-import { Box, Button, CircularProgress, Typography, Tooltip } from '@mui/material';
+import { Box, Button, CircularProgress, Collapse, Typography, Tooltip } from '@mui/material';
 import MuiAlert from '@mui/material/Alert';
 import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutline';
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
@@ -16,6 +16,7 @@ import StopIcon from '@mui/icons-material/Stop';
 import RestartAltIcon from '@mui/icons-material/RestartAlt';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 
+import { ActionButton, Hint, Line, StatusPill } from './ui';
 import {
   getDisplayStatus,
   installDisplay,
@@ -73,6 +74,7 @@ const AgentDisplaySection = ({ showMessage }) => {
   const [error, setError] = useState(null);
   // Set when the host needs a human to run apt itself (sudo wants a password).
   const [manualInstall, setManualInstall] = useState(null);
+  const [showComponents, setShowComponents] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -184,7 +186,17 @@ const AgentDisplaySection = ({ showMessage }) => {
     setControlAction('restart');
     showMessage?.('Restarting agent display…', 'info');
     try {
-      await stopDisplay({ force: true }).catch(() => {}); // tolerate stop failures (might already be down)
+      // A stop the backend refuses (409: an agent task or training holds the
+      // display) ends the restart here. Any other stop failure means it was
+      // already down, so the start still runs.
+      try {
+        await stopDisplay({ force: true });
+      } catch (stopErr) {
+        if (stopErr?.status === 409) {
+          showMessage?.(`Restart refused: ${stopErr.message}`, 'warning');
+          return;
+        }
+      }
       const startResult = await startDisplay();
       if (startResult.success) {
         showMessage?.('Agent display restarted.', 'success');
@@ -200,16 +212,12 @@ const AgentDisplaySection = ({ showMessage }) => {
   };
 
   if (loading && !status) {
-    return (
-      <Box sx={{ display: 'flex', justifyContent: 'center', py: 2 }}>
-        <CircularProgress size={20} />
-      </Box>
-    );
+    return <CircularProgress size={16} />;
   }
 
   if (error) {
     return (
-      <MuiAlert severity="error" sx={{ mb: 1 }}>
+      <MuiAlert severity="error" sx={{ py: 0.25 }}>
         {error}
       </MuiAlert>
     );
@@ -234,11 +242,75 @@ const AgentDisplaySection = ({ showMessage }) => {
           + 'answer that prompt. Run this in a terminal, then click Recheck.',
       }
       : null);
+  const isRunning = !!status.display_running;
+  const pill = needsInstall
+    ? { tone: 'warn', label: `Display :99 · ${[...missingApt, ...missingPip].length} missing` }
+    : isRunning
+      ? { tone: 'ok', label: 'Display :99 live' }
+      : { tone: 'neutral', label: 'Display :99 not running' };
 
   return (
-    <Box>
-      {pendingManual ? (
-        <MuiAlert severity="warning" sx={{ mb: 1.5 }}>
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+      <Line>
+        <StatusPill tone={pill.tone} label={pill.label} />
+        {needsInstall && !pendingManual && (
+          <ActionButton
+            startIcon={<FileDownloadIcon />}
+            onClick={onInstall}
+            loading={installing}
+            tooltip={status.install_method === 'pkexec'
+              ? 'Installs via apt-get and pip; your desktop will ask for your password.'
+              : 'Installs via apt-get and pip.'}
+          >
+            Install missing
+          </ActionButton>
+        )}
+        {!needsInstall && isRunning && (
+          <>
+            <ActionButton
+              startIcon={<RestartAltIcon />}
+              onClick={onRestart}
+              loading={controlAction === 'restart'}
+              disabled={controlAction !== null}
+            >
+              Restart
+            </ActionButton>
+            <ActionButton
+              startIcon={<StopIcon />}
+              onClick={onStop}
+              loading={controlAction === 'stop'}
+              disabled={controlAction !== null}
+              tooltip="Stops Xvfb, x11vnc and the window manager. Refused while an agent task or training is using the display."
+            >
+              Stop
+            </ActionButton>
+          </>
+        )}
+        {!needsInstall && !isRunning && (
+          <ActionButton
+            startIcon={<PlayArrowIcon />}
+            onClick={onStart}
+            loading={controlAction === 'start'}
+            disabled={controlAction !== null}
+            tooltip="Starts Xvfb, x11vnc, openbox and tint2 on :99. Can take up to a minute."
+          >
+            Start display
+          </ActionButton>
+        )}
+        <ActionButton kind="link" startIcon={<RefreshIcon />} onClick={refresh} disabled={loading || installing}>
+          Recheck
+        </ActionButton>
+        <ActionButton kind="link" onClick={() => setShowComponents((v) => !v)}>
+          {showComponents ? 'Hide components' : 'Components'}
+        </ActionButton>
+      </Line>
+
+      {needsInstall && !pendingManual && (
+        <Hint>Missing: {[...missingApt, ...missingPip].join(', ')}.</Hint>
+      )}
+
+      {pendingManual && (
+        <MuiAlert severity="warning" sx={{ py: 0.5 }}>
           <Typography variant="body2" sx={{ mb: 1 }}>{pendingManual.reason}</Typography>
           <Box
             sx={{
@@ -275,105 +347,27 @@ const AgentDisplaySection = ({ showMessage }) => {
             </Typography>
           )}
         </MuiAlert>
-      ) : needsInstall ? (
-        <MuiAlert
-          severity="warning"
-          sx={{ mb: 1.5 }}
-          action={
-            <Button
-              color="inherit"
-              size="small"
-              startIcon={installing ? <CircularProgress size={16} color="inherit" /> : <FileDownloadIcon />}
-              onClick={onInstall}
-              disabled={installing}
-            >
-              {installing ? 'Installing…' : 'Install Missing'}
-            </Button>
-          }
-        >
-          Agent Display is missing components: {[...missingApt, ...missingPip].join(', ')}.
-          {status.install_method === 'pkexec'
-            ? ' Click to install — your desktop will ask for your password.'
-            : ' Click to install via apt-get + pip.'}
-        </MuiAlert>
-      ) : status.display_running ? (
-        <MuiAlert
-          severity="success"
-          sx={{ mb: 1.5 }}
-          action={
-            <Box sx={{ display: 'flex', gap: 0.5 }}>
-              <Button
-                color="inherit"
-                size="small"
-                startIcon={controlAction === 'restart' ? <CircularProgress size={16} color="inherit" /> : <RestartAltIcon />}
-                onClick={onRestart}
-                disabled={controlAction !== null}
-              >
-                {controlAction === 'restart' ? 'Restarting…' : 'Restart'}
-              </Button>
-              <Button
-                color="inherit"
-                size="small"
-                startIcon={controlAction === 'stop' ? <CircularProgress size={16} color="inherit" /> : <StopIcon />}
-                onClick={onStop}
-                disabled={controlAction !== null}
-              >
-                {controlAction === 'stop' ? 'Stopping…' : 'Stop'}
-              </Button>
-            </Box>
-          }
-        >
-          Agent Display is fully installed and running on :99.
-        </MuiAlert>
-      ) : (
-        <MuiAlert
-          severity="info"
-          sx={{ mb: 1.5 }}
-          action={
-            <Button
-              color="inherit"
-              size="small"
-              startIcon={controlAction === 'start' ? <CircularProgress size={16} color="inherit" /> : <PlayArrowIcon />}
-              onClick={onStart}
-              disabled={controlAction !== null}
-            >
-              {controlAction === 'start' ? 'Starting…' : 'Start Display'}
-            </Button>
-          }
-        >
-          All dependencies installed. Display :99 is not running yet.
-        </MuiAlert>
       )}
 
-      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
-        {COMPONENT_ORDER.map((key) => {
-          const comp = components[key];
-          if (!comp) return null;
-          const label = COMPONENT_LABELS[key] || key;
-          return (
-            <StatusRow
-              key={key}
-              label={label}
-              ok={!!comp.installed}
-              version={comp.version}
-              hint={!comp.installed && comp.apt_package ? `apt: ${comp.apt_package}` :
-                    !comp.installed && comp.pip_package ? `pip: ${comp.pip_package}` : null}
-            />
-          );
-        })}
-      </Box>
-
-      <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: 1 }}>
-        <Button
-          size="small"
-          variant="text"
-          startIcon={<RefreshIcon fontSize="small" />}
-          onClick={refresh}
-          disabled={loading || installing}
-        >
-          Recheck
-        </Button>
-      </Box>
+      <Collapse in={showComponents} unmountOnExit>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+          {COMPONENT_ORDER.map((key) => {
+            const comp = components[key];
+            if (!comp) return null;
+            const label = COMPONENT_LABELS[key] || key;
+            return (
+              <StatusRow
+                key={key}
+                label={label}
+                ok={!!comp.installed}
+                version={comp.version}
+                hint={!comp.installed && comp.apt_package ? `apt: ${comp.apt_package}` :
+                      !comp.installed && comp.pip_package ? `pip: ${comp.pip_package}` : null}
+              />
+            );
+          })}
+        </Box>
+      </Collapse>
     </Box>
   );
 };

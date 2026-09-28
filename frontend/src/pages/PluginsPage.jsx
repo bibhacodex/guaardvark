@@ -68,6 +68,7 @@ import {
   getVisionCameraStatus,
 } from '../api/pluginsService';
 import { getGpuStatus } from '../api/gpuService';
+import OllamaLifecycleSection from '../components/settings/OllamaLifecycleSection';
 
 // ── Constants ──────────────────────────────────────────────────────────
 const TOTAL_VRAM_MB = 16384; // 16GB
@@ -495,6 +496,18 @@ const PluginCard = ({ plugin, onAction, onConfigOpen, showMessage }) => {
           </Tooltip>
         </Box>
       </CardActions>
+
+      {/* Ollama alone owns start/stop behaviour in .env; the switches live on its
+          card rather than behind the settings modal so the choice sits next to the
+          service it governs. */}
+      {plugin.id === 'ollama' && (
+        <>
+          <Divider />
+          <Box sx={{ px: 2, pb: 2, pt: 0.5 }}>
+            <OllamaLifecycleSection title="Lifecycle" />
+          </Box>
+        </>
+      )}
     </Card>
   );
 };

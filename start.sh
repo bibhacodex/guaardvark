@@ -24,6 +24,7 @@ START_TIME=$(date +%s)
 TOTAL_STEPS=11
 
 FAST_START=0
+FORCE_CLEAN=0
 TEST_MODE=0
 VOICE_CHECK=1
 VOICE_AVAILABLE=1
@@ -35,7 +36,14 @@ LAUNCH_BROWSER=0
 if [ "${GUAARDVARK_APP_MODE}" = "true" ] || [ "${GUAARDVARK_APP_MODE}" = "1" ]; then
   LAUNCH_BROWSER=1
 fi
+REQUESTED_PROFILE=""
+EXPECT_PROFILE=0
+VOICE_FLAG_GIVEN=0
+EXTERNAL_OLLAMA_FLAG=0
 for arg in "$@"; do
+  if [ "$EXPECT_PROFILE" = 1 ]; then
+    REQUESTED_PROFILE="$arg"; EXPECT_PROFILE=0; continue
+  fi
   case "$arg" in
     --help|-h)
       echo "Guaardvark Start Script"
@@ -43,7 +51,10 @@ for arg in "$@"; do
       echo "Usage: ./start.sh [OPTIONS]"
       echo ""
       echo "Options:"
-      echo "  --fast              Skip dependency checks and builds"
+      echo "  --fast              Reuse the venv and node_modules as they are: no package installs,"
+      echo "                     no frontend build, no preflight import check (FAST_START=1)"
+      echo "  --clean             Clear Python bytecode and rebuild the frontend even if the"
+      echo "                     code is unchanged since the last launch"
       echo "  --test              Run with comprehensive health diagnostics"
       echo "  --no-voice          Skip voice API health check"
       echo "  --parallel          Run checks in parallel"
@@ -54,16 +65,24 @@ for arg in "$@"; do
       echo "  --no-auto-build    Disable automatic frontend rebuild"
       echo "  --skip-migrations  Skip database migration checks"
       echo "  --skip-postgres    Skip PostgreSQL setup (for external DB users)"
+      echo "  --external-ollama  Use an Ollama you run yourself: never start it, never stop it"
+      echo "                     (persisted as GUAARDVARK_OLLAMA_EXTERNAL=1 in .env)"
       echo "  --app-mode         Launch browser on startup"
       echo "  --no-browser       Do not launch browser"
       echo "  --discord          Also start the Discord bot plugin"
       echo "  --plugins          Start all enabled plugins after backend is up"
+      echo "  --profile NAME     Select a profile (workstation, creator, or an extension's);"
+      echo "                     written to .env so it persists. See backend/profiles/README.md"
       echo "  --help, -h         Show this help"
       exit 0
       ;;
     --fast) FAST_START=1 ;;
+    --clean) FORCE_CLEAN=1 ;;
+    --external-ollama) EXTERNAL_OLLAMA_FLAG=1 ;;
     --test) TEST_MODE=1 ;;
-    --no-voice) VOICE_CHECK=0 ;;
+    --no-voice) VOICE_CHECK=0; VOICE_FLAG_GIVEN=1 ;;
+    --profile) EXPECT_PROFILE=1 ;;
+    --profile=*) REQUESTED_PROFILE="${arg#--profile=}" ;;
     --parallel) PARALLEL_CHECKS=1 ;;
     --force-ports) FORCE_PORTS=1 ;;
     --no-force-ports) FORCE_PORTS=0 ;;
@@ -79,7 +98,8 @@ for arg in "$@"; do
   esac
 done
 
-if [ -n "$CI" ] || [ -n "$CODEX_ENV" ]; then
+# GUAARDVARK_CI_BOOT=1 is the CI job that boots the app on purpose (ci.yml, macos-boot).
+if { [ -n "$CI" ] || [ -n "$CODEX_ENV" ]; } && [ "${GUAARDVARK_CI_BOOT:-0}" != 1 ]; then
   vader_info "CI or Codex environment detected. Exiting start.sh."
   exit 0
 fi
@@ -101,6 +121,7 @@ START_PID_FILE="$SCRIPT_DIR/.start_cache/start.sh.pid"
 mkdir -p "$SCRIPT_DIR/.start_cache"
 # shellcheck source=scripts/lib/start_lock.sh
 . "$SCRIPT_DIR/scripts/lib/start_lock.sh"
+. "$SCRIPT_DIR/scripts/lib/venv_pins.sh"
 if [ -f "$START_PID_FILE" ]; then
     _prev_pid=$(cat "$START_PID_FILE" 2>/dev/null)
     if [ "$(start_lock_guard_decision "$_prev_pid")" = "live" ]; then
@@ -168,8 +189,13 @@ if [ -f "$MANAGER_SCRIPT" ]; then
             "$MANAGER_SCRIPT" repair "$SCRIPT_DIR" || vader_warn "Auto-repair had issues, continuing with startup..."
         fi
     else
-        vader_info "Fresh or incomplete install detected (no usable venv). Running system-manager repair..."
-        "$MANAGER_SCRIPT" repair "$SCRIPT_DIR" || vader_warn "System-manager repair had issues; step 5 bootstrap will take over."
+        # No usable venv: step 5 (ensure_python_env) creates it with the Python
+        # 3.12 that platform_ensure_python resolves below, then bootstraps every
+        # requirements file. Running system-manager repair here first built the
+        # venv from whatever `python3` is — 3.14 on Ubuntu 26.04 — and pip then
+        # compiled numpy/pandas from source and failed, minutes before step 5
+        # threw that venv away and started over (client box, 2026-08-31).
+        vader_info "No usable Python venv yet — step 5 creates it with Python 3.12 and bootstraps dependencies."
     fi
 fi
 
@@ -210,6 +236,57 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   . "$SCRIPT_DIR/.env"
   set +a
   export GUAARDVARK_ROOT="$SCRIPT_DIR"
+fi
+
+# ─── Profile ──────────────────────────────────────────────────────────────────
+# `--profile NAME` is persisted to .env so the backend (which reads .env itself)
+# and every later start agree. The profile then fills in defaults for env keys
+# .env did not set — an explicit value always wins, and `workstation` sets nothing.
+if [ -n "$REQUESTED_PROFILE" ]; then
+  if ! printf '%s' "$REQUESTED_PROFILE" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$'; then
+    echo "Invalid profile name: $REQUESTED_PROFILE" >&2
+    exit 1
+  fi
+  touch "$SCRIPT_DIR/.env"
+  if grep -q '^GUAARDVARK_PROFILE=' "$SCRIPT_DIR/.env"; then
+    sed -i.bak "s/^GUAARDVARK_PROFILE=.*/GUAARDVARK_PROFILE=$REQUESTED_PROFILE/" "$SCRIPT_DIR/.env" && rm -f "$SCRIPT_DIR/.env.bak"
+  else
+    echo "GUAARDVARK_PROFILE=$REQUESTED_PROFILE" >> "$SCRIPT_DIR/.env"
+  fi
+  export GUAARDVARK_PROFILE="$REQUESTED_PROFILE"
+fi
+if [ "$EXTERNAL_OLLAMA_FLAG" = 1 ]; then
+  touch "$SCRIPT_DIR/.env"
+  if grep -q '^GUAARDVARK_OLLAMA_EXTERNAL=' "$SCRIPT_DIR/.env"; then
+    sed -i.bak "s/^GUAARDVARK_OLLAMA_EXTERNAL=.*/GUAARDVARK_OLLAMA_EXTERNAL=1/" "$SCRIPT_DIR/.env" && rm -f "$SCRIPT_DIR/.env.bak"
+  else
+    echo "GUAARDVARK_OLLAMA_EXTERNAL=1" >> "$SCRIPT_DIR/.env"
+  fi
+  export GUAARDVARK_OLLAMA_EXTERNAL=1
+fi
+_PROFILE_EXPORTS="$("$PYTHON_CMD" "$SCRIPT_DIR/backend/profiles/__main__.py" export --shell 2>"$SCRIPT_DIR/.start_cache/profile.err" || true)"
+if [ -n "$_PROFILE_EXPORTS" ]; then
+  eval "$_PROFILE_EXPORTS"
+fi
+if [ -s "$SCRIPT_DIR/.start_cache/profile.err" ]; then
+  while IFS= read -r _line; do echo "  ⚠ profile: ${_line#\# WARNING: }"; done < "$SCRIPT_DIR/.start_cache/profile.err"
+fi
+# startup skips the profile asks for, unless the flag was passed explicitly
+if [ "$VOICE_FLAG_GIVEN" = 0 ] && [ "${GUAARDVARK_PROFILE_VOICE_CHECK:-1}" = "0" ]; then
+  VOICE_CHECK=0
+fi
+
+# ─── Backend port ─────────────────────────────────────────────────────────────
+# macOS reserves 5000 for the AirPlay Receiver (Monterey and later), so the default
+# there is 5055. An explicit FLASK_PORT (environment or .env) always wins. The chosen
+# default is written to .env so the backend, Vite and the CLI agree on every start.
+if [ -z "${FLASK_PORT:-}" ] && is_macos; then
+  FLASK_PORT=5055
+  touch "$SCRIPT_DIR/.env"
+  if ! grep -q '^FLASK_PORT=' "$SCRIPT_DIR/.env"; then
+    echo "FLASK_PORT=$FLASK_PORT" >> "$SCRIPT_DIR/.env"
+  fi
+  export FLASK_PORT
 fi
 
 # Generate SECRET_KEY if not set — prevents "Using default SECRET_KEY" warning.
@@ -314,6 +391,42 @@ if ! command_exists timeout; then
     fi
 fi
 
+# host_resolves NAME: does the system resolver answer for NAME? `getent` is glibc
+# only; macOS has none, so without the fallbacks every Mac start reported broken DNS.
+# True when package installs can reach their index. GUAARDVARK_OFFLINE=1 forces
+# "no" (Flight Mode, or a known outage). Behind a proxy, local DNS is the wrong
+# probe (see ensure_backend_python_environment), so a proxy counts as reachable.
+install_network_up() {
+    [ "${GUAARDVARK_OFFLINE:-0}" = "1" ] && return 1
+    [ -n "${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}" ] && return 0
+    host_resolves "$1"
+}
+
+# Fingerprint of the checkout: HEAD, uncommitted edits to tracked files, and the
+# contents of untracked source files. Extra arguments are mixed in (lockfile,
+# build-time env). Prints nothing outside a git checkout, so callers fall back to
+# always clearing/rebuilding there.
+code_fingerprint() {
+    git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+    {
+        git -C "$SCRIPT_DIR" rev-parse HEAD
+        git -C "$SCRIPT_DIR" diff HEAD --binary -- . ':(exclude)docs/local-workspace-only'
+        git -C "$SCRIPT_DIR" ls-files -z --others --exclude-standard -- backend plugins cli scripts frontend/src \
+            | (cd "$SCRIPT_DIR" && xargs -0 -r sha256sum)
+        printf '%s\n' "$@"
+    } 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+
+host_resolves() {
+    if command_exists getent; then
+        timeout 5 getent hosts "$1" >/dev/null 2>&1
+    elif command_exists dscacheutil; then
+        timeout 5 dscacheutil -q host -a name "$1" 2>/dev/null | grep -q '^ip'
+    else
+        timeout 5 python3 -c 'import socket, sys; socket.gethostbyname(sys.argv[1])' "$1" >/dev/null 2>&1
+    fi
+}
+
 # Resolve the EFFECTIVE enabled state for a plugin:
 #   1. data/plugin_state.json's `user_enabled[<id>]` if the user has toggled it
 #   2. plugin.json's `config.enabled` otherwise (manifest default)
@@ -340,6 +453,11 @@ try:
         sys.exit(0)
 except (OSError, ValueError):
     pass
+# The active profile's plugin defaults (same string PluginMetadata.from_json_file reads).
+for item in os.environ.get("GUAARDVARK_PROFILE_PLUGIN_DEFAULTS", "").split(","):
+    if "=" in item and item.split("=", 1)[0].strip() == plugin_id:
+        print("True" if item.split("=", 1)[1].strip().lower() in ("1", "true", "yes", "on") else "False")
+        sys.exit(0)
 try:
     with open(plugin_json) as f:
         cfg = (json.load(f) or {}).get("config", {})
@@ -819,7 +937,7 @@ relaunch_backend_if_dead() {
     fi
     vader_warn "Backend not responding and port $port is free — attempting a one-shot relaunch..."
     rm -f "$SCRIPT_DIR/pids/backend.pid" 2>/dev/null
-    nohup env GUAARDVARK_ROOT="$SCRIPT_DIR" FLASK_PORT="$port" GUAARDVARK_MIGRATIONS_VERIFIED="${GUAARDVARK_MIGRATIONS_VERIFIED:-}" "$VENV_DIR/bin/python" -m backend.app >> "$BACKEND_STARTUP_LOG_FILE" 2>&1 &
+    nohup env GUAARDVARK_ROOT="$SCRIPT_DIR" FLASK_PORT="$port" VITE_PORT="$VITE_PORT" GUAARDVARK_MIGRATIONS_VERIFIED="${GUAARDVARK_MIGRATIONS_VERIFIED:-}" "$VENV_DIR/bin/python" -m backend.app >> "$BACKEND_STARTUP_LOG_FILE" 2>&1 &
     local spawned=$!
     if ! is_port_listening "$port" 90 "Backend (self-heal)"; then
         if [ -n "$spawned" ] && kill -0 "$spawned" 2>/dev/null; then
@@ -1085,7 +1203,11 @@ ensure_venv_python_version() {
 # packages.
 BOOTSTRAP_STAMP="$VENV_DIR/.guaardvark_bootstrap_ts"
 venv_reqs_fingerprint() {
-    cat "$BACKEND_DIR/requirements-base.txt" "$BACKEND_DIR/requirements.txt" 2>/dev/null \
+    # constraints.txt and requirements-cv.txt shape the same venv (caps and CV
+    # pins) — a change to either must invalidate the stamp too, or a box with a
+    # stamped-but-drifted venv never picks the fix up.
+    cat "$BACKEND_DIR/requirements-base.txt" "$BACKEND_DIR/requirements.txt" \
+        "$BACKEND_DIR/requirements-cv.txt" "$BACKEND_DIR/constraints.txt" 2>/dev/null \
         | sha256sum 2>/dev/null | awk '{print $1}'
 }
 
@@ -1113,6 +1235,9 @@ except Exception:
 # Can we SKIP the bootstrap? Functional AND provably complete. Use this only for
 # the skip decision, never to verify a bootstrap that just ran.
 backend_venv_healthy() {
+    # Set when the only fault is a requirements change since the last bootstrap:
+    # the venv works, it is just behind. Offline, that venv still starts.
+    VENV_REQS_STALE=0
     backend_venv_functional || return 1
 
     # The import probe only names packages from requirements-base.txt. If
@@ -1133,7 +1258,10 @@ backend_venv_healthy() {
     recorded="$(awk -F: '/^reqs:/ {print $2; exit}' "$BOOTSTRAP_STAMP" 2>/dev/null || true)"
     if [ -n "$recorded" ]; then
         current="$(venv_reqs_fingerprint)"
-        [ "$recorded" = "$current" ] || return 1
+        if [ "$recorded" != "$current" ]; then
+            VENV_REQS_STALE=1
+            return 1
+        fi
     fi
     return 0
 }
@@ -1162,7 +1290,7 @@ ensure_pip_tmpdir() {
     # Network hardening for EVERY pip call this process spawns (requirements
     # installs, requirements-cv, install_pytorch.sh, dep_reconciler). pip's
     # default socket timeout is 15s — too tight for multi-hundred-MB wheels on
-    # links that stall under sustained load. ALPACA 2026-08-13: a mid-download
+    # links that stall under sustained load. Observed 2026-08-13: a mid-download
     # read timeout on files.pythonhosted.org (fetching the 35MB av wheel)
     # aborted the whole bootstrap. Operator-set values win.
     export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-60}"
@@ -1220,7 +1348,7 @@ ensure_pip_tmpdir() {
 # known-fixable signatures (missing dev headers → apt once; transient network
 # fault → back off and retry, downloads resume from PIP_CACHE_DIR so every
 # retry makes forward progress); else fail LOUD with the actual first error.
-# ALPACA 2026-08-13: one PyPI read timeout mid-wheel aborted the entire
+# Observed 2026-08-13: one PyPI read timeout mid-wheel aborted the entire
 # bootstrap because nothing retried at this level.
 PIP_NET_FAULT_RE="Read timed out|ReadTimeoutError|Connection broken|ConnectionResetError|Connection aborted|NewConnectionError|ProtocolError|IncompleteRead|Temporary failure in name resolution|Network is unreachable"
 pip_install_requirements() {
@@ -1288,6 +1416,14 @@ ensure_backend_python_environment() {
         needed=1
     fi
 
+    # A working venv whose requirements changed is updated when the network is
+    # there; without it, start on what is installed rather than refuse to start.
+    if [ "$needed" -eq 1 ] && [ "${VENV_REQS_STALE:-0}" -eq 1 ] && ! install_network_up pypi.org; then
+        vader_warn "Requirements changed since the last install, but the package index is unreachable."
+        vader_info "Starting on the installed packages; the next ./start.sh with a network connection updates them."
+        return 0
+    fi
+
     if [ "$needed" -eq 1 ]; then
         # DNS sanity probe before multi-GB downloads. On the 24.04 client box a
         # full resolution outage ("Temporary failure in name resolution" for
@@ -1317,9 +1453,13 @@ ensure_backend_python_environment() {
                 vader_info "Continuing anyway in case a warm pip cache covers this run..."
             fi
             unset _gv_pp _gv_ph _gv_pt
-        elif ! timeout 5 getent hosts pypi.org >/dev/null 2>&1; then
+        elif ! host_resolves pypi.org; then
             vader_error "DNS resolution is broken on this box (cannot resolve pypi.org) — dependency installs WILL fail."
-            vader_error "Try: sudo systemctl restart systemd-resolved   (check: resolvectl status)"
+            if is_macos; then
+                vader_error "Check the network connection and DNS servers (System Settings → Network; check: scutil --dns)"
+            else
+                vader_error "Try: sudo systemctl restart systemd-resolved   (check: resolvectl status)"
+            fi
             vader_info "Continuing anyway in case this box is intentionally offline..."
         fi
         unset _gv_proxy
@@ -1330,6 +1470,20 @@ ensure_backend_python_environment() {
         # requirements-cv, install_pytorch.sh, the reconciler). Exported, so the
         # install_pytorch.sh subprocess inherits it instead of re-deriving it.
         ensure_pip_tmpdir
+
+        # Constrain EVERY bootstrap pip pass, not just install_pytorch.sh. The
+        # requirements-cv resolve used to run unconstrained: once a numpy>=2-only
+        # transitive (opencv-contrib-python 5.x, tifffile 2026.4+, ml-dtypes 0.6)
+        # is in the venv, that pass upgrades numpy to 2.x, the constrained torch
+        # pass drags it back to 1.26.4, and every boot loops through a full torch
+        # re-stage. Operator-set PIP_CONSTRAINT wins; unset again before the
+        # reconciler — isolated plugin venvs manage their own stacks and must not
+        # inherit these caps (see the NOTE in backend/constraints.txt).
+        _gv_own_constraint=0
+        if [ -z "${PIP_CONSTRAINT:-}" ] && [ -f "$BACKEND_DIR/constraints.txt" ]; then
+            export PIP_CONSTRAINT="$BACKEND_DIR/constraints.txt"
+            _gv_own_constraint=1
+        fi
 
         # requirements-base first (matches system-manager + leaves room for smart torch).
         # Fail fast: if the core files can't install there is nothing to boot —
@@ -1348,27 +1502,21 @@ ensure_backend_python_environment() {
             fi
         fi
 
-        # Optional CV/face-restoration extra (P3-10). These deps (gfpgan/realesrgan/
-        # basicsr/facexlib/controlnet-aux/mediapipe) lack reliable aarch64 wheels and
-        # used to abort the whole install on a Pi. Install them only when explicitly
-        # forced (GUAARDVARK_INSTALL_CV=1) OR auto-detected as a non-ARM GPU box.
-        # Failure here WARNS but never fails the core install — face-restore just stays
-        # disabled (its consumers import lazily inside try/except).
+        # Optional face-restoration extra (P3-10) — OPT-IN ONLY. These deps
+        # (gfpgan/realesrgan/basicsr/facexlib) are a multi-hundred-MB stack
+        # that lacks reliable aarch64 wheels, and the earlier auto-install on
+        # any GPU box made every fresh install pay for an optional feature. The
+        # consumer imports lazily inside try/except and degrades gracefully
+        # when absent (restoration_available=False), so skipping costs nothing
+        # at boot.
+        # Failure here WARNS but never fails the core install.
         if [ -f "$BACKEND_DIR/requirements-cv.txt" ]; then
-            _cv_arch="$(uname -m 2>/dev/null || echo unknown)"
-            _cv_want=0
             if [ "${GUAARDVARK_INSTALL_CV:-0}" = "1" ]; then
-                _cv_want=1
-            elif command_exists nvidia-smi && nvidia-smi >/dev/null 2>&1 \
-                 && [ "$_cv_arch" != "aarch64" ] && [ "$_cv_arch" != "arm64" ]; then
-                _cv_want=1
-            fi
-            if [ "$_cv_want" -eq 1 ]; then
                 vader_info "Installing optional CV/face-restoration deps (requirements-cv.txt)..."
                 pip install -r "$BACKEND_DIR/requirements-cv.txt" >> "$SETUP_LOG" 2>&1 \
                     || vader_warn "Optional CV deps failed to install (face-restore stays disabled; non-fatal). Retry later: pip install -r backend/requirements-cv.txt"
             else
-                vader_info "Skipping optional CV deps (no GPU or ARM arch). Force with GUAARDVARK_INSTALL_CV=1"
+                vader_info "Skipping optional CV deps (face-restore/anatomy stay disabled). Opt in with GUAARDVARK_INSTALL_CV=1"
             fi
         fi
 
@@ -1386,15 +1534,26 @@ ensure_backend_python_environment() {
             # install_pytorch.sh's `pip install --upgrade ... --index-url .../whl/<ver>` can
             # drag numpy 2.x + an old setuptools back in, violating the ML-stack pins
             # (numpy<2.0) and llama-index (setuptools>=80.9.0). Re-assert them without
-            # touching torch (--no-deps). Reconciled from PR #40 (anubissbe).
-            pip install --no-deps --force-reinstall 'numpy<2.0,>=1.26.4' 'setuptools>=80.9.0,<81' >> "$SETUP_LOG" 2>&1 \
-                || vader_warn "Could not re-pin numpy/setuptools after PyTorch — check 'pip check'."
+            # touching torch (--no-deps) — but only the ones actually wrong: the probe
+            # is offline, --force-reinstall is not (scripts/lib/venv_pins.sh).
+            _gv_bad_pins="$(venv_pins_violated "$VENV_DIR/bin/python" "${GV_ML_PINS[@]}")" || true
+            if [ -n "$_gv_bad_pins" ]; then
+                # shellcheck disable=SC2086  # one spec per line, no spaces inside a spec
+                pip install --no-deps --force-reinstall $_gv_bad_pins >> "$SETUP_LOG" 2>&1 \
+                    || vader_warn "Could not re-pin ${_gv_bad_pins//$'\n'/ } after PyTorch — check 'pip check'."
+            fi
+            unset _gv_bad_pins
             # Extra safety: always purge flash-attn/xformers after torch (even on GPU). These
             # are the direct cause of the aten::_flash schema mismatch (flash 2.5.7 vs torch
             # 2.5.1+cu124 philox vs rng_state) logged in backend.log/preflight on diffusers
             # import for batch_image_generation_api. Custom nodes + plugin reqs re-introduce them.
             "$VENV_DIR/bin/pip" uninstall -y flash-attn flash_attn xformers 2>/dev/null | tail -1 || true
         fi
+
+        if [ "${_gv_own_constraint:-0}" -eq 1 ]; then
+            unset PIP_CONSTRAINT
+        fi
+        unset _gv_own_constraint
 
         # Full reconciler pass for state tracking, CRITICAL_PACKAGES verification, cli_venv, etc.
         # A failure here is NOT a soft warn: it means a dependency target is broken.
@@ -1405,6 +1564,11 @@ ensure_backend_python_environment() {
             if ! "$VENV_DIR/bin/python" "$SCRIPT_DIR/scripts/dep_reconciler.py" --force --only backend_venv,cli_venv --repo-root "$SCRIPT_DIR" >> "$SETUP_LOG" 2>&1; then
                 vader_error "Dependency reconciler FAILED:"
                 tail -n 200 "$SETUP_LOG" | grep -A4 "Reconciliation failed for:" | sed 's/^/      /'
+                # pip reports an unreachable index as a resolver error ("No matching
+                # distribution", even "ResolutionImpossible"); say what it really was.
+                if tail -c 40000 "$LOGS_DIR/dep_reconciler.log" 2>/dev/null | grep -qE "$PIP_NET_FAULT_RE"; then
+                    vader_error "Cause: pip could not reach its package index (DNS or link fault). Nothing was removed — fix the network and re-run ./start.sh."
+                fi
                 vader_info "Details: $SETUP_LOG and logs/dep_reconciler.log. Repair: ./scripts/heal_backend_venv.sh"
             fi
         fi
@@ -1424,6 +1588,12 @@ ensure_backend_python_environment() {
                 > "$BOOTSTRAP_STAMP" 2>/dev/null || true
         else
             vader_error "Bootstrap did not produce a working Python environment."
+            # Name the import that fails instead of leaving it to the log.
+            "$VENV_DIR/bin/python" -c "import sys; sys.path.insert(0, '$SCRIPT_DIR'); import numpy, flask, celery, redis, psycopg2; import backend.config" 2>&1 \
+                | tail -n 3 | sed 's/^/      /'
+            if tail -c 40000 "$SETUP_LOG" 2>/dev/null | grep -qE "$PIP_NET_FAULT_RE"; then
+                vader_error "Cause: pip could not reach its package index (DNS or link fault) during the install above."
+            fi
             vader_info "See $SETUP_LOG for details. Recommended manual steps:"
             vader_info "  ./scripts/dep_reconciler.py --force"
             vader_info "  or: ./scripts/system-manager/system-manager repair ."
@@ -1445,6 +1615,13 @@ ensure_frontend_deps() {
     # Run npm ci (lockfile-strict, same strategy as scripts/dep_reconciler/reconcilers/frontend.py)
     # only when truly needed: missing node_modules, or lockfile newer than our stamp.
     if [ ! -d "$nm" ] || [ ! -f "$stamp" ] || [ "$lock" -nt "$stamp" 2>/dev/null ]; then
+        # npm ci deletes node_modules before downloading, so offline it would
+        # leave the UI with nothing. Keep the installed tree until the registry
+        # is reachable; the stamp stays old, so the next online start updates it.
+        if [ -d "$nm" ] && ! install_network_up registry.npmjs.org; then
+            vader_warn "Frontend lockfile changed, but the npm registry is unreachable — keeping the installed node_modules."
+            return 0
+        fi
         vader_info "Ensuring frontend dependencies (using npm ci for lockfile safety)..."
         if (cd "$FRONTEND_DIR" && npm ci >> "$SETUP_LOG" 2>&1); then
             touch "$stamp" 2>/dev/null || true
@@ -1631,7 +1808,7 @@ mkdir -p "$HOME/.guaardvark"
 # Invoke by FILE PATH, not `-m backend.services...`: -m imports backend/__init__.py,
 # which pulls socketio_events → numpy. Pre-venv (system python3, no numpy) that
 # GUARANTEED a "ModuleNotFoundError: numpy" traceback at the top of setup.log on
-# every fresh box — the red herring that derailed the ALPACA install diagnosis.
+# every fresh box — the red herring that derailed a real install diagnosis.
 # The detector itself is pure stdlib and needs no package context.
 if python3 "$SCRIPT_DIR/backend/services/hardware_detector.py" \
         --output "$HOME/.guaardvark/hardware.json" >> "$SETUP_LOG" 2>&1; then
@@ -1649,7 +1826,7 @@ fi
 # most Intel desktop boards) have a years-old, Intel-acknowledged TX engine bug:
 # under sustained transmit load the NIC hangs ("Detected Hardware Unit Hang" in
 # dmesg), the driver resets it, and the interface drops mid-transfer. Our
-# bootstrap is exactly that load profile. ALPACA (ASRock Z390 Pro4, I219-V)
+# bootstrap is exactly that load profile. On an ASRock Z390 Pro4 (I219-V),
 # 2026-08-13: repeated bootstrap deaths (read timeouts, DNS gone, BrokenPipe),
 # CURED by disabling offloads — install completed first try afterwards. BIOS
 # ASPM settings do not govern this NIC (it is not a PCIe device); the offload
@@ -1751,10 +1928,18 @@ source "$VENV_DIR/bin/activate" || { vader_error "Failed to activate venv"; exit
 # This is the key part of the strong fix: after creation (or if broken) we now ensure
 # the venv actually has the packages via ensure_backend_python_environment.
 if ! ensure_backend_python_environment; then
+  if [ "${VENV_REQS_STALE:-0}" -eq 1 ] && backend_venv_functional; then
+    # The update failed part-way (network dropped mid-download), but the
+    # previous install still imports. Start on it; the stamp is unchanged, so
+    # the next ./start.sh retries the update.
+    vader_warn "Dependency update did not finish; starting on the previously installed packages."
+    source "$VENV_DIR/bin/activate" || { vader_error "Failed to activate venv"; exit 1; }
+  else
     vader_error "Python bootstrap failed. Cannot continue."
     # ensure_... already deactivated on its error path
     cd "$SCRIPT_DIR"
     exit 1
+  fi
 fi
 
 # The ensure function manages its own activate/deactivate when it performs work.
@@ -1847,6 +2032,18 @@ if [ "$FAST_START" -ne 1 ]; then
     fi
 else
     vader_info "Fast start enabled - skipping frontend install/build."
+fi
+
+# macOS on an external/exFAT volume leaves "._name" AppleDouble sidecars next to
+# files after every pull, copy or pip install. A "._x.py" is a binary file that
+# ends in .py, so transformers' import scan and our blueprint discovery choke on
+# it (#41). Strip them before anything imports the backend. No-op on Linux.
+if is_macos && [ -f "$SCRIPT_DIR/scripts/platform/strip_appledouble.sh" ]; then
+    _sidecars=$(bash "$SCRIPT_DIR/scripts/platform/strip_appledouble.sh" "$SCRIPT_DIR" 2>/dev/null || echo 0)
+    if [ "${_sidecars:-0}" -gt 0 ]; then
+        vader_info "Removed $_sidecars AppleDouble '._*' sidecar file(s) from the checkout (they break Python import scans)."
+    fi
+    unset _sidecars
 fi
 vader_separator
 
@@ -1987,13 +2184,27 @@ fi
 OLLAMA_PLUGIN_JSON="$SCRIPT_DIR/plugins/ollama/plugin.json"
 OLLAMA_ENABLED=$(plugin_effective_enabled "ollama" "$OLLAMA_PLUGIN_JSON")
 
-if [ "$OLLAMA_AVAILABLE" -eq 1 ] && [ "$OLLAMA_ENABLED" != "False" ]; then
+if [ "${GUAARDVARK_OLLAMA_EXTERNAL:-0}" = 1 ] && [ "$OLLAMA_ENABLED" != "False" ]; then
+    # External Ollama: the user runs it; start.sh only checks that it answers.
+    if curl -sf --max-time 3 http://127.0.0.1:11434/ >/dev/null 2>&1; then
+        vader_success "Using external Ollama on 127.0.0.1:11434 (GUAARDVARK_OLLAMA_EXTERNAL=1; never started or stopped by these scripts)"
+    elif [ "${GUAARDVARK_OLLAMA_OPTIONAL:-0}" = "1" ]; then
+        vader_warn "External Ollama is not answering on 127.0.0.1:11434 — continuing because GUAARDVARK_OLLAMA_OPTIONAL=1."
+    else
+        vader_error "GUAARDVARK_OLLAMA_EXTERNAL=1 but nothing answers on 127.0.0.1:11434. Start your Ollama (ollama serve) and re-run ./start.sh,"
+        vader_error "or remove GUAARDVARK_OLLAMA_EXTERNAL from .env to let start.sh manage it."
+        exit 1
+    fi
+elif [ "$OLLAMA_AVAILABLE" -eq 1 ] && [ "$OLLAMA_ENABLED" != "False" ]; then
     # Step 1: Check if already running
     if curl -sf --max-time 3 http://127.0.0.1:11434/ >/dev/null 2>&1; then
         vader_success "Ollama service is already active"
     else
         # Step 2: Kill any zombie process holding the port but not responding
-        OLLAMA_ZOMBIE_PID=$(lsof -ti :11434 2>/dev/null | head -1)
+        # Listeners only: a backend with an open client connection to Ollama
+        # also shows up on this port — the other install's, when two share a
+        # box — and that is not the process to kill.
+        OLLAMA_ZOMBIE_PID=$(lsof -ti TCP:11434 -sTCP:LISTEN 2>/dev/null | head -1)
         if [ -n "$OLLAMA_ZOMBIE_PID" ]; then
             vader_info "Killing unresponsive process on port 11434 (PID: $OLLAMA_ZOMBIE_PID)..."
             kill -9 "$OLLAMA_ZOMBIE_PID" 2>/dev/null
@@ -2141,6 +2352,9 @@ except Exception:
         fi
         BOOT_EMBED_MODEL="${GUAARDVARK_EMBEDDING_MODEL:-nomic-embed-text}"
     fi
+    # An explicit choice (.env or the active profile) beats the hardware tier.
+    [ -n "${GUAARDVARK_DEFAULT_LLM:-}" ] && BOOT_CHAT_MODEL="$GUAARDVARK_DEFAULT_LLM"
+    [ -n "${GUAARDVARK_EMBEDDING_MODEL:-}" ] && BOOT_EMBED_MODEL="$GUAARDVARK_EMBEDDING_MODEL"
 
     BOOT_LIST="$(timeout 10 ollama list 2>/dev/null || true)"
     # A "chat model" is any non-embed tag. Detect absence of either class.
@@ -2182,7 +2396,7 @@ vader_separator
 
 vader_step 7 "Checking Whisper.cpp voice processing..."
 if [ "$VOICE_CHECK" -eq 0 ]; then
-    vader_info "Voice check disabled (--no-voice). Skipping Whisper.cpp build."
+    vader_info "Voice check disabled (--no-voice, or the active profile). Skipping Whisper.cpp build."
 else
     WHISPER_DIR="$BACKEND_DIR/tools/voice/whisper.cpp"
     WHISPER_BUILD_DIR="$WHISPER_DIR/build"
@@ -2253,15 +2467,53 @@ else
 fi
 vader_separator
 
+# Optional: start an external whisper.cpp HTTP server for STT when
+# GUAARDVARK_USE_WHISPER_SERVER=1 (see backend/api/voice_api.py). This lets
+# Guaardvark reuse an already-built whisper-server instead of building its own
+# whisper-cli. Paths are overridable via GUAARDVARK_WHISPER_SERVER_BIN / _MODEL.
+if [ "${GUAARDVARK_USE_WHISPER_SERVER:-0}" = "1" ]; then
+    # Prefer a whisper-server on PATH; fall back to an explicit env var. Avoid
+    # hardcoding a personal checkout layout.
+    WHISPER_SERVER_BIN="${GUAARDVARK_WHISPER_SERVER_BIN:-$(command -v whisper-server 2>/dev/null || true)}"
+    WHISPER_SERVER_MODEL="${GUAARDVARK_WHISPER_SERVER_MODEL:-$BACKEND_DIR/tools/voice/whisper.cpp/models/ggml-base.bin}"
+    WHISPER_SERVER_PORT="${GUAARDVARK_WHISPER_SERVER_PORT:-5800}"
+    if [ -x "$WHISPER_SERVER_BIN" ] && [ -f "$WHISPER_SERVER_MODEL" ]; then
+        if lsof -Pi :$WHISPER_SERVER_PORT -sTCP:LISTEN -t >/dev/null 2>&1; then
+            vader_success "Whisper server already running on port $WHISPER_SERVER_PORT"
+        else
+            vader_info "Starting whisper.cpp server on port $WHISPER_SERVER_PORT..."
+            "$WHISPER_SERVER_BIN" --host 127.0.0.1 --port "$WHISPER_SERVER_PORT" --model "$WHISPER_SERVER_MODEL" >> "$LOGS_DIR/whisper_server.log" 2>&1 &
+            echo $! > "$SCRIPT_DIR/pids/whisper_server.pid"
+            sleep 2
+            if lsof -Pi :$WHISPER_SERVER_PORT -sTCP:LISTEN -t >/dev/null 2>&1; then
+                vader_success "Whisper server started on port $WHISPER_SERVER_PORT"
+            else
+                vader_warn "Whisper server failed to start — check $LOGS_DIR/whisper_server.log"
+            fi
+        fi
+    else
+        vader_warn "Whisper server binary/model not found (GUAARDVARK_USE_WHISPER_SERVER=1 but $WHISPER_SERVER_BIN / $WHISPER_SERVER_MODEL missing)"
+    fi
+fi
+
 vader_step 8 "Setting up backend..."
 cd "$BACKEND_DIR" || { vader_error "Failed to cd to $BACKEND_DIR"; exit 1; }
 
 # Clear stale Python bytecode cache (prevents import errors after file sync)
 # Scan entire project (not just backend/) — scripts/, plugins/, cli/ also have Python
-PYCACHE_COUNT=$(find "$GUAARDVARK_ROOT" -path "*/venv" -prune -o -path "*/node_modules" -prune -o -type d -name "__pycache__" -print 2>/dev/null | wc -l)
-if [ "$PYCACHE_COUNT" -gt 0 ]; then
-    find "$GUAARDVARK_ROOT" -path "*/venv" -prune -o -path "*/node_modules" -prune -o -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
-    vader_info "Cleared $PYCACHE_COUNT __pycache__ directories"
+# Only when the code changed since the last launch (or --clean): an unchanged
+# checkout keeps its bytecode, which saves recompiling on every boot.
+PYCACHE_FP="$(code_fingerprint)"
+PYCACHE_STAMP="$VENV_DIR/.guaardvark_pycache_fp"
+if [ "$FORCE_CLEAN" -eq 0 ] && [ -n "$PYCACHE_FP" ] && [ "$(cat "$PYCACHE_STAMP" 2>/dev/null)" = "$PYCACHE_FP" ]; then
+    vader_info "Code unchanged since last launch — keeping the Python bytecode cache"
+else
+    PYCACHE_COUNT=$(find "$GUAARDVARK_ROOT" -path "*/venv*" -prune -o -path "*/.venv" -prune -o -path "*/node_modules" -prune -o -type d -name "__pycache__" -print 2>/dev/null | wc -l)
+    if [ "$PYCACHE_COUNT" -gt 0 ]; then
+        find "$GUAARDVARK_ROOT" -path "*/venv*" -prune -o -path "*/.venv" -prune -o -path "*/node_modules" -prune -o -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
+        vader_info "Cleared $PYCACHE_COUNT __pycache__ directories"
+    fi
+    [ -n "$PYCACHE_FP" ] && [ -d "$VENV_DIR" ] && printf '%s\n' "$PYCACHE_FP" > "$PYCACHE_STAMP"
 fi
 
 if [ ! -f "$VENV_DIR/bin/activate" ]; then
@@ -2396,7 +2648,7 @@ if [ "$FAST_START" -eq 0 ]; then
         # known-broken capability (missing torch on a GPU box, unhealed
         # reconcile). Print the actual errors so nobody has to dig in logs.
         vader_error "Preflight check FAILED — the app will start DEGRADED:"
-        grep -E "^    - " "$GUAARDVARK_LOG_DIR/preflight.log" | tail -n 10 | sed 's/^/      /'
+        grep -E "^    - " "$GUAARDVARK_LOG_DIR/preflight.log" | awk '!seen[$0]++' | tail -n 10 | sed 's/^/      /'
         vader_error "Full report: logs/preflight.log"
         vader_info "Continuing startup so you can use unaffected features; fix the above and re-run ./start.sh"
     else
@@ -2415,35 +2667,61 @@ export GUAARDVARK_ROOT="$SCRIPT_DIR"
 export TZ="America/New_York"
 export CUDA_DEVICE_ORDER="PCI_BUS_ID"
 export TORCH_CUDNN_V8_API_ENABLED=1
-export OLLAMA_NUM_PARALLEL=2
-
 export OLLAMA_NUM_CTX=8192
+# OLLAMA_NUM_PARALLEL / OLLAMA_MAX_LOADED_MODELS come from hardware_policy (exported
+# in the Ollama tuning step above); a backend-relaunched daemon inherits them.
+export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
 
-GPU_VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 0)
-if [ "${GPU_VRAM_MB:-0}" -gt 12000 ]; then
-    export OLLAMA_MAX_LOADED_MODELS=2
-    vader_info "OLLAMA_MAX_LOADED_MODELS=2 (${GPU_VRAM_MB}MB VRAM detected)"
-elif [ "${GPU_VRAM_MB:-0}" -gt 0 ]; then
-    export OLLAMA_MAX_LOADED_MODELS=1
-    vader_info "OLLAMA_MAX_LOADED_MODELS=1 (${GPU_VRAM_MB}MB VRAM — small GPU)"
-else
-    export OLLAMA_MAX_LOADED_MODELS=1
-    vader_info "OLLAMA_MAX_LOADED_MODELS=1 (no GPU detected)"
-fi
-
+# Must match start_celery.sh: both processes share the card and the allocator policy.
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512,garbage_collection_threshold:0.8"
 
-# Raise GPU power limit to max for higher sustained boost clocks
+# GPU power limit policy. The board limit is the operator's call: a limit the
+# supply cannot sustain hard-freezes the box mid-generation, and an operator-set
+# limit must survive every launch. Precedence, highest first:
+#   GUAARDVARK_GPU_POWER_LIMIT=<watts>  explicit target, clamped to [min,max]
+#   GUAARDVARK_GPU_POWER_LIMIT=max      raise to the card maximum
+#   GUAARDVARK_GPU_POWER_LIMIT=off      leave the limit exactly as found
+#   otherwise                           leave the limit as found (factory or operator)
+# Read from the environment, or from .env so it survives reboots without touching
+# a shell profile.
 if command -v nvidia-smi &>/dev/null; then
-    MAX_PL=$(nvidia-smi --query-gpu=power.max_limit --format=csv,noheader,nounits 2>/dev/null | head -1 | cut -d. -f1)
-    CUR_PL=$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits 2>/dev/null | head -1 | cut -d. -f1)
-    if [ -n "$MAX_PL" ] && [ -n "$CUR_PL" ] && [ "$MAX_PL" -gt "$CUR_PL" ]; then
-        if sudo -n nvidia-smi -pl "$MAX_PL" 2>/dev/null; then
-            vader_info "GPU power limit raised: ${CUR_PL}W → ${MAX_PL}W"
-        else
-            vader_warn "GPU power limit ${CUR_PL}W < max ${MAX_PL}W (needs sudo nvidia-smi -pl ${MAX_PL})"
-        fi
+    if [ -z "${GUAARDVARK_GPU_POWER_LIMIT:-}" ] && [ -f "$SCRIPT_DIR/.env" ]; then
+        _envpl=$(grep -E "^GUAARDVARK_GPU_POWER_LIMIT=" "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | sed "s/^GUAARDVARK_GPU_POWER_LIMIT=//" | tr -d '"'"'"' ')
+        [ -n "$_envpl" ] && GUAARDVARK_GPU_POWER_LIMIT="$_envpl"
     fi
+    _pl_q() { nvidia-smi --query-gpu="$1" --format=csv,noheader,nounits 2>/dev/null | head -1 | cut -d. -f1; }
+    MAX_PL=$(_pl_q power.max_limit)
+    CUR_PL=$(_pl_q power.limit)
+    DEF_PL=$(_pl_q power.default_limit)
+    MIN_PL=$(_pl_q power.min_limit)
+    _want="${GUAARDVARK_GPU_POWER_LIMIT:-}"
+
+    if [ "${_want,,}" = "off" ]; then
+        vader_info "GPU power limit: left at ${CUR_PL}W (GUAARDVARK_GPU_POWER_LIMIT=off)"
+    elif [ "${_want,,}" = "max" ] && [ -n "$MAX_PL" ]; then
+        if [ "$MAX_PL" = "$CUR_PL" ]; then
+            vader_info "GPU power limit: already at card maximum ${CUR_PL}W"
+        elif sudo -n nvidia-smi -pl "$MAX_PL" >/dev/null 2>&1; then
+            vader_success "GPU power limit raised: ${CUR_PL}W → ${MAX_PL}W (GUAARDVARK_GPU_POWER_LIMIT=max)"
+        else
+            vader_warn "GPU power limit: could not raise to ${MAX_PL}W (needs: sudo nvidia-smi -pl ${MAX_PL})"
+        fi
+    elif [ -n "$_want" ] && [ "$_want" -eq "$_want" ] 2>/dev/null; then
+        [ -n "$MIN_PL" ] && [ "$_want" -lt "$MIN_PL" ] && _want="$MIN_PL"
+        [ -n "$MAX_PL" ] && [ "$_want" -gt "$MAX_PL" ] && _want="$MAX_PL"
+        if [ "$_want" = "$CUR_PL" ]; then
+            vader_info "GPU power limit: already ${CUR_PL}W"
+        elif sudo -n nvidia-smi -pl "$_want" >/dev/null 2>&1; then
+            vader_success "GPU power limit set: ${CUR_PL}W → ${_want}W (GUAARDVARK_GPU_POWER_LIMIT)"
+        else
+            vader_warn "GPU power limit: could not set ${_want}W (needs: sudo nvidia-smi -pl ${_want})"
+        fi
+    elif [ -n "$CUR_PL" ] && [ -n "$DEF_PL" ] && [ "$CUR_PL" != "$DEF_PL" ]; then
+        vader_info "GPU power limit: respecting operator setting ${CUR_PL}W (factory default ${DEF_PL}W)"
+    elif [ -n "$CUR_PL" ]; then
+        vader_info "GPU power limit: ${CUR_PL}W (factory default; GUAARDVARK_GPU_POWER_LIMIT=<watts|max|off> to change)"
+    fi
+    unset -f _pl_q; unset _want _envpl
 fi
 # Pick up the auth-bearing URLs that start_redis.sh / start_postgres.sh wrote to .env.
 # Without this, the `${X:-default}` exports below would set no-auth defaults that win
@@ -2541,7 +2819,7 @@ elif { command_exists ss && ss -tlpn 2>/dev/null | grep -q ":$FLASK_PORT\b"; } \
     # macOS and the backend just dies on bind with a cryptic "Address already in use").
     if [ "$(uname -s)" = "Darwin" ] && [ "$FLASK_PORT" = "5000" ]; then
         vader_error "Port 5000 is in use — on macOS this is almost always the 'AirPlay Receiver' (System Settings → General → AirDrop & Handoff → AirPlay Receiver)."
-        vader_error "Either turn AirPlay Receiver off, or keep it on and set a different backend port: add 'FLASK_PORT=5055' to your .env, then re-run ./start.sh."
+        vader_error "The macOS default is 5055; this run asked for 5000 explicitly. Remove FLASK_PORT=5000 from .env (or set another port there), or turn AirPlay Receiver off, then re-run ./start.sh."
     else
         vader_error "Port $FLASK_PORT is in use by a non-Guaardvark process that does not respond to /api/health. Free it or set FLASK_PORT, then retry."
     fi
@@ -2557,7 +2835,7 @@ if [ "$BACKEND_ADOPTED" -eq 0 ]; then
     ulimit -n 65535
     vader_info "File descriptor limit set to: $(ulimit -n)"
 
-    nohup env GUAARDVARK_ROOT="$SCRIPT_DIR" FLASK_PORT="$FLASK_PORT" GUAARDVARK_MIGRATIONS_VERIFIED="${GUAARDVARK_MIGRATIONS_VERIFIED:-}" "$VENV_DIR/bin/python" -m backend.app >> "$BACKEND_STARTUP_LOG_FILE" 2>&1 &
+    nohup env GUAARDVARK_ROOT="$SCRIPT_DIR" FLASK_PORT="$FLASK_PORT" VITE_PORT="$VITE_PORT" GUAARDVARK_MIGRATIONS_VERIFIED="${GUAARDVARK_MIGRATIONS_VERIFIED:-}" "$VENV_DIR/bin/python" -m backend.app >> "$BACKEND_STARTUP_LOG_FILE" 2>&1 &
     BACKEND_PID=$!
     echo "$BACKEND_PID" > "$SCRIPT_DIR/pids/backend.pid"
 
@@ -2599,8 +2877,14 @@ vader_separator
 vader_step 10 "Starting enhanced Celery workers..."
 if [ -f "$SCRIPT_DIR/start_celery.sh" ]; then
     bash "$SCRIPT_DIR/start_celery.sh"
-    if pgrep -f "celery.*worker" >/dev/null 2>&1; then
-        CELERY_PID=$(pgrep -f "celery.*worker" | head -1)
+    # Only workers whose cwd is this checkout count — another install on the
+    # same machine must neither satisfy this check nor lend its PID.
+    CELERY_PID=""
+    for _pid in $(pgrep -f "celery -A backend.celery_app.celery worker" 2>/dev/null); do
+        _cwd=$(_proc_cwd "$_pid")
+        case "$_cwd" in "$SCRIPT_DIR"|"$SCRIPT_DIR"/*) CELERY_PID="$_pid"; break ;; esac
+    done
+    if [ -n "$CELERY_PID" ]; then
         echo "$CELERY_PID" > "$SCRIPT_DIR/pids/celery.pid"
         vader_success "Enhanced Celery workers started"
     else
@@ -2710,9 +2994,18 @@ else
     fi
 fi
 
-vader_info "Building frontend (production) before serving..."
-if (cd "$FRONTEND_DIR" && $NPM_CMD run build >> "$FRONTEND_LOG_FILE" 2>&1); then
+# The dev server below serves src/ directly; this build proves the code still
+# compiles and keeps a last-good dist. Skip it when neither the code, the
+# lockfile nor the build-time VITE_* env changed since the last good build.
+FRONTEND_BUILD_STAMP="$FRONTEND_DIR/dist/.build_fp"
+FRONTEND_FP="$(code_fingerprint "$(sha256sum "$FRONTEND_DIR/package-lock.json" 2>/dev/null)" "$(env | grep '^VITE_' | sort)")"
+if [ "$FORCE_CLEAN" -eq 0 ] && [ -n "$FRONTEND_FP" ] && [ -f "$FRONTEND_DIR/dist/index.html" ] \
+   && [ "$(cat "$FRONTEND_BUILD_STAMP" 2>/dev/null)" = "$FRONTEND_FP" ]; then
+    vader_info "Frontend unchanged since the last good build — skipping the build"
+elif vader_info "Building frontend (production) before serving..." \
+   && (cd "$FRONTEND_DIR" && $NPM_CMD run build >> "$FRONTEND_LOG_FILE" 2>&1); then
     vader_success "Frontend build complete"
+    [ -n "$FRONTEND_FP" ] && printf '%s\n' "$FRONTEND_FP" > "$FRONTEND_BUILD_STAMP"
 elif [ -f "$FRONTEND_DIR/dist/index.html" ]; then
     vader_error "Frontend build FAILED — serving the LAST-GOOD (stale) dist. Code is NOT current. Fix the build; see $FRONTEND_LOG_FILE"
 else
@@ -2895,6 +3188,60 @@ start_plugin() {
 # plugin (vision_pipeline) is started. Not started at boot to save RAM/VNC cost.
 
 PLUGINS_STARTED=0
+
+# Pass 0: ComfyUI back the way it was. ./stop.sh kills ComfyUI; the backend
+# restores the plugins it recorded as running when it boots, and this is the
+# second line when that restore did not happen (its health wait timed out, a
+# tripped breaker skipped it): the first video generation otherwise fails with
+# "Start the ComfyUI plugin". The decision (enabled, was running before the
+# stop or default_auto_start, video models installed, port free) lives in
+# backend/plugins/boot_autostart.py; the start goes through the plugin
+# manager, the same path as the Plugins page toggle.
+_comfy_py="$SCRIPT_DIR/backend/venv/bin/python"
+comfyui_boot_decision() {
+    "$_comfy_py" - "$SCRIPT_DIR" <<'AUTOSTART' 2>/dev/null || echo "no|decision helper failed"
+import importlib.util, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location(
+    "boot_autostart", root / "backend" / "plugins" / "boot_autostart.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+sys.exit(mod.main([str(root)]))
+AUTOSTART
+}
+
+# The API wraps the manager's result: {"success": true, "data": {"success": ..,
+# "message"/"error": ..}}; a gate refusal is a 200 with data.success false.
+comfyui_start_outcome() {
+    "$_comfy_py" -c '
+import json, sys
+try:
+    body = json.load(sys.stdin)
+except Exception:
+    print("no|no answer from the backend"); sys.exit(0)
+data = body.get("data") if isinstance(body.get("data"), dict) else {}
+ok = bool(body.get("success")) and bool(data.get("success", True))
+text = data.get("message") or data.get("error") or body.get("message") or body.get("error") or ""
+print(("yes|" if ok else "no|") + str(text))
+'
+}
+
+if ! plugin_should_skip comfyui && [ -x "$_comfy_py" ]; then
+    _comfy_decision=$(comfyui_boot_decision)
+    _comfy_reason="${_comfy_decision#*|}"
+    if [ "${_comfy_decision%%|*}" = "yes" ]; then
+        vader_info "Starting ComfyUI plugin through the backend: $_comfy_reason"
+        _comfy_outcome=$(curl -s --max-time 180 -X POST "http://localhost:$FLASK_PORT/api/plugins/comfyui/start" 2>/dev/null | comfyui_start_outcome)
+        if [ "${_comfy_outcome%%|*}" = "yes" ]; then
+            vader_success "ComfyUI plugin started: ${_comfy_outcome#*|}"
+            PLUGINS_STARTED=$((PLUGINS_STARTED + 1))
+        else
+            vader_warn "ComfyUI plugin did not start: ${_comfy_outcome#*|}. Toggle it on the Plugins page."
+        fi
+    else
+        vader_info "ComfyUI plugin not started: $_comfy_reason"
+    fi
+fi
 
 # Pass 1: Start auto_start plugins (always, no flag needed)
 for plugin_dir in "$SCRIPT_DIR"/plugins/*/; do
