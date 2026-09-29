@@ -510,7 +510,7 @@
         "action": "wait_until_settled",
         "timeout_s": 1.5
       }
-    ]
+    ]  b
   },
   "close_tab": {
     "description": "Close the current browser tab.",
@@ -606,16 +606,17 @@
     ]
   },
    "next_tab": {
-    "description": "Switch to the next brower tab.",
-    "triggers": [
-      "^next\\s+tab \\s*$",
+     "description": "Switch to the next brower tab.",
+     "triggers": [
+       "^next\\s+tab \\s*$"
+       "^switch\\s+to\\s+the\\s+next\\s+tab\\s*$"
     ],
     "steps": [
       {
         "action": "hotkey",
         "keys": [
           "ctrl",
-          "Tab"
+          "tab"
         ]
      }
    ]
@@ -624,13 +625,15 @@
     "description": "Switch to the previous brower tab.",
     "triggers": [
       "^previous\\s+tab \\s*$",
+      "^go\\s+to\\s+the\\s+previous\\s+tab\\s*$"
     ],
     "steps": [
       {
         "action": "hotkey",
         "keys": [
+          "ctrl",
           "shift",
-          "Tab"
+          "tab"
         ]
      }
    ]
@@ -638,7 +641,7 @@
   "bookmark_page": {
     "description": "Bookmark the current browser page.",
     "triggers": [
-      "^(?:bookmark|save)\\s+(?:this\\s+)?page \\s*$",
+      "^bookmark\\s+(?:this\\s+)?page \\s*$"
     ],
     "steps": [
       {
@@ -647,37 +650,53 @@
           "ctrl",
           "d"
         ]
-     }
-   ]
- },
+      },
+      {
+        "action": "wait_until_visible",
+        "target_description": "Firefox bookmark panel",
+        "timeout_s": 4.0
+  },
+  {
+     "action" : "hotkey",
+     "keys" : [
+            "Escape"
+      ]
+   }
+},
   "zoom_in": {
-    "description":  " Zoom in on the current browser page.",
+    "description":  "Zoom in on the current browser page.",
     "triggers": [
-      "^zoom\\s+in \\s*$",
+      "^zoom\\s+in \\s*$"
     ],
     "steps": [
       {
         "action": "hotkey",
         "keys": [
           "ctrl",
-          "+"
+          "plus"
         ]
-     }
+     },
+     {  "action" : "wait_until_settled",
+         "timeout_s" : 1.5
+       }
    ]
  },
   "zoom_out": {
-    "description":  " Zoom out on the current browser page.",
+    "description":  "Zoom out on the current browser page.",
     "triggers": [
-      "^zoom\\s+out \\s*$",
+      "^zoom\\s+out \\s*$"
     ],
     "steps": [
       {
         "action": "hotkey",
         "keys": [
           "ctrl",
-          "-"
+          "minus"
         ]
-     }
+     },
+      {  "action" : "wait_until_settled",
+         "timeout_s" : 1.5
+       }
    ]
  }
 }
